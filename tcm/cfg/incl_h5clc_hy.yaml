@@ -1,0 +1,6 @@
+defaults:
+- base_incl_h5clc_hy
+- _self_
+hydra:
+  searchpath:
+  - file://d:/WorkData/_experiment/inclinometer/231009_tank@iB18,25-30/_raw/cfg_proc

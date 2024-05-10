@@ -1,0 +1,6 @@
+defaults:
+- my_incl_calibr
+- _self_
+hydra:
+  searchpath:
+  - file://d:/WorkData/_experiment/inclinometer/231229_stand@i58-60/_raw/cfg_proc

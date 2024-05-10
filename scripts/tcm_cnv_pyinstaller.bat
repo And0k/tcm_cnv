@@ -1,0 +1,1 @@
+pyinstaller --noconfirm --upx-dir=c:\Programs\_utils\_archivator\UPX\ d:\Work\_Python3\And0K\tcm_cnv\tcm_cnv.spec
