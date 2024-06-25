@@ -237,7 +237,8 @@ def first_of_paths_text(paths):
 
 def set_field_if_no(dictlike, dictfield, value=None):
     """
-    Modifies dict: sets field to value only if it not exists
+    Note: In contrast to `setdefault` this function sets `dictlike` value also if it was exist and was equal
+    to None. Equal to `dictlike[dictfield] = dictlike.get(dictfield) or value` but may be faster
     :param dictlike: dict
     :param dictfield: field
     :param value: value
@@ -280,7 +281,8 @@ def getDirBaseOut(mask_in_path, raw_dir_words: Optional[Sequence[str]]=None, rep
     for source_dir_word in raw_dir_words:
         # Start of source_dir_word in 1st detected variant
         st = mask_in_str.find(source_dir_word, 3)  # .lower()
-        if st >= 0: break
+        if st >= 0:
+            break
 
     if st < 0:
         print(
@@ -429,6 +431,8 @@ def type_fix(name: str, opt: Any) -> Tuple[str, Any]:
     try:
         if is_simple_sequence(opt):
             opt = [type_fix('_'.join(key_splitted[0:-1]) if suffix in {'list', 'names'} else name, v)[1] for v in opt]
+            return name, opt
+
         if suffix in {'list', 'names'}:  # , '_endswith_list' -> '_endswith'
             # parse list. Todo: support square brackets
             name_out = '_'.join(key_splitted[0:-1])
@@ -505,15 +509,19 @@ def type_fix(name: str, opt: Any) -> Tuple[str, Any]:
         if prefix == 'dt':
             if suffix in {'days', 'seconds', 'microseconds', 'milliseconds', 'minutes', 'hours', 'weeks'}:
                 name_out = '_'.join(key_splitted[:-1])
-                if opt:
-                    try:
-                        opt = timedelta(**{suffix: float(opt)})
-                    except TypeError as e:
-                        raise KeyError(e.msg) from e  # changing error type to be not caught and accepted
-                else:  # not need convert
-                    opt = timedelta(0)
-            else:  # do nothing
-                name_out = name
+            else:  # input in seconds by default, also allow 's' suffix instead of 'seconds'
+                name_out = '_'.join(key_splitted[:-1]) if suffix == 's' else name
+                suffix = 'seconds'
+            if opt:
+                try:
+                    opt = timedelta(**{suffix: float(opt)})
+                except TypeError as e:  # Not need convert (like for list of timedeltas after items converted)
+                    raise KeyError(e.msg) from e  # changing error type to be not caught and accepted
+                except OverflowError:
+                    opt = timedelta.max
+            else:  # not need convert
+                opt = timedelta(0)
+
             return name_out, opt
         b_trig_is_prefix = prefix in {'date', 'time'}
         if b_trig_is_prefix or suffix in {'date', 'time'}:
@@ -1959,16 +1967,30 @@ st.go = True
 
 def call_with_valid_kwargs(func: Callable[[Any], Any], *args, **kwargs):
     """
-    Calls func with extracted valid arguments from kwargs
-    inspired by https://stackoverflow.com/a/9433836
-    :param func: function you're calling
-    :param args:
-    :param kwargs:
-    :return:
+    Call the provided function with valid arguments that are extracted from kwargs.
+
+    :param func: The function to be called.
+    :param *args: The variable arguments that the function will be called with.
+    :param **kwargs: The keyword arguments from which valid arguments will be selected.
+    :Return: The result of calling func with valid arguments extracted from kwargs.
+    How it works:
+    It first finds the intersection of the keys in kwargs and the expected arguments of func.
+    It then calls func, with positional arguments *args and only those key-value pairs from kwargs that are
+    valid arguments for func.
+    Inspired by https://stackoverflow.com/a/9433836
     """
-    valid_keys = kwargs.keys() & func.__code__.co_varnames[len(args):func.__code__.co_argcount]
+    valid_keys = kwargs.keys() & func.__code__.co_varnames[len(args) : func.__code__.co_argcount]
     return func(*args, **{k: kwargs[k] for k in valid_keys})
 
+
+def omit_none(param_name: str, value):
+    """Returns a keyword argument dictionary if value is not None.
+    :param param_name: The name of the parameter.
+    :param value: The value to be assigned to the parameter, if not None.
+    :Return: dict: A dictionary with the parameter name as key and value as value,
+              or an empty dictionary if value is None.
+    """
+    return {param_name: value} if value is not None else {}
 
 
 @enum.unique
