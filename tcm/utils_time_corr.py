@@ -270,7 +270,7 @@ def time_corr(
                 lf.warning('Not flattening for frequency < 1')
             else:
                 # Increase time resolution by recalculating all values
-                
+
                 dt_interp_between = cfg_in.get('dt_interp_between', timedelta(seconds=1.5))
                 # interp to can use as pandas index even if any bad. Note: if ~b_ok at i_st_hole then interp. is bad
                 tim_before = pd.to_datetime(np.int64(rep2mean(t, bOk=b_ok)))
@@ -297,12 +297,12 @@ def time_corr(
                     dt = np.ediff1d(t, to_begin=1)
                     if (dt < 0).any():
                         t = tim_before.to_numpy(dtype=np.int64)
-                        lf.info('flattening frequency failed => skipping (keeping not constant frequency)')
+                        lf.info("flattening frequency failed => keeping variable frequency")
                     else:
                         lf.info(f'There are {n_repeated} adjacent among them => '
                                 'revert to original not constant frequency there')
                 else:
-                    lf.info('Leaving values following each other with a large interval, since they are single')
+                    lf.info("Discarded isolated gaps")
             # Show what is done
             if b_show:
                 if b_ok is None:
@@ -382,7 +382,7 @@ def time_corr(
 
 def get_version_via_com(filename):
     from win32com.client import Dispatch
-    
+
     parser = Dispatch("Scripting.FileSystemObject")
     try:
         version = parser.GetFileVersion(filename)
@@ -412,7 +412,7 @@ def plot_bad_time_in_thread(cfg_in, t: np.ndarray, b_ok=None, idel=None,
     from bokeh.io import export_png, export_svgs
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
-    
+
     save_format_suffix = '.png'
     # output figure name
     fig_name = '{:%y%m%d_%H%M}-{:%H%M}'.format(*(
@@ -518,7 +518,7 @@ def plot_bad_time_in_thread(cfg_in, t: np.ndarray, b_ok=None, idel=None,
                         web_driver = None
                     except ImportError:
                         lf.exception('Skipping of figure creating because there is no needed package...')
-                        
+
             except SessionNotCreatedException:
                 lf.exception('Can not save png so will save html instead')
                 save_format_suffix = '.html'

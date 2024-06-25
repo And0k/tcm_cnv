@@ -32,6 +32,7 @@ from typing import (
     get_origin,
     get_type_hints,
 )
+from pathlib import Path
 import hydra
 from hydra.core.config_store import ConfigStore
 from hydra.errors import HydraException
@@ -431,6 +432,10 @@ def convert_value(value, field_type, default_value=None):
     if field_type in (int, float, str, bool):
         if isinstance(value, list) and len(value) == 1:
             value = value[0]
+        elif isinstance(value, timedelta):  # allow timedelta to be converted to int seconds
+            return int(value.total_seconds())
+
+
     if hasattr(value, "dtype"):
         value = value.item()
 
@@ -438,7 +443,7 @@ def convert_value(value, field_type, default_value=None):
     if field_type is not Any and isinstance(value, field_type):
         return value
 
-    # Only values that need convert to strings are not handled yet for which field_type must be compatible:
+    # Only conversion to strings are not handled yet, so `field_type` must be compatible to str:
     if field_type not in (Any, str):
         raise TypeError(f"Can not convert {value} to {field_type}")
 
@@ -463,7 +468,15 @@ def omegaconf_merge_compatible(unstructured: Dict[str, Any], schema) -> Dict[str
     """
     if not is_dataclass(schema):
         raise TypeError("Provided schema is not a dataclass.")
-    schema_fields = {fld.name: (fld.type, fld.default) for fld in fields(schema)}
+    schema_fields = {
+        fld.name: (
+            fld.type,
+            fld.default if fld.default is not dataclasses_missing else
+            None if fld.default_factory is dataclasses_missing else
+            fld.default_factory()
+        )
+        for fld in fields(schema)
+    }
     converted = {}
     for key, value in unstructured.items():
         if key in schema_fields and value is not None:
@@ -597,7 +610,8 @@ def main_init(cfg: Mapping[str, Any], cs_store_name, __file__=None, ) -> Mapping
     # print not empty / not False values # todo: print only if config changed instead
     try:
         print(OmegaConf.to_yaml({
-            k0: ({k1: v1 for k1, v1 in v0.items() if v1} if hasattr(v0, 'items') else v0) for k0, v0 in cfg.items()
+            k0: ({k1: v1 for k1, v1 in v0.items() if v1}
+                 if hasattr(v0, 'items') else v0) for k0, v0 in cfg.items()
             }))
     except MissingMandatoryValue as e:
         lf.error(standard_error_info(e))
@@ -641,69 +655,86 @@ def main_call(
     :param fun: function that uses command line args, usually called ``main``
     :param my_hydra_module: module with hydra config, that contains `cs_store_name`, `ConfigType`, stores
     config in "cfg" dir. If ``fun`` is not specified then its ``main`` function will be called instead.
-    :param overrides: mapping of hydra commands or config options selecting/overwriting. Upplies after
+    :param overrides: mapping of hydra commands or config options selecting/overwriting. Applies after
     ``cmd_line_list``.
-    :return: fun() output
+    :return: `fun()` output
     """
     argv0, *argv_from1 = sys.argv
 
-    # Modified command line to add/change hydra settings
+    # Modify command line to add/change hydra settings
+
     # if argv0.endswith('.py'):  #?
     cmd_line_list_upd = [argv0]
-    #  and next input arguments from cmd_line_list
-    if cmd_line_list is not None and any(
-        cmd.startswith(("--config-path", "--config-dir", "hydra.searchpath")) for cmd in cmd_line_list
-    ):  # do not change config search path if modified in command line
-            config_path = None
-    else:
 
-        # Add raw data dir path "cfg_proc" subdir to hydra config search path
-        from pathlib import Path
+    # Change config search path (if it is not modified in command line, else get it) and set hydra output dirs
+    # inside
+    config_path = path = None
+    if cmd_line_list is not None:
+        for cmd in cmd_line_list:
+            if cmd.startswith(("--config-path", "--config-dir", "hydra.searchpath")):
+                key, path = cmd.split('=')
+                if key == "hydra.searchpath":
+                    config_path = path[1:-1]  # strip brackets
+                config_path = Path(config_path.strip('"'))
+                break
+        if config_path is None:
+            # Add raw data dir path "cfg_proc" subdir to hydra config search path
 
-        from yaml import safe_dump as yaml_safe_dump
-        # Searching in command line arguments ending with "path" else in `overrides[in/input]` keys else argv0
-        dir_raw = [cmd.split("path=") for cmd in cmd_line_list if "path=" in cmd]
-        if dir_raw:
-            dir_raw = Path(dir_raw[0][-1])
-        elif overrides:
-            dir_raw = [
-                v for k, v in overrides.get("in", overrides.get("input")).items() if k.endswith("path")
-            ]
-            if dir_raw:
-                dir_raw = Path(dir_raw[0])
-        if not dir_raw:
-            # Else add current path
-            dir_raw = Path(argv0).parent  # old '"file://{}"'.format(sys.argv[0].replace("\\", "/"))
-        if dir_raw:
-            try:
-                dir_raw = dir_raw.parents[-dir_raw.parts.index('_raw') - 1]
-            except (ValueError, IndexError):
-                dir_raw = dir_raw.parent / '_raw'
-            config_path = dir_raw / "cfg_proc"
+            # Searching in command line arguments ending with "path" else in `overrides[in/input]` keys else argv0
+            path = [cmd.split("path=") for cmd in cmd_line_list if "path=" in cmd]
+            if path:
+                path = Path(path[0][-1].strip('"'))
+            elif overrides:
+                path = [
+                    v for k, v in overrides.get("in", overrides.get("input")).items() if k.endswith("path")
+                ]
+                if path:
+                    path = Path(path[0].strip('"'))
+            if not path:
+                # Else add current path
+                path = Path(argv0).parent  # old '"file://{}"'.format(sys.argv[0].replace("\\", "/"))
+            if path:
+                parents = path.parents
+                try:
+                    dir_raw = parents[-path.parts.index('_raw') - 1]
+                except (IndexError, ValueError):
+                    if not path.is_dir():
+                        for path in parents:
+                            if path.is_dir():
+                                break
+                    dir_raw = path / '_raw'
+                config_path = dir_raw / "cfg_proc"
 
-
-        # # Saving config_path to hydra main config - old way while absolute path in cmd haven't worked
-        # py_file = Path(argv0)
-        # path_cfg_default = (lambda p: p.parent / 'cfg' / p.name)(py_file).with_suffix('.yaml')
-        # with path_cfg_default.open('w') as f:
-        #     yaml_safe_dump(
-        #         {
-        #             "defaults": [f"base_{py_file.stem}", "_self_"],
-        #             "hydra": {"searchpath": [f"file://{config_path.as_posix()}".replace("///", "//")]},
-        #         },
-        #         f
-        #     )
-        #     f.flush()
+            # # Saving config_path to hydra main config - old way while absolute path in cmd haven't worked
+            # py_file = Path(argv0)
+            # path_cfg_default = (lambda p: p.parent / 'cfg' / p.name)(py_file).with_suffix('.yaml')
+            # from yaml import safe_dump as yaml_safe_dump
+            # with path_cfg_default.open('w') as f:
+            #     yaml_safe_dump(
+            #         {
+            #             "defaults": [f"base_{py_file.stem}", "_self_"],
+            #             "hydra": {"searchpath": [f"file://{config_path.as_posix()}".replace("///", "//")]},
+            #         },
+            #         f
+            #     )
+            #     f.flush()
+            if config_path:
+                cmd_line_list_upd += [f'hydra.searchpath=["{config_path.as_posix().strip(chr(34))}"]']
+                # (strip user added quotation marks to ensure only one keeped)
 
     # todo: check colorlog is installed before this:
+    hydra_dir = (config_path / "log") if config_path else 'outputs'
+    hydra_time = '${now:%Y%m%d_%H%M}'
     cmd_line_list_upd += [
         "hydra/job_logging=colorlog",
         "hydra/hydra_logging=colorlog",
         "hydra.job_logging.formatters.colorlog.format='%(cyan)s%(asctime)s %(blue)s%(funcName)10s"
         "%(cyan)s: %(log_color)s%(message)s%(reset)s\t'",  # \\< not supported
-        "hydra.run.dir='outputs/${now:%Y%m%d_%H%M}'",  # /${hydra.job.name} Interpolation key not found
-        "hydra.sweep.dir='outputs'",
-        "hydra.sweep.subdir='${now:%Y%m%d_%H%M}'",
+        f"hydra.run.dir='{hydra_dir}/{hydra_time}'",
+        f"hydra.sweep.dir='{hydra_dir}'",
+        "hydra.sweep.subdir='{}-{}'".format(
+            hydra_time, "${hydra.job.num}"  # job.override_dirname?
+        ),
         # "hydra.job_logging.formatters.colorlog.style='\\{'" not supported
         #'[%(blue)s%(name)s%(reset)s %(log_color)s%(levelname)s%(reset)s] - %(message)s'
         # ]
@@ -711,8 +742,7 @@ def main_call(
         # %(asctime)s %(log_color)s[%(name)12s:%(lineno)3s'
         # ' %(funcName)18s ]\t%(levelname)-.6s  %(message)s'
     ]
-    if config_path:
-        cmd_line_list_upd += [f'hydra.searchpath=["{config_path.as_posix().strip(chr(34))}"]']
+
     if cmd_line_list is not None:
         # Not brake diagnostic commands
         if cmd_line_list[0].startswith('--info'):

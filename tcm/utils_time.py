@@ -101,29 +101,39 @@ def multiindex_replace(pd_index, new1index, itm):
     return pd_index
 
 
-def timzone_view(t, dt_from_utc=0):
+def timezone_view(t, dt_from_utc=0):
     """
-    
-    :param t: Pandas Timestamp time
-    :param dt_from_utc: pd.Timedelta - timezone offset
-    :return: t with applied timezone dt_from_utc
-      Assume that if time zone of tz-naive Timestamp is naive then it is UTC
-    """
-    tzinfo = 'UTC' if dt_from_utc in (0, pd.Timedelta(0)) else tzoffset(
-        None, pd.to_timedelta(dt_from_utc).total_seconds())  # better pd.datetime.timezone?
+    Convert a given time 't' to a specific timezone offset from UTC.
+    If the time 't' is timezone-naive, it's assumed to be in UTC.
 
-    if isinstance(t, pd.DatetimeIndex) or isinstance(t, pd.Timestamp):
+    :param t: Pandas Timestamp or DatetimeIndex. The time to be converted.
+    :param dt_from_utc: int or any pd.to_timedelta() compatible argument.
+        The offset from UTC in seconds. Defaults to 0.
+    :return: The time 't' converted to the timezone offset by 'dt_from_utc' from UTC.
+    """
+    # If dt_from_utc is 0 or equivalent to pd.Timedelta(0), set timezone info to 'UTC'
+    tzinfo = (
+        "UTC"
+        if dt_from_utc in (0, pd.Timedelta(0))
+        else tzoffset(None, pd.to_timedelta(dt_from_utc).total_seconds())
+    )
+
+    # Check if 't' is either a Pandas DatetimeIndex or a Timestamp
+    if isinstance(t, (pd.DatetimeIndex, pd.Timestamp)):
+        # If 't' is timezone-naive, localize it to 'UTC'
         if t.tz is None:
-            # think if time zone of tz-naive Timestamp is naive then it is UTC
-            t = t.tz_localize('UTC')
+            t = t.tz_localize("UTC")
+        # Convert 't' to the desired timezone
         return t.tz_convert(tzinfo)
     else:
+        # If 't' is not a subclass of pd.Timestamp/DatetimeIndex, convert it
         lf.error(
-            'Bad time format {}: {} - it is not subclass of pd.Timestamp/DatetimeIndex => Converting...', type(t), t)
+            "Bad time format {}: {} - it is not subclass of pd.Timestamp/DatetimeIndex => Converting...",
+            type(t),
+            t,
+        )
         t = pd.to_datetime(t).tz_localize(tzinfo)
         return t
-        # t.to_datetime().replace(tzinfo= tzinfo) + dt_from_utc
-    # t.astype(datetime).replace(
 
 
 # ----------------------------------------------------------------------
@@ -147,7 +157,7 @@ def intervals_from_period(
     max_date: Optional[pd.Timestamp] = None,
     period: Optional[str] = '999D',
     **kwargs
-) -> (pd.Timestamp, pd.DatetimeIndex):
+) -> Tuple[pd.Timestamp, pd.DatetimeIndex]:
     """
     Divide datetime_range on intervals of period, normalizes starts[1:] if period>1D and returns them in tuple's 2nd element
     :param period: pandas offset string 'D' (Y, D, 5D, H, ...) if None such field must be in cfg_in

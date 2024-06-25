@@ -19,7 +19,7 @@ from .utils2init import FakeContextIfOpen, standard_error_info, my_logging
 lf = my_logging(__name__)
 
 
-def rot_matrix_x(c, s):
+def rot_matrix_x(c, s) -> np.ndarray:
     """ Rotation matrix to rotate 3D vector around x axis
     :param c, s: - cos() and sin() of rotation angle
     """
@@ -28,7 +28,7 @@ def rot_matrix_x(c, s):
                      [0, s, c]], np.float64)
 
 
-def rot_matrix_y(c, s):
+def rot_matrix_y(c, s) -> np.ndarray:
     """ Rotation matrix to rotate 3D vector around y axis
     :param c, s: - cos() and sin() of rotation angle
     """
@@ -37,7 +37,7 @@ def rot_matrix_y(c, s):
                      [-s, 0, c]], np.float64)
 
 
-def rot_matrix_z(c, s):
+def rot_matrix_z(c, s) -> np.ndarray:
     """ Rotation matrix to rotate 3D vector around z axis
     :param c, s: - cos() and sin() of rotation angle
     """
@@ -124,14 +124,14 @@ def h5copy_coef(h5file_source=None, h5file_dest=None, tbl=None, tbl_source=None,
                 ok_to_replace_group=False
                 ):
     """
-    Copy tbl from h5file_source to h5file_dest overwriting tbl + '/coef/H/A and '/coef/H/C' with H and C if provided
-    todo: add path to h5file_source
+    Copy tbl from h5file_source to h5file_dest overwriting tbl + '/coef/H/A and '/coef/H/C' with H and C if
+    provided. Skip to write `dict_matrices` elements that are None, but check that they are not exist else
+    error
     :param h5file_source: name of any hdf5 file with existed coef to copy structure
     :param h5file_dest: name of hdf5 file to paste structure
-    :param dict_matrices: dict of numpy arrays - to write or list of paths to coefs (to matrices) under tbl - to copy them
-    dict_matrices_for_h5() from inclinometer.incl_calibr helps to create standard paths from dict with fields Ag, Cg, ...
-    Skip to write dict_matrices elements that are None, but will check that they are not exist else gwerror
-    :param dates: can contain date attibutes for each of dict_matrices key to add to corresponded data in hdf5
+    :param dict_matrices: dict of numpy arrays - to write or list of paths to coefs (to matrices) under tbl -
+    to copy them. See `dict_matrices_for_h5()` to create standard paths from dict with fields Ag, Cg, ...
+    :param dates: date attributes for dict_matrices keys that will be written to HDF5
     :param tbl:
     :param tbl_source:
     :param tbl_dest:
@@ -178,11 +178,14 @@ def h5copy_coef(h5file_source=None, h5file_dest=None, tbl=None, tbl_source=None,
     #         return False
 
     def path_h5(file):
-        return Path(file.filename if isinstance(file, h5py._hl.files.File) else file)
+        try:
+            return Path(file.filename)  # if isinstance(file, (h5py._hl.files.File, tables.file.File))
+        except AttributeError:
+            return Path(file)
 
     def save_operation(h5source=None):
         """
-        update dict_matrices in h5file_dest. h5source may be used to copy from h5source
+        Update dict_matrices in h5file_dest. h5source may be used to copy from h5source
         :param h5source: opened h5py.File, if not None copy h5file_source//tbl_source//coef to h5file_dest//tbl//coef before update
         uses global:
             h5file_dest
@@ -190,29 +193,32 @@ def h5copy_coef(h5file_source=None, h5file_dest=None, tbl=None, tbl_source=None,
             dict_matrices
         """
         nonlocal dict_matrices
-
+        table_written = None
         with FakeContextIfOpen(lambda f: h5py.File(f, 'a'), h5file_dest) as h5dest:
-            try:
+            try:  # we may generate FileExistsError error that to catch (not real error if use dict_matrices)
                 if h5source is None:
                     if tbl_dest != tbl_source:
                         h5source = h5dest
                     else:
                         raise FileExistsError(f'Can not copy to itself {h5dest.filename}//{tbl_dest}')
-                elif path_h5(h5dest) == h5source and tbl_dest == tbl_source:
+                elif path_h5(h5dest) == path_h5(h5source) and tbl_dest == tbl_source:
                     raise FileExistsError(f'Can not copy to itself {h5dest.filename}//{tbl_dest}')
 
                 # Copy using provided paths:
                 if h5source:
-                    path_coef = f'//{tbl_source}//coef'
-                    lf.info(f'copying "coef" from {path_h5(h5source)}//{tbl_source} to {h5dest.filename}//{tbl_dest}')
+                    coef_path_src = f"//{tbl_source}//coef"
+                    lf.info(
+                        f'copying "coef" from {path_h5(h5source)}//{tbl_source} '
+                        f'to {h5dest.filename}//{tbl_dest}'
+                        )
                     # Reuse previous calibration structure:
                     # import pdb; pdb.set_trace()
                     # h5source.copy('//' + tbl_source + '//coef', h5dest[tbl_dest + '//coef'])
                     try:
-                        h5source.copy(path_coef, h5dest[tbl_dest])
+                        h5source.copy(coef_path_src, h5dest[tbl_dest])
                         # h5source[tbl_source].copy('', h5dest[tbl_dest], name='coef')
                     except RuntimeError as e:  # Unable to copy object (destination object already exists)
-                        replace_coefs_group_on_error(h5source, h5dest, path_coef, e)
+                        replace_coefs_group_on_error(h5source, h5dest, coef_path_src, e)
                     except KeyError:  # Unable to open object (object 'incl_b11' doesn't exist)"
                         lf.debug('Creating "{:s}"', tbl_source)
                         try:
@@ -220,8 +226,8 @@ def h5copy_coef(h5file_source=None, h5file_dest=None, tbl=None, tbl_source=None,
                         except (ValueError, KeyError) as e:  # already exists
                             replace_coefs_group_on_error(h5source, h5dest, tbl_source, e)
                         else:
-                            h5source.copy(path_coef, h5dest[tbl_dest])
-
+                            h5source.copy(coef_path_src, h5dest[tbl_dest])
+                    table_written = f"{tbl_dest.replace('//', '/')}/coef"
             except FileExistsError:
                 if dict_matrices is None:
                     raise
@@ -229,31 +235,31 @@ def h5copy_coef(h5file_source=None, h5file_dest=None, tbl=None, tbl_source=None,
             if dict_matrices:  # not is None:
                 have_values = isinstance(dict_matrices, dict)
                 lf.info(f'updating {h5file_dest}/{tbl_dest}/{{}}', str(dict_matrices))  # .keys()
-
-                if have_values:  # Save provided values:
+                if have_values:
+                    # Save provided values
                     date_now_str = datetime.now().replace(microsecond=0).isoformat()
-                    for k in dict_matrices.keys():
-                        path = f'{tbl_dest}{k}'
-                        data = dict_matrices[k]
+                    for rel_path in dict_matrices.keys():
+                        path = f'{tbl_dest}{rel_path}'
+                        data = dict_matrices[rel_path]
                         if data is None:
                             continue
-                        if isinstance(dict_matrices[k], (int, float)) and not (
-                           isinstance(dict_matrices[k], bool) and k.endswith('date')):
-                            data = np.atleast_1d(data)  # Veusz can't load 0d single values
+                        if isinstance(dict_matrices[rel_path], (int, float)) and not (
+                            isinstance(dict_matrices[rel_path], bool) and rel_path.endswith('date')):
+                            data = np.atleast_1d(data)  # to can load in Veusz (can't load 0d single values)
                         try:
                             if isinstance(data, (str, bool)):
-                                if k.endswith('date'):
+                                if rel_path.endswith('date'):
                                     if isinstance(data, bool):
                                         data = date_now_str
-                                        dict_matrices[k] = data
+                                        dict_matrices[rel_path] = data
                                     dtype = 'S19'
                                 else:
-                                    dtype = 'S10'  # 'pid' is only currently possible k str
+                                    dtype = 'S10'  # 'pid' is only currently possible rel_path str
                                 try:
                                     dset = h5dest.create_dataset(path, data=data, dtype=dtype)
                                 except ValueError as e:
                                     lf.info(
-                                        'Can not create {} to write text "{}". Already exist?  => Just writing...',
+                                        'Can not create {} to write text "{}". Already exist? => Writing...',
                                         path, data
                                     )
                                     h5dest[path][...] = data
@@ -261,7 +267,7 @@ def h5copy_coef(h5file_source=None, h5file_dest=None, tbl=None, tbl_source=None,
                                 dtype = np.float64
                                 b_isnan = np.isnan(data)
                                 if np.any(b_isnan):
-                                    lf.warning('not writing NaNs: {}{}...', k, np.flatnonzero(b_isnan))
+                                    lf.warning('not writing NaNs: {}{}...', rel_path, np.flatnonzero(b_isnan))
                                     h5dest[path][~b_isnan] = data[~b_isnan]
                                 else:
                                     h5dest[path][...] = data
@@ -272,7 +278,7 @@ def h5copy_coef(h5file_source=None, h5file_dest=None, tbl=None, tbl_source=None,
                                 '\n==> '.join([a for a in e.args if isinstance(a, str)])
                             )
                             try:
-                                # or if you want to replace the dataset with some other dataset of different shape:
+                                # to replace the dataset with some other dataset of different shape
                                 del h5dest[path]
                             except KeyError as e:
                                 pass
@@ -281,12 +287,14 @@ def h5copy_coef(h5file_source=None, h5file_dest=None, tbl=None, tbl_source=None,
                             lf.debug('Creating "{}"', path)
                             dset = h5dest.create_dataset(path, data=data, dtype=dtype)
                         if dates:
-                            date = isinstance(dates, bool) or dates.get(k) or dates.get(k.rsplit('//', 1)[-1])
+                            date = isinstance(dates, bool) or dates.get(rel_path) or dates.get(
+                                rel_path.rsplit('//', 1)[-1])
                             if date:
                                 if isinstance(date, str):
                                     date = str(date)  # required if date is numpy.str_
                                 try:
-                                    dset.attrs.modify('timestamp', date if isinstance(date, str) else date_now_str)
+                                    dset.attrs.modify(
+                                        'timestamp', date if isinstance(date, str) else date_now_str)
                                 except Exception as e:
                                     dset.attrs['timestamp'] = date if isinstance(date, str) else date_now_str
                 else:
@@ -296,16 +304,17 @@ def h5copy_coef(h5file_source=None, h5file_dest=None, tbl=None, tbl_source=None,
                         path = tbl_source + rel_path
                         try:
                             dict_matrices[path] = h5source[path][...]
-                        except AttributeError:  # 'ellipsis' object has no attribute 'encode'
+                        except AttributeError as e:  # 'ellipsis' object has no attribute 'encode'
                             lf.error(
-                                'Skip update coef: dict_matrices must be None or its items must point to matrices {}',
-                                '\n==> '.join(a for a in e.args if isinstance(a, str)))
+                                'Skip update coef: dict_matrices must be None or its items must point to '
+                                'matrices {}', '\n==> '.join(a for a in e.args if isinstance(a, str)))
                             continue
                         h5dest[path][...] = dict_matrices[path]
                 h5dest.flush()
+                table_written = f"{tbl_dest.replace('//', '/')}/coef"
             else:
                 dict_matrices = {}
-
+            return table_written
             # or if you want to replace the dataset with some other dataset of different shape:
             # del f1['meas/frame1/data']
             # h5dest.create_dataset(tbl_dest + '//coef_cal//H//A', data= A  , dtype=np.float64)
@@ -324,7 +333,9 @@ def h5copy_coef(h5file_source=None, h5file_dest=None, tbl=None, tbl_source=None,
     with FakeContextIfOpen(
             (lambda f: h5py.File(f, 'r')) if h5file_source != h5file_dest else None, h5file_source
     ) as h5source:
-        save_operation(h5source)
+        _ = save_operation(h5source)
+        tables_written = [_] if _ else []
+
 
     # if h5file_source != h5file_dest:
     #     with h5py.File(h5file_source, 'r') as h5source:
@@ -336,20 +347,23 @@ def h5copy_coef(h5file_source=None, h5file_dest=None, tbl=None, tbl_source=None,
 
     # Confirm the changes were properly made and saved:
     b_ok = True
-    with FakeContextIfOpen(lambda f: h5py.File(f, 'r'), h5file_dest) as h5dest:
-        for k, v in dict_matrices.items():
-            if isinstance(v, str):
-                if h5dest[tbl_dest + k][...].item().decode() != v[:19]:
-                    lf.error('h5copy_coef(): value of {}{} not updated to "{}"!', tbl_dest, k, v)
+    if dict_matrices:
+        with FakeContextIfOpen(lambda f: h5py.File(f, 'r'), h5file_dest) as h5dest:
+            for rel_path, v in dict_matrices.items():
+                if isinstance(v, str):
+                    if h5dest[tbl_dest + rel_path][...].item().decode() != v[:19]:
+                        lf.error('h5copy_coef(): value of {}{} not updated to "{}"!', tbl_dest, rel_path, v)
+                        b_ok = False
+                elif v is None:
+                    assert (tbl_dest + rel_path) not in h5dest
+                elif not np.allclose(h5dest[tbl_dest + rel_path][...], v, equal_nan=True):
+                    lf.error('h5copy_coef(): coef. {}{} not updated!', tbl_dest, rel_path)
                     b_ok = False
-            elif v is None:
-                assert (tbl_dest + k) not in h5dest
-            elif not np.allclose(h5dest[tbl_dest + k][...], v, equal_nan=True):
-                lf.error('h5copy_coef(): coef. {}{} not updated!', tbl_dest, k)
-                b_ok = False
-    if b_ok and dict_matrices:
-        print('h5copy_coef() updated coefficients Ok>')
-
+        if b_ok:
+            print('h5copy_coef() updated coefficients Ok>')
+        else:
+            tables_written = []
+    return tables_written
 
 def h5_rotate_coef(h5file_source, h5file_dest, tbl):
     """
