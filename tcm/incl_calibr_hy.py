@@ -36,7 +36,7 @@ if __debug__:
 # import my functions:
 from .cfg_dataclasses import hydra_cfg_store, ConfigInHdf5_Simple, ConfigProgram, main_init, main_init_input_file  #  ConfigProgram is used indirectly
 from .h5_dask_pandas import filter_local
-from .h5toh5 import h5load_ranges
+from . import h5
 
 from .incl_h5clc_hy import ConfigIn_InclProc, incl_calc_velocity_nodask, gen_subconfigs, probes_gen, norm_field
 from .h5inclinometer_coef import channel_cols, dict_matrices_for_h5, h5copy_coef
@@ -134,7 +134,7 @@ class ConfigInHdf5_InclCalibr(ConfigIn_InclProc):
     time_range_nord: List[str] = field(default_factory=list)
     time_range_nord_dict: Dict[str, str] = field(default_factory=dict)  # Dict[int, str] not supported in omegaconf
     # Dict[Optional[str], Optional[List[str]]]
-    
+
 @dataclass
 class ConfigProgramSt(ConfigProgram):
     step_start: int = 1
@@ -376,10 +376,10 @@ def fit_quadric_form(s: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
          [0, 0, 0, -0.25, 0, 0],   # [ 0, 0, 0,-4, 0, 0],
          [0, 0, 0, 0, -0.25, 0],   # [ 0, 0, 0, 0,-4, 0],
          [0, 0, 0, 0, 0, -0.25]])  # [ 0, 0, 0, 0, 0,-4]])
-    
+
     if not linalg.det(S_22):
         print('Singular matrix: no unique solution.')  # numpy.linalg.LinAlgError is going below
-        
+
     # v_1 (eq. 15, solution)
     E = np.dot(c_inv, S_11 - np.dot(S_12, np.dot(linalg.inv(S_22), S_21)))
 
@@ -398,8 +398,8 @@ def fit_quadric_form(s: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
                       [4, 3, 2]], np.int8)]
     n = v_2[:-1, np.newaxis]
     d = v_2[3]
-    
-    
+
+
     # Modified according to Robert R - todo: check:
     # I believe in your code example your M is incorrect. Based on your notation in your Quadric section you have
     # [[a f g],
@@ -411,7 +411,7 @@ def fit_quadric_form(s: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
     #  [g f c]], instead you have the XY term assigned in the f positions.
     # The overall result is that your A_1 matrix will have "mirrored" column 1 and row 1.
     # Interestingly enough, this flip doesn't seem to impact the calibration significantly.
-    
+
     return M, n, d
 
 
@@ -442,7 +442,7 @@ def calibrate(raw3d: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
                 ch_ok_min = s[i_ch_ok].min(axis=1)
                 ch_ok_max = s[i_ch_ok].max(axis=1)
                 center = np.mean([ch_ok_min, ch_ok_max], axis=0)
-                
+
                 # create transformation matrix
                 t = np.reciprocal((ch_ok_max - ch_ok_min)/2).tolist()
                 t.insert(i_ch_bad, 0)
@@ -457,11 +457,11 @@ def calibrate(raw3d: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         else:
             raise
         # center, evecs, radii = ellipsoid_fit()
-    
+
     # Calibration parameters
 
     Q_inv = linalg.inv(Q)
-    # combined bias:           
+    # combined bias:
     b = -np.dot(Q_inv, n) + mean_Hxyz
     # scale factors, soft iron, and misalignment:
     # note: some implementations of sqrtm return complex type, taking real
@@ -575,12 +575,12 @@ def zeroing_azimuth(store: pd.HDFStore, tbl, time_range_nord, coefs=None, cfg_in
     'Ag': (3, 3), 'Cg': (3, 1), 'Ah': (3, 3), 'Ch': array(3, 1), 'azimuth_shift_deg': (1,), 'kVabs': (n,)
     :param cfg_in: dict with fields:
         - time_range_nord
-        - other, needed in h5load_ranges() and optionally in incl_calc_velocity_nodask()
+        - other, needed in h5.load_ranges() and optionally in incl_calc_velocity_nodask()
     :param filter_query: upply this filter query to incl_calc_velocity*() output before mean azimuth calculation
     :return: azimuth_shift_deg: degrees
     """
     lf.debug('Zeroing Nord direction')
-    df = h5load_ranges(store, table=tbl, t_intervals=time_range_nord)
+    df = h5.load_ranges(store, table=tbl, t_intervals=time_range_nord)
     if df.empty:
         lf.info('Zero calibration range out of data scope')
         return
@@ -701,7 +701,7 @@ def main(config: ConfigType) -> None:
     coefs = {}
     cfg['in']['is_counts'] = True
     cfg['out']['aggregate_period'] = None
-    
+
     for d, cfg1, tbl, col_out, pid, i_tbl_part in gen_subconfigs(
             cfg,
             fun_gen=probes_gen,
@@ -713,7 +713,7 @@ def main(config: ConfigType) -> None:
             probe_continues = (tbl == tbl_prev and pid == pid_prev)
             tbl_prev = tbl
             pid_prev = pid
-        
+
         n_parts = round(len(cfg1['in']['time_range']) / 2)
         if n_parts > 1:
             if i_tbl_part == 0:
@@ -723,7 +723,7 @@ def main(config: ConfigType) -> None:
                 continue
             else:
                 d = dd.concat(d_list_save)
-        
+
         # replacing changed table name back (that was prepared by gen_subconfigs() to output processed data we don't)
         tbl = tbl.replace('i', 'incl')
         d = filter_local(d, cfg['filter'], ignore_absent={'h_minus_1', 'g_minus_1'})

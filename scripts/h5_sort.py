@@ -1,13 +1,13 @@
 # Andrey Korzh, 20.10.2023
-# 
+#
 import logging
 from pathlib import Path
-from tcm.h5toh5 import h5out_init, h5find_tables, h5move_tables
+from tcm import h5
 
 def h5_sort(path_db_in, tables=None, path_db_out=None):
-    failed_storages = h5move_tables({
+    failed_storages = h5.move_tables({
         'temp_db_path': Path(path_db_in),
-        'db_path':      path_db_out or Path(path_db_in).with_name(f'{Path(path_db_in).stem}_sorted.h5'),
+        'db_path':      path_db_out or Path(path_db_in).with_name(f'{Path(path_db_in).stem}_sorted.h5.'),
         'b_del_temp_db': False
         # 'tables_log': []
     },
@@ -25,6 +25,6 @@ def h5_sort(path_db_in, tables=None, path_db_out=None):
 
 
 if __name__ == '__main__':
-    path_db_in = Path(r'd:\WorkData\_experiment\inclinometer\231010_stand,tank@i52-56\_raw\231011tank.raw.h5')
+    path_db_in = Path(r'd:\WorkData\_experiment\inclinometer\231010_stand,tank@i52-56\_raw\231011tank.raw.h5.')
     tables = 'incl53'
     h5_sort(path_db_in, tables)
