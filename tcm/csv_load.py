@@ -2,14 +2,29 @@ import logging
 import re
 import sys
 from collections import defaultdict
-from functools import partial
+from functools import partial, update_wrapper
 from itertools import islice
 from io import StringIO
 from pathlib import Path, PurePath
 import glob
 from typing import (
-    Any, AnyStr, Callable, Dict, Iterable, List, Mapping, Match, Optional, Union, Sequence, Tuple, TypeVar,
-    BinaryIO, TextIO, Iterator
+    Any,
+    AnyStr,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Match,
+    MutableMapping,
+    Optional,
+    Union,
+    Sequence,
+    Tuple,
+    TypeVar,
+    BinaryIO,
+    TextIO,
+    Iterator,
 )
 from operator import gt, lt
 
@@ -30,29 +45,29 @@ from .utils2init import (
 lf = LoggingStyleAdapter(logging.getLogger(__name__))
 
 
-def init_input_cols(cfg_in=None):
+def init_input_cols(cfg_in: Optional[MutableMapping[str, Any]]=None):
     """
-        Append/modify dictionary cfg_in for parameters of dask/pandas load_csv() function and of save to hdf5.
+    Append/modify `cfg_in` for parameters of dask / pandas `load_csv()` and `numpy.loadtxt()` functions
     :param cfg_in: dictionary, may has fields:
-        header (required if no 'cols') - comma/space separated string. Column names in source file data header
-        (as in Veusz standard input dialog), used to find cfg_in['cols'] if last is not cpecified
-        dtype - type of data in column (as in Numpy loadtxt)
-        converters - dict (see "converters" in Numpy loadtxt) or function(cfg_in) to make dict here
-        cols_load - list of used column names
-
+    - header (required if no 'cols') - comma/space separated string. Column names in source file data header
+    (as in Veusz standard input dialog), used to find cfg_in['cols'] if last is not cpecified
+    - dtype - numpy type of data in column (as in `loadtxt()`)
+    - converters - dict (see "converters" in `loadtxt()`) or function(cfg_in) to make dict here
+    - cols_load - list of used column names
+a list from the header by splitting it and removing format specifiers.
     :return: modified cfg_in dictionary. Will have fields:
-        cols - list constructed from header by spit and remove format cpecifiers: '(text)', '(float)', '(time)'
-        cols_load - list[int], indexes of ``cols`` in needed to save order
-        coltime/coldate - assigned to index of 'Time'/'Date' column
-        dtype: numpy.dtype of data after using loading function but before filtering/calculating fields
+    - cols: a list from the header by splitting it and removing format specifiers: '(text)', '(float)', '(time)'
+    - cols_load: list[int], indexes of ``cols`` in needed to save order
+    - coltime/coldate: assigned to index of 'Time'/'Date' column
+    - dtype: numpy.dtype of data after using loading function but before filtering/calculating fields
             numpy.float64 - default and for '(float)' format specifier
             numpy string with length cfg_in['max_text_width'] - for '(text)'
             datetime64[ns] - for coldate column (or coltime if no coldate) and for '(time)'
-        col_index_name - index name for saving Pandas frame. Will be set to name of cfg_in['coltime'] column if not exist already
-        used in main() default time postload proc only (if no specific loader which calculates and returns time column for index)
-        cols_loaded_save_b - columns mask of cols_load to save (some columns needed only before save to calulate
-        of others). Default: excluded (text) columns and index and coldate
-        (because index saved in other variable and coldate may only used to create it)
+    - col_index_name: index name for saving Pandas frame. Will be set to name of cfg_in['coltime'] column
+        if not exist already used in main() default time postload proc only (if no specific loader which
+        calculates and returns time column for index) cols_loaded_save_b - columns mask of cols_load to save
+        (some columns needed only before save to calulate of others). Default: excluded (text) columns and
+        index and coldate (because index saved in other variable and coldate may only used to create it)
 
     Example
     -------
@@ -81,7 +96,7 @@ def init_input_cols(cfg_in=None):
     b_was_no_dtype = 'dtype' not in cfg_in
     if b_was_no_dtype:
         cfg_in['dtype'] = np.array([np.float64] * len(cfg_in['cols']))
-        # 32 gets trunkation errors after 6th sign (=> shows long numbers after dot)
+        # 32 gets truncation errors after 6th sign (=> shows long numbers after dot)
     elif isinstance(cfg_in['dtype'], str):
         cfg_in['dtype'] = np.array([np.dtype(cfg_in['dtype'])] * len(cfg_in['cols']))
     elif isinstance(cfg_in['dtype'], list):
@@ -94,11 +109,11 @@ def init_input_cols(cfg_in=None):
     for col, col_name in (['coltime', 'Time'], ['coldate', 'Date']):
         if col not in cfg_in:
             # if cfg['col(time/date)'] is not provided try find 'Time'/'Date' column name
-            if not (col_name in cfg_in['cols']):
+            if col_name not in cfg_in['cols']:
                 col_name = col_name + '(text)'
-            if not (col_name in cfg_in['cols']):
+            if col_name not in cfg_in['cols']:
                 continue
-            cfg_in[col] = cfg_in['cols'].index(col_name)  # assign 'Time'/'Date' column index to cfg['col(time/date)']
+            cfg_in[col] = cfg_in['cols'].index(col_name)  # 'Time'/'Date' csv column index
         elif isinstance(cfg_in[col], str):
             cfg_in[col] = cfg_in['cols'].index(cfg_in[col])
 
@@ -112,14 +127,14 @@ def init_input_cols(cfg_in=None):
             # converters produce datetime64[ns] for coldate column (or coltime if no coldate):
             cfg_in['dtype'][cfg_in['coldate' if 'coldate' in cfg_in else 'coltime']] = 'datetime64[ns]'
 
-    # process format cpecifiers: '(text)','(float)','(time)' and remove it from ['cols'],
-    # also find not used cols cpecified by skipping name between commas like in 'col1,,,col4'
+    # process format specifiers: '(text)','(float)','(time)' and remove it from ['cols'],
+    # also find not used cols specified by skipping name between commas like in 'col1,,,col4'
     for i, s in enumerate(cfg_in['cols']):
         if len(s) == 0:
             cols_load_b[i] = 0
             cfg_in['cols'][i] = f'NotUsed{i}'
         else:
-            b_i_not_in_converters = (not (i in cfg_in['converters'].keys())) \
+            b_i_not_in_converters = (i not in cfg_in['converters'].keys()) \
                 if cfg_in['converters'] else True
             i_suffix = s.rfind('(text)')
             if i_suffix > 0:  # text
@@ -147,7 +162,7 @@ def init_input_cols(cfg_in=None):
         cfg_in['cols_load'] = np.array(cfg_in['cols'])[cols_load_b]
 
     col_names_out = cfg_in['cols_load'].copy()
-    # Convert ``cols_load`` to index (to be compatible with numpy loadtxt()), names will be in cfg_in['dtype'].names
+    # Convert ``cols_load`` to index (to be compatible both with readcsv() and numpy loadtxt())
     cfg_in['cols_load'] = np.int32([
         cfg_in['cols'].index(c) for c in cfg_in['cols_load'] if c in cfg_in['cols']
         ])
@@ -219,23 +234,21 @@ def csv_process(
     """
     utils_time_corr.tim_min_save = pd.Timestamp('now', tz='UTC')  # initialisation for time_corr_df()
     utils_time_corr.tim_max_save = pd.Timestamp(0, tz='UTC')
-    meta_time_and_mask = {'Time': 'datetime64[ns, utc]', 'b_ok': np.bool_}
     n_overlap = 2 * int(np.ceil(cfg_in['fs'])) if cfg_in.get('fs') else 50
     b_overlap = t_prev is not None
-    # Process df and get date in ISO string or numpy standard format
+    # Convert df columns (at least get date)
     try:
-        try:
-            get_out_types = cfg_in['fun_proc_loaded'].meta_out
-        except AttributeError:
-            lf.debug('time correction...')                           # only Time column
-            date = cfg_in['fun_proc_loaded'](df, cfg_in)
-
-        else:  # get_out_types is not None => fun_proc_loaded() will return full data DataFrame
-            lf.debug('processing csv data with time correction...')  # not only Time column
-            if callable(get_out_types):
-                meta_out = get_out_types([(k, v[0]) for k, v in cfg_in['dtype'].fields.items()])
+        # Use `meta_out` attribute, that was used historically with dask, indicating comlex output type to
+        # determine whether we must get modified dataframe in fun_proc_loaded
+        if hasattr(cfg_in['fun_proc_loaded'], 'meta_out'):
+            # fun_proc_loaded() will replace our input data DataFrame
+            lf.debug("converting csv columns with time correction...")
             df = cfg_in['fun_proc_loaded'](df, cfg_in)
             date = df.Time
+        else:
+            # fun_proc_loaded() gives only Time column
+            lf.debug('time correction...')
+            date = cfg_in['fun_proc_loaded'](df, cfg_in)
 
         if b_overlap:
             date = pd.concat([t_prev, date])
@@ -353,7 +366,7 @@ def csv_read_gen(paths: Sequence[Union[str, Path]],
     if read_csv_args['converters']:
         read_csv_args['dtype'] = {k: v[0] for i, (k, v) in enumerate(read_csv_args['dtype'].fields.items()) if i not in read_csv_args['converters']}
 
-    t_prev = None
+    t_prev = None  #  not corrected part of previous time chunk for time_corr() filtering in csv_process()
     for i1_path, path in enumerate(paths, start=1):
         # Save params that may be need in `csv_process()` (to extract date)
         cfg_in['file_cur'] = Path(path)
@@ -416,19 +429,46 @@ def csv_read_gen(paths: Sequence[Union[str, Path]],
 
             # lf.exception('If file "{}" have no data try to delete it?', paths)
 
-# #############################################################################################################
-# def text_type(file_stem):
-#     """
-#     Type of file (probe).
-#     :param file_stem: file name without extension
-#     :return: 'p' if file_stem is like "INKL_P01"
-#     """
-#     return 'p' if 'P' in file_stem[5] else 'i'
 
-
-def config_model(text_type, get_regex_only=False) -> Union[bytes, dict[str, Any]]:
+def config_text_regex(text_type) -> bytes:
     """
-    Parameters to correct and (optionally) load text file (csv) data
+    Regex to check / correct lines of text data (see csv_specific_proc.correct_txt())
+    :param text_type: one letter among (i, p) to get corresponding parameters (for any other returns None).
+    todo: Implement for b, d, w.
+    :param get_regex_only: get only values of 'text_line_regex' field of normally returned dict
+    :return: text_line_regex:
+    """
+    if text_type is None:
+        return None
+    b_default_type = text_type in ('i', '', 'b')
+    text_line_regex = b'^(?P<use>' + csv_specific_proc.century + br'\d{2}(,\d{1,2}){5}' + (  # date & time
+        br'(,\-?\d{1,6}){6},\d{1,2}(\.\d{1,2})?,\-?\d{1,3}(\.\d{1,2})?).*' if b_default_type else
+        br'(,\-?\d{1,6}){6}(,\-?\d{1,8}),\d{1,2}(\.\d{1,2})?,\-?\d{1,3}(\.\d{1,2})?).*'  # if text_type == 'p'
+        # Ax,y,z,Mx,y,z,ADC,T,Bat
+    )                                   # ,160,-2576,-13808,-111,62,547
+        # br'(,\-?\d{1,2}\.\d{2}){2}).*' if text_type == 'w'           # ,1849841,21.63,5.42
+
+    return text_line_regex
+
+
+def config_text_header_dtype(text_type) -> dict[str, Any]:
+    if text_type is None:
+        return {}
+    if text_type not in ('i', 'p', 'b', 'd', 'w'):
+        raise TypeError('Probe model not recognized!')
+    b_default_type = text_type in ('i', '', 'b')
+    cfg_for_type = {
+        "header": "yyyy(text),mm(text),dd(text),HH(text),MM(text),SS(text),Ax,Ay,Az,Mx,My,Mz"
+        + (",Battery,Temp" if b_default_type else ",P_counts,Temp,Battery"),
+        "dtype": "|S4 |S2 |S2 |S2 |S2 |S2 i2 i2 i2 i2 i2 i2 f8 f8".split()
+        + ([] if b_default_type else ["f8"]),
+    }
+    return cfg_for_type
+
+
+def config_text_header_dtype_regex(text_type) -> dict[str, Any]:
+    """
+    Parameters to correct and (optionally) load text file (csv data)
     :param text_type: one letter among (i, p) to get corresponding parameters (for any other returns None).
     todo: Implement for b, d, w.
     :param get_regex_only: get only values of 'text_line_regex' field of normally returned dict
@@ -438,28 +478,9 @@ def config_model(text_type, get_regex_only=False) -> Union[bytes, dict[str, Any]
     - dtype:
     or only its 'text_line_regex' field value if ``get_regex_only`` is True
     """
-    if text_type is None:
-        return {}
-    if text_type not in ('i', 'p', 'b', 'd', 'w'):
-        raise TypeError('Probe model not recognised!')
-    b_default_type = text_type in ('i', '', 'b')
-    text_line_regex = b'^(?P<use>' + csv_specific_proc.century + br'\d{2}(,\d{1,2}){5}' + (  # date & time
-        br'(,\-?\d{1,6}){6},\d{1,2}(\.\d{1,2})?,\-?\d{1,3}(\.\d{1,2})?).*' if b_default_type else
-        br'(,\-?\d{1,6}){6}(,\-?\d{1,8}),\d{1,2}(\.\d{1,2})?,\-?\d{1,3}(\.\d{1,2})?).*'  # if text_type == 'p'
-        # Ax,y,z,Mx,y,z,ADC,T,Bat
-    )                                   # ,160,-2576,-13808,-111,62,547
-        # br'(,\-?\d{1,2}\.\d{2}){2}).*' if text_type == 'w'           # ,1849841,21.63,5.42
-
-    if get_regex_only:
-        return text_line_regex
-
-    cfg_for_type = {
-        'text_line_regex': text_line_regex,
-        'header': 'yyyy(text),mm(text),dd(text),HH(text),MM(text),SS(text),Ax,Ay,Az,Mx,My,Mz' + (
-            ',Battery,Temp' if b_default_type else ',P_counts,Temp,Battery'),
-        'dtype': '|S4 |S2 |S2 |S2 |S2 |S2 i2 i2 i2 i2 i2 i2 f8 f8'.split() + ([] if b_default_type else ['f8']),
+    return {
+        **config_text_header_dtype(text_type), "text_line_regex": config_text_regex(text_type),
     }
-    return cfg_for_type
 
 
 raw_pattern_default = '*{prefix:}{number:0>2}*.[tT][xX][tT]'
@@ -474,37 +495,38 @@ def correct_files(
     fun_correct=None,
     sub_str_list: Optional[Union[Callable[[str], Union[str, bytes]], Sequence[Union[str, bytes]]]] = None,
     **kwargs
-) -> Dict[Tuple[str, str], list[Path]]:
+) -> Dict[Tuple[str, int], list[Path]]:
     """
-    Find and correct raw files for specified probes. If file for probe is not a path/mask then search corrected file.
+    Find and correct with `fun_correct` raw files for specified probes. If file for probe is not a
+    path/mask then search corrected file.
     :param raw_parent:
     :param raw_subdir: Optional subdir or zip/rar archive name (data will be unpacked) in "path_cruise/_raw".
-    Symbols * and ? are not supported for directories (to load from many directories/archives) but `prefix` and `number`
-    format strings are available instead.
-    :param raw_pattern: mask to find raw files: Python "format" command pattern to format with {prefix} and {number}
-        placeholders (where prefix is a ``prefix`` argument and number will be one of specified in ``probes`` arg).
-        To match files in archive the subdirectories can be prepended with "/" but files will be unpacked with flattened
-        path in created dir with name constructed from path in archive
+    Symbols * and ? are not supported for directories (to load from many directories/archives) but `prefix`
+    and `number` format strings are available instead.
+    :param raw_pattern: mask to find raw files: Python "format" command pattern to format with {prefix} and
+    {number} placeholders (where prefix is a ``prefix`` argument and number will be one of specified in
+    ``probes`` arg). To match files in archive the subdirectories can be prepended with "/" but files will be
+    unpacked with flattened path in created dir with name constructed from path in archive
     :param prefix: word, that should be in raw input file
     :param probes: iterable of probes identifiers. Can be
     - digit: if only one device type for each prober number (include device type in prefix).
     - {model}{number}: {model} should not contain digits, do not repeat model in ``prefix``.
-    - None: we use 2-digit numbers from '01' to '99'
-    :param fun_correct: callable returning Path of corrected file with arguments (as in csv_specific_proc.correct_txt()
-     except ``sub_str_list`` argument):
+    - None: we use numbers < 100 (we will format them as 2-digit words from '01' to '99')
+    :param fun_correct: callable returning Path of corrected file with arguments (as in
+    csv_specific_proc.correct_txt() except ``sub_str_list`` argument):
         file_in,
         dir_out: ,
         binary_mode=False,
         mod_file_name
     :param sub_str_list: ``sub_str_list`` argument of fun_correct() or function to get it from file name (
-    see correct_txt())
+    see `correct_txt()`)
     :param mod_name: function to get probe models and names of corrected raw files from source raw file names. Default:
         csv_specific_proc.mod_name(x, add_prefix='@')
     :param kwargs: not used
-    :return: probes_found: dict with:
-    - keys: tuples (model, pid) where:
-      - model: model abbreviation (one letter among i, b, d, p, w) or '' if not recognized
-      - pid: probe identifier = item from input probes: model and numder
+    :return: {(model, number): files} dict of found probes, where:
+    - keys: tuples (model, number) where:
+      - model: str, model abbreviation (one letter among i, b, d, p, w) or '' if not recognized
+      - number: int, probe number from input `probes` parameter
     - values: list of corrected files paths for probes
     """
 
@@ -522,27 +544,42 @@ def correct_files(
                 probes = [int(pattern_name_parts['number'])]
         else:
             lf.warning(' '.join([
-                'No {number} or {id} part in in.raw_pattern configuration, so all matched files will be assigned to ',
-                f'each of specified {len(probes)} probes number' if len(probes) > 1
+                'No {number} or {id} part in in.raw_pattern configuration, so all matched files will be '
+                'assigned to ', f'each of specified {len(probes)} probes number' if len(probes) > 1
                 else f'specified probe "{probes[0]}"'
             ]))
-    # Try determine if we use arcive (for now without account for specific probe subdir we deteimine laner)
+
+    def gen_pids(probes):
+        def pid_pattern_from_number(number):
+            return f"[0bdp]{number:0>2}"  # 0 for allow 3-digits numbers inputs
+
+        all_models_search_pattern = "[bdp]"
+        if probes is None:
+            model = all_models_search_pattern
+            for number in range(1, 100):
+                yield model, number, pid_pattern_from_number(number)
+        else:
+            for pid in probes:
+                if pid:
+                    if isinstance(pid, int):
+                        model, number = all_models_search_pattern, pid
+                        pid = pid_pattern_from_number(number)
+                    else:
+                        model = pid.rstrip("0123456789")
+                        number = int(pid[len(model) :])
+                else:
+                    model = None
+                    number = None
+                yield model, number, pid
+
+    # Check if `raw_parent` is archive (for now without account for specific probe subdir we determine later)
     arc_supported_suffixes = ('.zip', '.rar')
     arc_suffix_ = raw_parent.suffix.lower()
     arc_suffix_ = [sfx for sfx in arc_supported_suffixes if sfx == arc_suffix_]
     arc_suffix_ = arc_suffix_[0] if arc_suffix_ else None
-    for pid in (range(1, 100) if probes is None else probes):
-        # Search files matched `subdir`/`pattern` matched current probe `pid` or its parts:
-        if isinstance(pid, int):
-            model = '[bdp]'
-            number = f'{pid:0>2}'
-            pid = f'[0bdp]{number}'
-        elif pid:
-            model = pid.rstrip('0123456789')
-            number = pid[len(model):]
-        else:
-            model = None
-            number = None
+
+    # Search files matched `subdir`/`pattern` matched current probe `pid` or its parts:
+    for model, number, pid in gen_pids(probes):
         # Fill patten's placeholders `prefix`, `model`, `number`, `id`:
         # prefix_model = f"{prefix}{model}*"  #  if not prefix or prefix[-1] not in 'ibdpw' else '*'
         subdir = raw_subdir.format(prefix=prefix, model=model, number=number, id=pid)
@@ -562,7 +599,7 @@ def correct_files(
                 # We will open archive and search inside later if no corrected files will be found in dir
 
                 # Corrected raw files output dir name if input is archive (for fun_correct())
-                _ = f"{arc_suffix[1:]}^{str(cur_dir.stem).replace('/', '_')}"
+                _ = f"{str(cur_dir.stem).replace('/', '_')}@{arc_suffix[1:]}"
                 dir_cor_path = raw_parent / _
 
                 glob_processed_in_arc, pattern_to_get_corr_if_arc = \
@@ -584,7 +621,7 @@ def correct_files(
 
             # If already have corrected files for pid with glob name = fun_correct_name(pattern) then use them
             model, glob_corrected = mod_name(
-                pattern_to_get_corr_if_arc if arc_suffix else pattern, parce=bool(pid))
+                pattern_to_get_corr_if_arc if arc_suffix else pattern, parse=bool(pid))
             paths = list((dir_cor_path if arc_suffix else cur_dir).glob(glob_corrected.name))
             # or (raw_parent / cur_dir).glob(f"@{prefix_model}{number:0>2}.txt"  # f"{tbl}.txt"
             if paths:
@@ -593,7 +630,7 @@ def correct_files(
                     # keep only that paths that has no corresponding corrected path
                     _, paths_not_corr = paths_not_corr, []
                     for p in _:
-                        __, p_cor = mod_name(p, parce=False)
+                        __, p_cor = mod_name(p, parse=False)
                         if p_cor not in paths:
                             paths_not_corr.append(p)
                     if paths_not_corr:
@@ -602,7 +639,7 @@ def correct_files(
             for file_in in (
                 (paths + paths_not_corr) or open_csv_or_archive_of_them(raw_parent / subdir, pattern=pattern)
             ):
-                model, file = mod_name(file_in.name, parce=bool(pid))
+                model, file = mod_name(file_in.name, parse=bool(pid))
                 # (".name" is required for mod_name() if file_in is TextIOWrapper)
                 file = fun_correct(
                     file_in,
@@ -636,19 +673,25 @@ def correct_files(
                     continue
             n_files_total += n_files
 
-    lf.info(
-        'Raw files {:s}for {:d} probes found:\n{:s}',
-        f'({n_files_total}) ' if n_files_total != len(probes_found) else '', len(probes_found),
-        '\n'.join('{}{}: {}'.format(m, n, ', '.join(f'{f!s}' for f in ff)) for (m, n), ff in probes_found.items())
-    )
+    lf.info(*(
+        (
+            "Raw files {:s}for {:d} probes found:\n{:s}",
+            f"({n_files_total}) " if n_files_total != len(probes_found) else "",
+            len(probes_found),
+            "\n".join(
+                "{}{}: {}".format(m, n, ", ".join(f"{f!s}" for f in ff))
+                for (m, n), ff in (probes_found.items())
+            ),
+        ) if n_files_total else
+        ("No files found for {} probes", "any" if probes is None else probes)
+    ))
     return probes_found
 
 
 #############################################################################################################
 # Inclinometer file format and other parameters
-cfg = {
+cfg_default = {
     'in':      {
-        'fun_proc_loaded':    csv_specific_proc.loaded_tcm,  # function to convert csv to dask dataframe
         'delimiter':          ',',  # \t not specify if need "None" useful for fixed length format
         'skiprows':           3,  # ignore this number of top rows both in preliminary correction and read_csv
         'on_bad_lines':       'warn',  #'error',
@@ -681,12 +724,13 @@ cfg = {
         'corr_time_mode': True,  # to make sorted index: required to can process loaded data as timeseries by dask
         'text_type': None,
         'text_line_regex': None,
-        'dt_from_utc': 0
+        'dt_from_utc': 0,
+        'fun_proc_loaded': csv_specific_proc.loaded_tcm
     },
-    'out':     {},
-    'filter':  {},
+    # 'out':     {},
+    # 'filter':  {},
     'program': {
-        'log':     'tcm_csv.log',
+        'log_file_name':     'tcm_csv.log',
         'verbose': 'INFO',
         # 'dask_scheduler': 'synchronous'
     }
@@ -695,101 +739,39 @@ cfg = {
 }
 
 
-def load_from_csv_gen(
-        cfg_in: Mapping[str, Any],
-        cfg_in_probe: Optional[Mapping[str, Any]] = None,
-        return_: str = ''
-) -> Iterator[Tuple[int, Any, Path, pd.DataFrame]]:
+def search_correct_csv_files(
+    cfg_in: Mapping[str, Any], cfg_program: Mapping[str, Any] = None
+) -> Dict[Tuple[str, int], list[Path]]:
     """
-    Yields metadata and data for each discovered paths ordered by probe.
-    filter, correct, and group data files based on probe identifiers. The order of processing is determined by the order of probes specified in the probes parameter or by default numeric sequencing when probes is not provided
+    Yields filtered data (dataframes) and metadata for each csv-file discovered from dir/mask in input
+    order of probes specified in the `probes` parameter or by default numeric sequencing when `probes` is not
+    provided as a list. Corrects data files based on probe identifiers.
 
-
-
-       as represented by the paths_csv list in the output tuple.
-
-
-    pandas dataframes loaded from dir/mask csv-files
-    :param cfg_in: subdict of global `cfg`: cfg['in']. Required field:
+    :param cfg_in: configuration for input files. Required fields:
       - path: input directory/file mask
-    Other fields are optional (see global cfg). For example, overwrite this field:
-      - fun_proc_loaded: function to convert csv to dask dataframe
+    Other fields are optional (see global cfg_default). For example, overwrite this field:
+      - fun_proc_loaded: function to convert/process column data after loading csv pandas dataframe.
       - text_type: to specify cfg_in fields 'text_line_regex', 'header', 'dtype' for known probes
-        (specified in config_model()). If probe not known then set these fields keeping
+        (specified in config_text_header_dtype_regex()). If probe not known then set these fields keeping
         default text_type = None
       ...
-    :param cfg_in_probe: optional dict with fields named equal to probe(s) {pid}(s) to update cfg_in
-     in the cycle of loading probe data with settings specified to current probe
-    :param return_:
-    - None: iterator will yield all data
-    - edge_rows_only: yielded `df` will have only edge csv rows and other rows will not be read from csv
-    - files_list: yielded `df` will be None
-    :return: iterator of (i1_probe, probe, paths_csv, df):
-    - i1_probe: int, 1-based index;
-    - probe: f'{text_type}{probe}';
-    - paths_csv: list of all Paths found for probe;
-    - loaded probe data (may be part)
+    in the cycle of loading probe data with settings specified to current probe
+    :param cfg_program: dict with fields
+    - log_file_name, verbose: logging parameters
+    :return: dict {(model, number): files} dict of found probes and their files returned by `correct_files()`
     """
 
-    global cfg, lf
-    lf = LoggingStyleAdapter(init_logging(__name__, cfg['program']['log'], cfg['program']['verbose']))
+    global lf
+    cfg_program = {**cfg_default['program'], **cfg_program} if cfg_program else cfg_default['program']
+    lf = LoggingStyleAdapter(init_logging(__name__, cfg_program['log_file_name'], cfg_program['verbose']))
 
-    dir_csv_cor = None  # dir for cleaned (intermediate) raw files, None => same as cfg['in']['dir']
-
-    # other fields init
-    cfg['in'].update(cfg_in)
-    # Prepare loading and processing by rad_csv() specific to raw data format
-
-    # - extract date from file name if needed
-    if cfg['in'].get('fun_date_from_filename') and isinstance(cfg['in']['fun_date_from_filename'], str):
-        cfg['in']['fun_date_from_filename'] = eval(
-            compile("lambda file_stem, century=None: {}".format(cfg['in']['fun_date_from_filename']), '', 'eval'))
-
-    # - additional calculation in read_csv() if needed
-    if cfg['in'].get('fun_proc_loaded') is None:
-        # Default time processing after loading by dask/pandas.read_csv()
-        if 'coldate' not in cfg['in']:  # if Time includes Date then we will just return it
-            cfg['in']['fun_proc_loaded'] = lambda a, cfg_in, dummy=None: a[cfg_in['col_index_name']]
-        else:                           # else will return Time + Date
-            cfg['in']['fun_proc_loaded'] = lambda a, cfg_in, dummy=None: a['Date'] + np.array(
-                np.int32(1000 * a[cfg_in['col_index_name']]), dtype='m8[ms]')
-
-    if cfg['in']['csv_specific_param']:
-        # Split 'csv_specific_param' fields into two parts for :
-        # 1. loaded_corr() - oneliner operations ('fun', 'add'), and rest embed into
-        # 2. cfg['in']['fun_proc_loaded']()
-        arg_loaded_corr = {}
-        arg_fun_proc_loaded = {}
-        for k, v in cfg['in']['csv_specific_param'].items():
-            (arg_loaded_corr if k.rsplit('_', 1)[-1] in ('fun', 'add') else arg_fun_proc_loaded)[k] = v
-        arg_fun_proc_loaded = {'csv_specific_param': arg_fun_proc_loaded} if arg_fun_proc_loaded else {}
-        arg_loaded_corr = {'csv_specific_param': arg_loaded_corr} if arg_loaded_corr else {}
-
-        # Incorporate these two types of custom operations in cfg['in']['fun_proc_loaded'] function
-        # to be executed in our read_csv() without extra arguments
-        fun_proc_loaded = cfg['in']['fun_proc_loaded']
-
-        def fun_loaded_and_loaded_corr(a, cfg_in):
-            _ = fun_proc_loaded(a, cfg_in=cfg_in, **arg_fun_proc_loaded)
-            b = csv_specific_proc.loaded_corr(_, cfg_in, **arg_loaded_corr)
-            return b
-
-        try:  # Save 'meta_out' attribute before wrapping (defines output parameters needed for dask)
-            meta_out = fun_proc_loaded.meta_out
-        except AttributeError:
-            pass
-            # cfg['in']['fun_proc_loaded'] = partial(fun_proc_loaded, **arg_fun_proc_loaded)
-        else:  # Wrapping
-            # 'meta_out' attribute means we will modify parameters in same step as Time loading by apply function:
-            fun_loaded_and_loaded_corr.meta_out = meta_out  # add lost parameter back
-
-        cfg['in']['fun_proc_loaded'] = fun_loaded_and_loaded_corr
+    cfg_in = {**cfg_default["in"], **cfg_in}
 
     # Find raw files and preliminary format correction: non-regularity in source (primary) csv
     # todo: move correction into the load cycle
-    raw_parent = cfg['in']['path'].parent
-    raw_pattern = cfg['in']['path'].name
-    if cfg['in']['path'].is_dir() or (not cfg['in']['path'].suffix or
+    raw_parent = cfg_in['path'].parent
+    raw_pattern = cfg_in['path'].name
+    if cfg_in['path'].is_dir() or (not cfg_in['path'].suffix or
         sum(p.suffix.lower() in ('.zip', '.rar') or p.is_dir() for p in raw_parent.glob(raw_pattern))):
         # raw_parent was found
         raw_subdir = raw_pattern
@@ -800,75 +782,192 @@ def load_from_csv_gen(
         # raw_pattern was found
 
     # type may be specified to get ``raw_corrected`` files
-    cfg_text_type = cfg['in']['text_type']
+    cfg_text_type = cfg_in['text_type']
     if cfg_text_type:
-        _ = cfg['in']['text_line_regex']        # save custom regex
-        cfg['in'].update(config_model(cfg_text_type))
-        if _ is not None:
-            cfg['in']['text_line_regex'] = _    # recover custom regex
-        cfg['in'] = init_input_cols(cfg['in'])
-    else:  # wait getting ``raw_corrected`` files first, we run init_input_cols() later in loop
-        cfg_text_type = 'run init_input_cols() later in loop'  # not text_type we'll get in loop allows to update cfg_in there
+        cfg_in.update((  # keeping custom regex
+            config_text_header_dtype_regex if cfg_in['text_line_regex'] is None else config_text_header_dtype
+        )(cfg_text_type))
     raw_corrected = correct_files(
-        raw_parent=raw_parent, raw_subdir=raw_subdir, raw_pattern=raw_pattern,
+        raw_parent=raw_parent,
+        raw_subdir=raw_subdir,
+        raw_pattern=raw_pattern,
         fun_correct=partial(
-            csv_specific_proc.correct_txt, dir_out=dir_csv_cor, binary_mode=False,
-            header_rows=cfg['in']['skiprows']
+            csv_specific_proc.correct_txt,
+            dir_out=None,  # dir for cleaned (intermediate) raw files, None => same as cfg['in']['dir']
+            binary_mode=False,
+            header_rows=cfg_in["skiprows"],
         ),
         sub_str_list=(
-            (lambda txt_type: [config_model(txt_type, get_regex_only=True), b'^.+']
-             ) if cfg['in']['text_line_regex'] is None else [cfg['in']['text_line_regex'], b'^.+']
+            (lambda txt_type: [config_text_regex(txt_type), b"^.+"])
+            if cfg_in["text_line_regex"] is None
+            else [cfg_in["text_line_regex"], b"^.+"]
         ),
-        **cfg['in']
-        )
-    n_raw_cor_found = len(raw_corrected)
+        **cfg_in,
+    )
+    return raw_corrected
 
+
+def pcid_from_parts(type: str = "i", model: str = None, number: str|int = None):
+    """
+    Get Probe output Column ID (pcid)
+    :param probe_type: probe type ('i' for inclinometers)
+    :return: pcid
+    """
+    if model == "i":
+        if type == "i":
+            type = ""  # not repeat "i"
+            _ = ""
+        else:
+            _ = "_"
+    else:
+        _ = "_"
+    return f"{type}{_}{model}{number:0>2}"
+
+
+def load_from_csv_gen(
+    raw_corrected,
+    cfg_in: Mapping[str, Any],
+    cfg_in_probe: Optional[Mapping[str, Any]] = None,
+    skip_for_meta: Optional[Callable[[Any], bool]] = None,
+    return_=None,
+) -> Iterator[Tuple[pd.DataFrame, Tuple[int, Any, Path]]]:
+    """
+    Loads files of corrected format and convert their columns data.
+    Yields filtered data (dataframes) and metadata for each csv-file discovered from dir/mask in input
+    order of probes specified in the `probes` parameter or by default numeric sequencing when `probes` is not
+    provided as a list. Corrects data files based on probe identifiers.
+    :param raw_corrected: {(model, number): files} dict of found probes returned by `correct_files()`
+    :param cfg_in: configuration for input files. Required fields:
+      - path: input directory/file mask
+    Other fields are optional (see global cfg_default). For example, overwrite this field:
+      - fun_proc_loaded: function to convert/process column data after loading csv pandas dataframe.
+      - text_type: to specify cfg_in fields 'text_line_regex', 'header', 'dtype' for known probes
+        (specified in config_text_header_dtype_regex()). If probe not known then set these fields keeping
+        default text_type = None
+      ...
+    :param cfg_in_probe: optional dict with fields named equal to probe(s) {pid}(s) to update cfg_in
+    in the cycle of loading probe data with settings specified to current probe
+    :param skip_for_meta: optional function to skip specific files taking `load_from_csv_gen` 2nd output argument
+    :param return_:
+        - None: iterator will yield all data
+        - edge_rows_only: yielded `df` will have only edge csv rows and other rows will not be read from csv
+        - files_list: yielded `df` will be None
+    - log_file_name, verbose: logging parameters
+    :return: iterator of df, (i1_pid, probe, paths_csv):
+    - i1_pid: int, 1-based index;
+    - pcid: probe identifier: '{probe_type}{_}{text_type=model}{number}';
+    - paths_csv: list of all Paths found for pcid;
+    - loaded probe data (may be part)
+    """
+    n_raw_cor_found = len(raw_corrected)
     if n_raw_cor_found == 0:
-        lf.warning('No {:s} raw files found!', raw_pattern)
+        lf.warning("No {:s} raw files found!", str(cfg_in["path"]))
         sys.exit(ExitStatus.failure)
 
+    # Optional return file list without any processing or configure to return only edge rows
     if return_:
         if return_.startswith('<cfg_input_files_list'):
             lf.info('{:d} raw files...', n_raw_cor_found)
-            for i1_probe, ((text_type, probe), paths_csv) in enumerate(raw_corrected.items(), start=1):
+            for i1_pid, ((text_type, number), paths_csv) in enumerate(raw_corrected.items(), start=1):
                 for path_csv in paths_csv:
-                    yield i1_probe, f'{text_type}{probe}', path_csv, None
+                    yield None, (i1_pid, pcid_from_parts(model=text_type, number=number), path_csv)
             return
         edge_rows_only = 'meta' in return_
     else:
         edge_rows_only = False
 
-    # Loading files of corrected format and processing their data
-    #############################################################
+    cfg_in = {**cfg_default["in"], **cfg_in}
 
+    # Converting loaded columns configuration
+
+    # Function for getting main fields after dataframe loaded from csv. Can be appended so overwritten below
+    # - extract date from file name if needed
+    if cfg_in.get("fun_date_from_filename") and isinstance(cfg_in["fun_date_from_filename"], str):
+        cfg_in["fun_date_from_filename"] = eval(
+            compile("lambda file_stem, century=None: {}".format(cfg_in["fun_date_from_filename"]), "", "eval")
+        )
+    # - additional calculation in read_csv() if needed
+    if cfg_in.get("fun_proc_loaded") is None:
+        # Default time processing after loading by dask/pandas.read_csv()
+        if "coldate" not in cfg_in:  # if Time includes Date then we will just return it
+            cfg_in["fun_proc_loaded"] = lambda a, cfg_in, dummy=None: a[cfg_in["col_index_name"]]
+        else:  # else will return Time + Date
+            cfg_in["fun_proc_loaded"] = lambda a, cfg_in, dummy=None: a["Date"] + np.array(
+                np.int32(1000 * a[cfg_in["col_index_name"]]), dtype="m8[ms]"
+            )
+
+    if cfg_in["csv_specific_param"]:
+        # Split 'csv_specific_param' fields into two parts for :
+        # 1. loaded_corr() - oneliner operations ('fun', 'add'), and rest embed into
+        # 2. cfg_in['fun_proc_loaded']()
+        arg_loaded_corr = {}
+        arg_fun_proc_loaded = {}
+        for k, v in cfg_in["csv_specific_param"].items():
+            (arg_loaded_corr if k.rsplit("_", 1)[-1] in ("fun", "add") else arg_fun_proc_loaded)[k] = v
+        arg_fun_proc_loaded = {"csv_specific_param": arg_fun_proc_loaded} if arg_fun_proc_loaded else {}
+        arg_loaded_corr = {"csv_specific_param": arg_loaded_corr} if arg_loaded_corr else {}
+
+        # Update `cfg_in['fun_proc_loaded']` incorporating these two types of operations in our `read_csv()
+        fun_proc_loaded = cfg_in["fun_proc_loaded"]
+
+        def fun_loaded_and_loaded_corr(a, cfg_in):
+            result = fun_proc_loaded(a, cfg_in=cfg_in, **arg_fun_proc_loaded)
+            b = csv_specific_proc.loaded_corr(result, cfg_in, **arg_loaded_corr)
+            return b
+
+        # Preserve the attributes of fun_proc_loaded, including `meta_out` if it exists
+        update_wrapper(fun_loaded_and_loaded_corr, fun_proc_loaded)
+        cfg_in["fun_proc_loaded"] = fun_loaded_and_loaded_corr
+
+    # Loading files of corrected format and processing their data
+    cfg_text_type = None
     lf.info('Loading {:d} raw files...', n_raw_cor_found)
-    cfg_in = cfg['in'].copy()
-    for i1_probe, ((text_type, probe), paths_csv) in enumerate(raw_corrected.items(), start=1):
+    for i1_pid, ((text_type, number), paths_csv) in enumerate(raw_corrected.items(), start=1):
+        pid = pcid_from_parts(model=text_type, number=number)  # probe_type = "i"
+        if skip_for_meta:
+            # Skip specific files
+            paths_csv_orig, paths_csv, paths_csv_old = paths_csv, [], []
+            for path in paths_csv_orig:
+                if skip_for_meta((i1_pid, pid, path)):
+                    paths_csv_old.append(path)
+                else:
+                    paths_csv.append(path)
+            if paths_csv_old:
+                skipped_count = len(paths_csv_old)
+                lf.warning('Skipped loading {:d} CSV files for present "{:s}" data', skipped_count, pid)
+                yield None, (i1_pid, pid, paths_csv_old)
+                if not paths_csv:
+                    continue
+
+        cfg_in_cur = {**cfg_in, "paths": paths_csv}
+        if cfg_in_probe and pid in cfg_in_probe:
+            cfg_in_cur.update(cfg_in_probe[pid])
+        if cfg_in_cur.get("date_to_from"):
+            cfg_in_cur["dt_from_utc"] = (
+                cfg_in_cur["date_to_from"][1] - cfg_in_cur["date_to_from"][0]
+            )
+            lf.warning(
+                "Time shift to {} from {} will be performed ({} hours)",
+                *cfg_in_cur["date_to_from"],
+                -cfg_in_cur["dt_from_utc"],
+            )
+
+        # Update config if have specific for current probe and if probe is of other type
         if text_type != cfg_text_type:
             cfg_text_type = text_type
-            cfg_in = cfg['in'].copy()
-            cfg_in.update(config_model(text_type))
-            pid = f'{text_type}{probe}'
-            if cfg_in_probe and pid in cfg_in_probe:
-                cfg_in.update(cfg_in_probe[pid])
-            cfg_in = init_input_cols(cfg_in)
-            if cfg_in.get('date_to_from'):
-                cfg_in['dt_from_utc'] = (cfg_in['date_to_from'][1] - cfg_in['date_to_from'][0])
-                lf.warning(
-                    'Time shift to {} from {} will be performed ({} hours)',
-                    *cfg_in['date_to_from'], -cfg_in['dt_from_utc']
-                )
 
-        # Loading csv in parts
-        ######################
+            # Prepare loading and processing by rad_csv() specific to raw data format
+            cfg_in_cur = init_input_cols(
+                {**cfg_in_cur, **config_text_header_dtype_regex(text_type)}
+            )
+
+        # Load from all found paths in parts
         n_paths = len(paths_csv)
-        for i1_path, i_chunk, path_csv, df in csv_read_gen(
-            **{**cfg_in, "paths": paths_csv}, edge_rows_only=edge_rows_only
-        ):
+        for i1_path, i_chunk, path_csv, df in csv_read_gen(**cfg_in_cur, edge_rows_only=edge_rows_only):
             if not edge_rows_only:
                 lf.warning(
                     '{: >2}. csv {:s}{:s}{:s} loading...',
-                    i1_probe, path_csv.stem,
+                    i1_pid, path_csv.stem,
                     f' {i1_path}/{n_paths}' if n_paths > 1 else '',
                     f'.{i_chunk}' if i_chunk else ''
                 )
@@ -876,13 +975,13 @@ def load_from_csv_gen(
                 if i_chunk == 0:
                     lf.warning('Not processed (empty) {}', path_csv.name)
                 continue
-            yield i1_probe, f'{text_type}{probe}', path_csv, df
+            yield df, (i1_pid, pid, path_csv)
+
 
 
 if __name__ == '__main__':
 
     def main():
-        global cfg
         filenames_default = '*.txt'
         if len(sys.argv) > 1:
             dir_in, raw_pattern_file = sys.argv[1].split('*', 1)
@@ -893,17 +992,12 @@ if __name__ == '__main__':
             dir_in = Path.cwd().resolve()
             raw_pattern_file = filenames_default
             lf.info(
-                'No input arguments => using current dir to search config file and input files (default mask: {:s})',
-                raw_pattern_file
+                "No command line arguments given => searching for {:s} input files and config in current dir",
+                raw_pattern_file,
             )
 
         cfg_in = {'path': Path(dir_in) / raw_pattern_file}
-
-        # file_ini = cfg['in']['dir'] / 'tcm.ini'
-        # file_out = cfg['in']['dir'] / 'test.h5'
-        # tbl_out = 'test'
-
-        for i1_probe, probe, paths_csv, d in load_from_csv_gen(cfg_in):
+        for i1_pid, pid, paths_csv, d in load_from_csv_gen(cfg_in):
             print(d.compute())
             # todo
 

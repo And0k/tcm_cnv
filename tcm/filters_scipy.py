@@ -72,7 +72,7 @@ def despike(x: np.ndarray,
             if ax is not None:
                 ax.plot(x_plot, mean, color=colors[i % 3], alpha=0.3,
                         label='{}_mean({})'.format(label if label is not None else '', block))
-    y = np.ma.filled(y, fill_value=np.NaN)
+    y = np.ma.filled(y, fill_value=np.nan)
     if __debug__:
         print('despike(offsets=', offsets, ', blocks=', blocks, ') deletes', n_filtered, ' points')
         if ax is not None:

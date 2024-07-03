@@ -87,7 +87,7 @@ def time_corr(
                     np.subtract, tim.values, np.timedelta64(dt_from_utc), type_of_operation='<M8[ms]'
                     ), utc=True)
             # tim += np.timedelta64(pd.Timedelta(hours=hours_from_utc_f)) #?
-        lf.info('Time constant: {} {:s}', abs(dt_from_utc),
+        lf.info('Time constant ({}) {:s}', abs(dt_from_utc),
                 'subtracted' if dt_from_utc > timedelta(0) else 'added')
     else:
         if not isinstance(date.iat[0] if isinstance(date, pd.Series) else date[0], pd.Timestamp):  # isinstance(date, (pd.Series, np.datetime64))
@@ -361,7 +361,7 @@ def time_corr(
     # make initial shape: paste NaNs back
     if n_bad_in and cfg_in.get('b_keep_not_a_time'):
         # place initially bad elements back
-        t, t_in = (np.NaN + np.empty_like(b_ok_in)), t
+        t, t_in = (np.nan + np.empty_like(b_ok_in)), t
         t[b_ok_in] = t_in
         b_ok_in[b_ok_in] = b_ok
         b_ok = b_ok_in

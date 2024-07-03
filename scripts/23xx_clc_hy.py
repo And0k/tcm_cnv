@@ -123,56 +123,53 @@ for probes in 'inclinometers'.split():  # 'inclinometers wavegauges', 'inclinome
             # r'd:\WorkData\_experiment\inclinometer\230428_stand,tank,pres@ip1-6\_raw\230428tank.raw.h5'
         ).as_posix()
         for aggr in aggregate_period_s[probes]:
-            df = cfg_d.main_call([
+            df = cfg_d.main_call(
+                [
                     # '--info', 'defaults',
-
                     # Switch between text_path and db_path:
                     f'in.path="{path_db_raw or text_path}"'
-                ] + ([
-                    f'out.raw_db_path="{str_raw_db_path}"'
-                ] if text_path else []) + [
-
-                # 'in.text_type=p',  # not need if file named according standard
-                # 'in.coefs.Ag=[[1.0,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,1.0]]',
-                # 'in.coefs.Cg=[10.0,10.0,10.0]',
-                # 'in.coefs.Ah=[[1.0,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,1.0]]',
-                # 'in.coefs.Ch=[10.0,10.0,10.0]',
-                # 'in.coefs.kVabs=[10.0, -10.0, -10.0, -3.0, 3.0, 70.0]',
-                # 'in.coefs.azimuth_shift_deg=0.0',
-                # '+in.coefs.g0xyz={[0,0,1]}',
-
-                f'in.coefs_path="{coefs_path}"',
-                # 'in.skip_if_no_coef=True',
-                # 'in.coefs.kP=[0.0,1.0]',
-                # out.not_joined_db_path=True  # set to save in .proc_noAvg.h5 if not need filter data and save all loaded time range
-
-                # '++filter.time_bad_intervals=[2021-06-02T13:49, now]', # todo
-                # 'input.tables=["incl.*"]', # was set in probes config directory
-                ## f'out.db_path={db_out}',
-                # f'out.table=V_incl_bin{aggregate_period_s}s',
-                'out.b_del_temp_db=True',
-                # 'out.raw_db_path=None',
-                f"out.text_path={'text_output' if aggr else 'None'}",  # text_output  # None to skip save text
-                'program.verbose=INFO',
-                'program.dask_scheduler=threads',
-                # set additional parameters in probes config directory defined in hydra.searchpath earlier
-                f'+probes={probes}',
-                #f'out=out0',
-                # '--config-path=cfg_proc',  # Primary config module 'inclinometer.cfg_proc' not found.
-                # '--config-dir=cfg_proc'  # additional cfg dir
-                'in.min_date=2023-09-06T16:00',
-                # 'in.max_date=2023-05-23T19:40',
-                # 'in.date_to_from_list=[2023-10-11T13:00:00,2000-01-01T00:00:05]',
-                # '+in.date_to_from_lists={i28:[2023-06-30T11:47:26,2000-01-01T01:03:07]}',  # can use if load from text
-                # Note: "*" is mandatory for regex, "incl" only used in raw files, but you can average data in processed db.
-                ## "in.tables=['i.*']" if probes == 'inclinometers' else  # ['incl(23|30|32).*']  # ['i.*']
-                ## "in.tables=['w.*']",                                    # ['w0[2-6].*']         # ['w.*']
-                # hydra / sweeper / params =
-                # hydra.job.chdir=true
-                f"out.aggregate_period={aggr}s"  # {','.join(f'{a}s' for a in aggregate_period_s[probes])}",  # for multirun
-                # '--multirun'
+                ]
+                + ([f'out.raw_db_path="{str_raw_db_path}"'] if text_path else [])
+                + [
+                    # 'in.text_type=p',  # not need if file named according standard
+                    # 'in.coefs.Ag=[[1.0,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,1.0]]',
+                    # 'in.coefs.Cg=[10.0,10.0,10.0]',
+                    # 'in.coefs.Ah=[[1.0,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,1.0]]',
+                    # 'in.coefs.Ch=[10.0,10.0,10.0]',
+                    # 'in.coefs.kVabs=[10.0, -10.0, -10.0, -3.0, 3.0, 70.0]',
+                    # 'in.coefs.azimuth_shift_deg=0.0',
+                    # '+in.coefs.g0xyz={[0,0,1]}',
+                    f'in.coefs_path="{coefs_path}"',
+                    # 'in.skip_if_no_coef=True',
+                    # 'in.coefs.kP=[0.0,1.0]',
+                    # out.not_joined_db_path=True  # set to save in .proc_noAvg.h5 if not need filter data and save all loaded time range
+                    # '++filter.time_bad_intervals=[2021-06-02T13:49, now]', # todo
+                    # 'input.tables=["incl.*"]', # was set in probes config directory
+                    ## f'out.db_path={db_out}',
+                    # f'out.table=V_incl_bin{aggregate_period_s}s',
+                    "out.b_del_temp_db=True",
+                    # 'out.raw_db_path=None',
+                    f"out.dt_bins_min_save_text=1",  # text_output  # None to skip save text
+                    "program.verbose=INFO",
+                    "program.dask_scheduler=threads",
+                    # set additional parameters in probes config directory defined in hydra.searchpath earlier
+                    f"+probes={probes}",
+                    # f'out=out0',
+                    # '--config-path=cfg_proc',  # Primary config module 'inclinometer.cfg_proc' not found.
+                    # '--config-dir=cfg_proc'  # additional cfg dir
+                    "in.min_date=2023-09-06T16:00",
+                    # 'in.max_date=2023-05-23T19:40',
+                    # 'in.date_to_from_list=[2023-10-11T13:00:00,2000-01-01T00:00:05]',
+                    # '+in.date_to_from_lists={i28:[2023-06-30T11:47:26,2000-01-01T01:03:07]}',  # can use if load from text
+                    # Note: "*" is mandatory for regex, "incl" only used in raw files, but you can average data in processed db.
+                    ## "in.tables=['i.*']" if probes == 'inclinometers' else  # ['incl(23|30|32).*']  # ['i.*']
+                    ## "in.tables=['w.*']",                                    # ['w0[2-6].*']         # ['w.*']
+                    # hydra / sweeper / params =
+                    # hydra.job.chdir=true
+                    f"out.aggregate_period={aggr}s",  # {','.join(f'{a}s' for a in aggregate_period_s[probes])}",  # for multirun
+                    # '--multirun'
                 ],
-                fun=incl_h5clc_hy.main
+                fun=incl_h5clc_hy.main,
             )
 
 

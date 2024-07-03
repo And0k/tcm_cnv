@@ -13,10 +13,11 @@ import gc
 import logging
 import re
 import sys
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import date as datetime_date
 from datetime import datetime, timedelta
-from functools import wraps
+from functools import wraps, partial
 from pathlib import Path
 from time import sleep
 from typing import (
@@ -35,7 +36,7 @@ from typing import (
     TypeVar,
     Union,
 )
-
+import h5py
 import dask.array as da
 import dask.dataframe as dd
 import hydra
@@ -54,9 +55,9 @@ from omegaconf import MISSING, OmegaConf, open_dict
 # from scripts.incl_calibr import calibrate, calibrate_plot, coef2str
 # from other_filters import despike, rep2mean
 from . import cfg_dataclasses as cfg_d
-
+from . import h5  # v1
 # v2
-from .csv_load import load_from_csv_gen
+from .csv_load import search_correct_csv_files, load_from_csv_gen, pcid_from_parts
 from .csv_specific_proc import parse_name
 from .filters import b1spike, rep2mean
 from .h5_dask_pandas import (
@@ -64,14 +65,10 @@ from .h5_dask_pandas import (
     dd_to_csv,
     filter_global_minmax,
     filter_local,
-    h5_append_to,
-    h5_load_range_by_coord,
     i_bursts_starts,
+    h5_load_range_by_coord
 )
 from .h5inclinometer_coef import dict_matrices_for_h5, h5copy_coef, rot_matrix_x, rotate_y
-
-# v1
-from .h5toh5 import h5_close, h5_dispenser_and_names_gen, h5coords, h5find_tables, h5move_tables, h5out_init
 from .utils2init import (
     Ex_nothing_done,
     LoggingStyleAdapter,
@@ -105,17 +102,19 @@ class ConfigInCoefs_InclProc:
     New Rz will be saved only if saving raw data when loading from csv. Alternatively use
     ConfigIn_InclProc.time_ranges_zeroing to calculate new Rz.
     """
-    Ag: List[List[float]] = field(default_factory=lambda: [[0.00173, 0, 0], [0, 0.00173, 0], [0, 0, 0.00173]])
-    Cg: Annotated[list[float], 3] = field(default_factory=lambda: [10, 10, 10])
-    Ah: List[List[float]] = field(default_factory=lambda: [[1, 0, 0], [0, 1, 0], [0, 0, 1]])
-    Ch: Annotated[list[float], 3] = field(default_factory=lambda: [10, 10, 10])
+    Ag: Optional[List[List[float]]] = field(default_factory=lambda: [[0.00173, 0, 0], [0, 0.00173, 0], [0, 0, 0.00173]])
+    Cg: Optional[Annotated[list[float], 3]] = field(default_factory=lambda: [10, 10, 10])
+    Ah: Optional[List[List[float]]] = field(default_factory=lambda: [[1, 0, 0], [0, 1, 0], [0, 0, 1]])
+    Ch: Optional[Annotated[list[float], 3]] = field(default_factory=lambda: [10, 10, 10])
     Rz: Optional[List[List[float]]] = field(default_factory=lambda: [[1, 0, 0], [0, 1, 0], [0, 0, 1]])
-    kVabs: List[float] = field(default_factory=lambda: [10, -10, -10, -3, 3, 70])
+    kVabs: Optional[List[float]] = field(default_factory=lambda: [10, -10, -10, -3, 3, 70])
     # kP: Optional[List[float]] = field(default_factory=lambda: [0, 1])  # default polynom will not change input
     P_t: Optional[List[List[float]]] = None
-    azimuth_shift_deg: float = 180
+    azimuth_shift_deg: Optional[float] = 180
     g0xyz: Optional[Annotated[list[float], 3]] = None  # field(default_factory=lambda: [0, 0, 1])  #
 
+    dates: Optional[Dict[str, str]] = field(default_factory=dict)
+    date: Optional[str] = None
 
 @dataclass
 class ConfigIn_InclProc():  # cfg_d.ConfigInCsv
@@ -130,9 +129,11 @@ class ConfigIn_InclProc():  # cfg_d.ConfigInCsv
         "[0bdp]{\\d:0>2}"
       - pytables hdf5 store: may use patterns in Unix shell style (usually *.h5) or / and
     - tables: list of tables names or regex patterns to search. Note: regex search is switched on only if you
-      include "*" symbol somewhere in the pattern.
+    include "*" symbol somewhere in the pattern.
+    - coefs: coefficients. Note: only items different from default items of `ConfigInCoefs_InclProc` will
+    have more priority than ones loaded from `coefs_path`
     - coefs_path: coefficients will be copied from this hdf5 store to output hdf5 store. Used only if no coefs
-      provided
+    provided
     - azimuth_add_float: degrees, adds this value to velocity direction (addition to coef.azimuth_shift_deg')
     - time_ranges_zeroing: list of time str, if specified then rotate data in this interval such that it
     will have min mean pitch and roll, display "info" warning about')
@@ -141,6 +142,10 @@ class ConfigIn_InclProc():  # cfg_d.ConfigInCsv
     New Rz coefficient will be calculated and used instead current/previous Rz. New Rz will be saved only if
     saving raw data when loading from csv. Alternatively keep time_ranges_zeroing None and use coefs.g0xyz
     for new Rz.
+    - dt_from_utc: time shift setting in seconds from UTC. Other fields with same prefix and "_hours" and
+    other time suffixes can be used to get sum shift.
+    - date_to_from: alternative time shift setting, can be converted to dt_from_utc_hours by expression:
+    diff(array(date_to_from, 'M8[ms]')).astype('float')/3600000
     - max_incl_of_fit_deg: inclination where calibration curve y = Vabs(x=inclination) became bend down
     and we replace it with line so {\\Delta}^{2}y ≥ 0 for x > max_incl_of_fit_deg
     - calc_version: string, default=, variant of processing Vabs(inclination):',
@@ -152,8 +157,9 @@ class ConfigIn_InclProc():  # cfg_d.ConfigInCsv
     path: Optional[str] = None         # dir/mask
     paths: Optional[List[str]] = None  # exact paths list without masks, not for csv. If set then ignores `path`
     tables: List[str] = field(default_factory=lambda: ['incl.*'])  # table names in hdf5 store to get data. Uses regexp if only one table name
-    tables_log: List[str] = field(default_factory=list)
-    # aggregate_period_min_to_load_proc  # switch to use processed no avg db as input when aggregate_period is >  # uncomment to not use hard coded 2s default
+    tables_log: List[str] = field(default_factory=lambda: ['{}/logFiles'])
+    # dt_min_binning_proc: Optional[int] = 2  # seconds, switch to input processed noAvg data when bin is >
+    # (uncomment to not use hard coded 2s default)
 
     # params needed to process data when loading directly from csv:
     prefix: Optional[str] = 'I*_'  # 'INKL_'
@@ -161,14 +167,12 @@ class ConfigIn_InclProc():  # cfg_d.ConfigInCsv
     # will be guessed by file name
     text_line_regex: Optional[str] = None  # if not None then ignore text_type else will be selected based on text_type
 
-    coefs: Optional[ConfigInCoefs_InclProc] = None  # field(default_factory=ConfigInCoefs_InclProc)
+    coefs: Optional[ConfigInCoefs_InclProc] = field(default_factory=ConfigInCoefs_InclProc)  # None
     coefs_path: Optional[str] = r'd:\WorkData\~configuration~\inclinometer\190710incl.h5'
-
-    date_to_from_list: Optional[List[str]] = None  # alternative to set: dt_from_utc_hours = diff(array(
-    # date_to_from_list, 'M8[ms]')).astype('float')/3600000
-    dt_from_utc_hours = 0
-    min_date: Optional[str] = None  # imput data time range minimum
-    max_date: Optional[str] = None  # imput data time range maximum
+    date_to_from: Optional[List[str]] = None
+    dt_from_utc: Optional[int] = 0
+    min_date: Optional[str] = None  # input data time range minimum
+    max_date: Optional[str] = None  # input data time range maximum
     time_ranges: Optional[List[str]] = None
     coordinates: Optional[List[float]] = None  # add magnetic declination at coordinates [Lat, Lon], degrees
 
@@ -178,8 +182,9 @@ class ConfigIn_InclProc():  # cfg_d.ConfigInCsv
     calc_version: str = 'trigonometric(incl)'
 
     # minimum time between blocks, required in filt_data_dd() for data quality control messages:
-    dt_between_bursts: Optional[float] = np.inf  # inf to not use bursts, None to auto-find and repartition
-    dt_hole_warning_seconds: Optional[int] = 600
+    # default: nearly infinity value to not use bursts, None to auto-find and repartition
+    dt_between_bursts: Optional[float] = timedelta.max.total_seconds()
+    dt_hole_warning: Optional[int] = 600
 
 
 @dataclass
@@ -190,23 +195,27 @@ class ConfigOut_InclProc(cfg_d.ConfigOutSimple):
     :param not_joined_db_path: If set then save processed not averaged data for each probe individually to this path. If set to True then path will be out.db_path with suffix ".proc_noAvg.h5". Table names will be the same as input data.
     :param table: table name in hdf5 store to write combined/averaged data. If not specified then will be generated on base of path of input files. Note: "*" is used to write blocks in auto numbered locations (see dask to_hdf())
     :param split_period: string (pandas offset: D, H, 2S, ...) to process and output in separate blocks. If saving csv for data with original sampling period is set then that csv will be splitted with by this length (for data with no bin averaging  only)
-    :param aggregate_period: s, pandas offset strings  (5D, H, ...) to bin average data. This can greatly reduce sizes of output hdf5/text files. Frequenly used: None, 2s, 600s, 7200s
-    :param text_path: path to save text files with processed velocity (each probe individually). No file if empty, "text_output" if ``out.aggregate_period`` is set. Relative paths are from out.db_path
-    :param text_date_format: default '%Y-%m-%d %H:%M:%S.%f', format of date column in output text files. (.%f will be removed from end when aggregate_period > 1s). Can use float or string representations
+    :param dt_bins: list of int seconds to bin average data. This can greatly reduce sizes of output hdf5/text files. Frequently used: 0, 2, 600, 7200
+    :param text_path: path to save text files with processed velocity (each probe individually). No file if empty, "text_output" if ``out.dt_bins`` is set. Relative paths are from out.db_path
+    :param text_date_format: default '%Y-%m-%d %H:%M:%S.%f', format of date column in output text files. (.%f will be removed from end for bins in dt_bins > 1s). Can use float or string representations
     :param text_columns_list: if not empty then saved text files will contain only columns here specified
-    :param b_all_to_one_col: concatenate all data in same columns in out db. both separated and joined text files will be written
-    :param b_del_temp_db: default='False', temporary h5 file will be automatically deleted after operation. If false it will be remained. Delete it manually. Note: it may contain useful data for recovery
+    :param b_all_to_one_col: concatenate all data in same columns in out DB. both separated and joined text files will be written
+    :param b_del_temp_db: default='False', temporary hdf5 file will be automatically deleted after operation. If false it will be remained. Delete it manually. Note: it may contain useful data for recovery
 
     """
     not_joined_db_path: Any = None
     raw_db_path: Any = 'auto'  # will be the parent of input.path dir for text files
     table: str = ''
-    aggregate_period: Optional[str] = ''
+    tables_log: List[str] = field(default_factory=lambda: ['{}/logFiles'])  # overwrites default
+    dt_bins: Optional[List[int]] = field(
+        default_factory=lambda: [0, 2, 600, 3600, 7200]
+    )  # int will be auto converted to timedelta [s]
+    dt_bins_min_save_text: Optional[int] = 1  # s: Save to text only averaged data with bin >= 1s
     split_period: str = ''
     text_path: Optional[str] = 'text_output'
     text_date_format: str = '%Y-%m-%d %H:%M:%S.%f'
     text_columns: List[str] = field(default_factory=list)
-    b_split_by_time_ranges: bool = False  # split averaged data by cfg['in']['time_ranges'] only if this set
+    b_split_by_time_ranges: bool = False  # split data by cfg['in']['time_ranges']. Default False: merge them
     b_all_to_one_col: bool = False
     b_del_temp_db: bool = False
     b_overwrite: bool = True  # default is not to add new data to previous
@@ -224,6 +233,7 @@ class ConfigFilter_InclProc:
     :param dates_min_dict: List with items in "key:value" format. Start of time range for each probe: (used instead common for each probe min_dict["Time"]) ')
     :param dates_max_dict: List with items in "key:value" format. End of time range for each probe: (see dates_min_dict)
     :param bad_p_at_bursts_starts_period: pandas offset string. If set then marks each 2 samples of Pressure at start of burst as bad')
+    :param date_to_from: used to shift time if loading from csv
 
     """
     min: Optional[Dict[str, float]] = field(default_factory=dict)
@@ -236,8 +246,10 @@ class ConfigInMany_InclProc:
     Processing parameters for many probes: specify probe numbers as keys in parameters. Probe id will be infer from table name. For single probes these fields mostly defined in `ConfigIn_InclProc`
     - bad_p_at_bursts_starts_period: see the field in `ConfigFilter_InclProc`
     """
-    # Fields that specifies different values for each probe ID. May be dicts of existed in
-    # ConfigIn/ConfigFilter fields:
+    # Fields have keys and meaning same that can be found in ConfigIn/ConfigFilter fields but values are
+    # dicts {pcid: value} which specifies different values for each Probe output Column ID (pcid):
+    # {type}_{model}{number} or {type}{number} if no model: type may be i/w for inclinometer/wave gage.
+    # Inclinometers with pressure sensor currently have only model "p"
     min_date: Dict[str, Any] = field(default_factory=dict)  # Any is for List[str] but hydra not supported
     max_date: Dict[str, Any] = field(default_factory=dict)  # - // -
     time_ranges: Optional[Dict[str, Any]] = field(default_factory=dict)
@@ -391,7 +403,7 @@ def fVabs_from_force(force, coefs, vabs_good_max=0.5):
         return np.interp(x, force_range0, incl_range0) * np.polyval(coefs, 0.25) / incl_good_min
 
     force = np.where(force > 0.25, v_normal(force), v_linear(force))
-    force[is_nans] = np.NaN
+    force[is_nans] = np.nan
     return force
 
 
@@ -611,7 +623,7 @@ def incl_calc_velocity_nodask(
                 print('Acceleration is too high (>{}) in {}% points!'.format(
                     cfg_filter['max_g_minus_1'], 100 * bad_g_sum / len(GsumMinus1))
                 )
-            incl_rad[bad_g] = np.NaN
+            incl_rad[bad_g] = np.nan
 
         Vabs = v_abs_from_incl(incl_rad, kVabs, cfg_proc['calc_version'], cfg_proc['max_incl_of_fit_deg'])
 
@@ -782,7 +794,7 @@ def recover_magnetometer_x(Mcnts, Ah, Ch, max_h_minus_1, len_data):
                     lf.warning(
                         f'channel {ch}: bad points: {n_bad} - will not recover because too small good points ({n_good})'
                     )
-                    Mcnts_list[i] = np.NaN + da.empty_like(HsumMinus1)
+                    Mcnts_list[i] = np.nan + da.empty_like(HsumMinus1)
                     need_recover_mask[bad] = False
 
         Mcnts = da.vstack(Mcnts_list)
@@ -867,17 +879,21 @@ def rep2mean_da2np(y: da.Array, bOk=None, x=None) -> np.ndarray:
 # Next function calculates this columns:
 incl_calc_velocity_cols = ('Vabs', 'Vdir', 'v', 'u', 'inclination')
 
-def incl_calc_velocity(a: dd.DataFrame,
-                       filt_max: Optional[Mapping[str, float]] = None,
-                       cfg_proc: Optional[Mapping[str, Any]] = None,
-                       Ag: Optional[np.ndarray] = None, Cg: Optional[np.ndarray] = None,
-                       Ah: Optional[np.ndarray] = None, Ch: Optional[np.ndarray] = None,
-                       kVabs: Optional[np.ndarray] = None, azimuth_shift_deg: Optional[float] = 0,
-                       cols_prepend: Optional[Sequence[str]] = incl_calc_velocity_cols,
-                       **kwargs
-                       ) -> dd.DataFrame:
+def incl_calc_velocity(
+    a: dd.DataFrame,
+    filt_max: Optional[Mapping[str, float]] = None,
+    cfg_proc: Optional[Mapping[str, Any]] = None,
+    Ag: Optional[np.ndarray] = None, Cg: Optional[np.ndarray] = None,
+    Ah: Optional[np.ndarray] = None, Ch: Optional[np.ndarray] = None,
+    kVabs: Optional[np.ndarray] = None, azimuth_shift_deg: Optional[float] = 0,
+    calc_version='trigonometric(incl)',
+    max_incl_of_fit_deg=None,
+    cols_prepend: Optional[Sequence[str]] = incl_calc_velocity_cols,
+    **kwargs
+    ) -> dd.DataFrame:
     """
-    Calculates velocity from raw accelerometer/magnetometer data. Replaces raw columns with velocity vector parameters.
+    Calculates velocity from raw accelerometer/magnetometer data. Replaces raw columns with velocity vector
+    parameters.
     :param a: dask dataframe with columns (at least):
     - 'Ax','Ay','Az': accelerometer channels
     - 'Mx','My','Mz': magnetometer channels
@@ -888,16 +904,18 @@ def incl_calc_velocity(a: dd.DataFrame,
     :param Ch:
     :param kVabs: if None then will not try to calc velocity
     :param azimuth_shift_deg:
+    :param calc_version: see `ConfigIn_InclProc` config,
+    :param max_incl_of_fit_deg: see `ConfigIn_InclProc` config,
     :param filt_max: dict with fields:
     - g_minus_1: mark bad points where |Gxyz| is greater, if any then its number will be logged,
     - h_minus_1: to set Vdir=0 and...
-    :param cfg_proc: 'calc_version', 'max_incl_of_fit_deg'
-    :param cols_prepend: parameters that will be prepended to a columns (only columns if a have only raw
-    accelerometer and magnetometer fields). If None then ('Vabs', 'Vdir', 'v', 'u', 'inclination') will be used. Use
-     any from these elements in needed order.
+    :param cols_prepend: parameters that will be calculated hare and prepended to the columns of `a`. If None
+        then ('Vabs', 'Vdir', 'v', 'u', 'inclination'): the only columns that will be keeped if we have only
+        raw accelerometer and magnetometer data fields because source fields are discarded. Use any from these
+        elements in needed order.
     :param kwargs: not affects calculation
-    :return: dataframe with prepended columns ``cols_prepend`` and removed accelerometer and
-    magnetometer raw data
+    :return: dataframe with prepended columns ``cols_prepend`` and removed accelerometer and magnetometer raw
+    data
     """
 
     # old coefs need transposing: da.dot(Ag.T, (Axyz - Cg[0, :]).T)
@@ -913,9 +931,12 @@ def incl_calc_velocity(a: dd.DataFrame,
     # Gxyz = a.loc[:,('Ax','Ay','Az')].map_partitions(lambda x,A,C: fG(x.values,A,C).T, Ag, Cg, meta=('Gxyz', float64))
     # Gxyz = da.from_array(fG(a.loc[:,('Ax','Ay','Az')].values, Ag, Cg), chunks = (3, 50000), name='Gxyz')
     # Hxyz = da.from_array(fG(a.loc[:,('Mx','My','Mz')].values, Ah, Ch), chunks = (3, 50000), name='Hxyz')
-
     lengths = tuple(a.map_partitions(len).compute())  # or True to autocalculate it
-    len_data = sum(lengths)
+    length = sum(lengths)
+    if hasattr(a, 'length'):
+        assert length == a.length
+    else:
+        a.length = length
 
     if kVabs is not None and 'Ax' in a.columns:
         lf.debug('calculating V')
@@ -924,7 +945,7 @@ def incl_calc_velocity(a: dd.DataFrame,
             for i in range(3):
                 _ = da.map_overlap(b1spike, Hxyz[i], max_spike=100, depth=1)
                 Hxyz[i] = rep2mean_da(Hxyz[i], ~_)
-            Hxyz, need_recover_mask = recover_magnetometer_x(Hxyz, Ah, Ch, filt_max['h_minus_1'], len_data)
+            Hxyz, need_recover_mask = recover_magnetometer_x(Hxyz, Ah, Ch, filt_max['h_minus_1'], a.length)
 
             Gxyz = a.loc[:, ('Ax', 'Ay', 'Az')].to_dask_array(lengths=lengths).T
             for i in range(3):
@@ -953,7 +974,7 @@ def incl_calc_velocity(a: dd.DataFrame,
                         lf.warning(
                             'Raw acceleration over scaled (= -32624 counts) {}% where 2 channels '
                             'are good! Recovering assuming ideal calibration (|Gxyz_i| = 1)...',
-                            (100 * n_one_ch_is_over_scaled / len_data).to_dict()
+                            (100 * n_one_ch_is_over_scaled / a.length).to_dict()
                         )
                         g_max_of_two_ch = []
                         for ch in n_one_ch_is_over_scaled.keys():
@@ -965,7 +986,7 @@ def incl_calc_velocity(a: dd.DataFrame,
                             g_other_sqear = Gxyz[i_other, b_i_ch_is_over_scaled]**2
                             g_other_sqear.compute_chunk_sizes()
                             g_other_sqear = g_other_sqear.sum(axis=0)
-                            n_g_bigger_one = 100 * (g_other_sqear > 1).sum().compute() / len_data
+                            n_g_bigger_one = 100 * (g_other_sqear > 1).sum().compute() / a.length
                             if n_g_bigger_one > 0.1:
                                 # take too_big_g_max as norm of 3 channels if it is not a spike else we choose mean
                                 too_big_g_mean, too_big_g_max = da.compute(
@@ -997,13 +1018,13 @@ def incl_calc_velocity(a: dd.DataFrame,
                             bad_g_sum = False
                 if bad_g_sum:
                     # 2. delete bad
-                    bad_g_sum = 100 * bad_g_sum / len_data  # to %
+                    bad_g_sum = 100 * bad_g_sum / a.length  # to %
                     if bad_g_sum > 1:
                         lf.warning(
                             'Acceleration is too high (>{}) in {:g}% points! => data nulled',
                             filt_max['g_minus_1'], bad_g_sum
                         )
-                    incl_rad[bad] = np.NaN
+                    incl_rad[bad] = np.nan
             # else:
             #     bad = da.zeros_like(GsumMinus1, np.bool_)
 
@@ -1016,12 +1037,14 @@ def incl_calc_velocity(a: dd.DataFrame,
             # Velocity absolute value
 
             #Vabs = da.map_blocks(incl_rad, kVabs, )  # , chunks=GsumMinus1.chunks
-            Vabs = incl_rad.map_blocks(v_abs_from_incl,
-                                       coefs=kVabs,
-                                       calc_version=cfg_proc['calc_version'],
-                                       max_incl_of_fit_deg=cfg_proc['max_incl_of_fit_deg'],
-                                       dtype=np.float64, meta=np.float64([]))
-            # Vabs = np.polyval(kVabs, np.where(bad, np.NaN, Gxyz))
+            Vabs = incl_rad.map_blocks(
+                v_abs_from_incl,
+                coefs=kVabs,
+                calc_version=calc_version,
+                max_incl_of_fit_deg=max_incl_of_fit_deg,
+                dtype=np.float64, meta=np.float64([])
+            )
+            # Vabs = np.polyval(kVabs, np.where(bad, np.nan, Gxyz))
             # v = Vabs * np.cos(np.radians(Vdir))
             # u = Vabs * np.sin(np.radians(Vdir))
 
@@ -1047,19 +1070,19 @@ def incl_calc_velocity(a: dd.DataFrame,
             # Combine calculated data with existed in ``a`` except raw accelerometer and magnetometer columns.
             a = a.drop(['Ax', 'Ay', 'Az', 'Mx', 'My', 'Mz'], axis='columns')
             cols_remains = a.columns.to_list()
-            # Placing columns at first, defined in ``cols_prepend`` in their order, and keep remained in previous order
+            # Placing columns at first, defined in ``cols_prepend`` in their order, and keep remained in
+            # previous order
             _ = zip(incl_calc_velocity_cols, [Vabs, Vdir] + polar2dekart(Vabs, Vdir) + [da.degrees(incl_rad)])
             a = a.assign(
                 **{c: (
                     ar if isinstance(ar, da.Array) else
                     da.from_array(ar, chunks=GsumMinus1.chunks)
                     ).to_dask_dataframe(index=a.index) for c, ar in _ if c in cols_prepend
-                   }
+                }
                 )[list(cols_prepend) + cols_remains]  # reindex(, axis='columns')  # a[c] = ar
         except Exception as e:
             lf.exception('Error in incl_calc_velocity():')
             raise
-
     return a
 
 
@@ -1208,7 +1231,7 @@ def calc_pressure_old(
             """ mark bad data in first samples of burst"""
             # df.iloc[0:1, df.columns.get_loc('P')]=0  # not works!
             pressure = np.polyval(P, p.values)
-            pressure[:2] = np.NaN
+            pressure[:2] = np.nan
             p[:] = pressure
             return p
 
@@ -1221,17 +1244,19 @@ def calc_pressure_old(
 
 def coef_zeroing_rotation(g_xyz_0, Ag_old, Cg) -> Union[np.ndarray, int]:
     """
-    Zeroing rotation matrix Rz to correct old rotation matrices Ag_old, Ah_old (Ag = Rz @ Ag_old, Ah = Rz @ Ah_old)
-    based on accelerometer values when inclination is zero.
-    :param g_xyz_0: 3x1 values of columns 'Ax','Ay','Az' (it is practical to provide mean values of some time range)
+    Get zeroing rotation matrix `Rz` that can be used to correct old rotation matrices
+    `coef_rotate(Ag_old, Ah_old, Rz)` based on accelerometer values when inclination is zero.
+    :param g_xyz_0: 3x1 values of columns 'Ax','Ay','Az' (it is practical to provide mean values of some time
+    range)
     :param Ag_old, Cg: numpy.arrays, rotation matrix and shift for accelerometer
     :return Rz: 3x3 numpy.array , corrected rotation matrices
+    Todo: use new rotate algorithm
 
     Method of calculation of ``g_xyz_0`` from dask dataframe data:
-     g_xyz_0 = da.atleast_2d(da.from_delayed(
-          a_zeroing.loc[:, ('Ax', 'Ay', 'Az')].mean(
-             ).values.to_delayed()[0], shape=(3,), dtype=np.float64, name='mean_G0'))
-     """
+    g_xyz_0 = da.atleast_2d(da.from_delayed(
+        a_zeroing.loc[:, ('Ax', 'Ay', 'Az')].mean(
+            ).values.to_delayed()[0], shape=(3,), dtype=np.float64, name='mean_G0'))
+    """
 
     if not len(g_xyz_0):
         print(f'zeroing(): no data {g_xyz_0}, no rotation is done')
@@ -1246,7 +1271,6 @@ def coef_zeroing_rotation(g_xyz_0, Ag_old, Cg) -> Union[np.ndarray, int]:
         np.format_float_positional(x, precision=5) for x in np.rad2deg([old_pitch, old_roll])
     ])
     return rotate_y(rot_matrix_x(np.cos(old_roll), np.sin(old_roll)), angle_rad=old_pitch)
-    # todo: use new rotate algorithm
 
 
 def coef_rotate(*A, Z):
@@ -1256,13 +1280,13 @@ def coef_rotate(*A, Z):
 def coef_zeroing_rotation_from_data(
         df: dd.DataFrame | pd.DataFrame,
         Ag, Cg,
-        time_intervals=None,
+        time_ranges=None,
         **kwargs) -> np.ndarray:
     """
-    Zeroing rotation matrix Rz to correct old rotation matrices Ag_old, Ah_old (Ag = Rz @ Ag_old, Ah = Rz @ Ah_old)
+    Zeroing rotation matrix Rz that can be used to correct old rotation matrices
     based on accelerometer raw data from time range
     :param df: pandas or dask DataFrame with columns 'Ax', 'Ay', 'Az' - raw accelerometer data
-    :param time_intervals: optional data index time range to select data
+    :param time_ranges: optional data index time ranges to select data splitted here to pairs of start and end
     Old coefficients:
     :param Ag:
     :param Cg:
@@ -1270,13 +1294,13 @@ def coef_zeroing_rotation_from_data(
     :return: Ag, Ah - updated coefficients
     """
 
-    if time_intervals:
-        time_intervals = pd.to_datetime(time_intervals, utc=True)
-        if len(time_intervals) <= 2:
-            idx = slice(*time_intervals)
+    if time_ranges:
+        time_ranges = pd.to_datetime(time_ranges, utc=True)
+        if len(time_ranges) <= 2:
+            idx = slice(*time_ranges)
         else:
             # Create an iterator and use zip to pair up start and end times
-            time_pairs = (lambda x=iter(time_intervals): list(zip(x, x)))()
+            time_pairs = (lambda x=iter(time_ranges): list(zip(x, x)))()
             # Create a boolean mask for rows where the index is within any of the intervals
             idx = pd.Series(False, index=df.index)
             for start, end in time_pairs:
@@ -1302,10 +1326,10 @@ def coef_zeroing(g_xyz_0, Ag_old, Cg, Ah_old) -> Tuple[np.ndarray, np.ndarray]:
     return (Ag, Ah): numpy.arrays (3x3, 3x3), corrected rotation matrices
 
     Calculation method of ``g_xyz_0`` from dask dataframe data can be:
-     g_xyz_0 = da.atleast_2d(da.from_delayed(
-          a_zeroing.loc[:, ('Ax', 'Ay', 'Az')].mean(
-             ).values.to_delayed()[0], shape=(3,), dtype=np.float64, name='mean_G0'))
-     """
+    g_xyz_0 = da.atleast_2d(da.from_delayed(
+        a_zeroing.loc[:, ('Ax', 'Ay', 'Az')].mean(
+    ).values.to_delayed()[0], shape=(3,), dtype=np.float64, name='mean_G0'))
+    """
     lf.warning('coef_zeroing() depreciated. Use coef_zeroing_rotation() instead and save rotation matrix for future use')
     Z = coef_zeroing_rotation(g_xyz_0, Ag_old, Cg, Ah_old)
     Ag = Z @ Ag_old
@@ -1327,7 +1351,7 @@ def coef_zeroing(g_xyz_0, Ag_old, Cg, Ah_old) -> Tuple[np.ndarray, np.ndarray]:
     # def interp_after_median3(x, b):
     #     return np.interp(
     #         da.arange(len(b_ok), chunks=cfg_out['chunksize']),
-    #         da.flatnonzero(b_ok), median3(x[b]), da.NaN, da.NaN)
+    #         da.flatnonzero(b_ok), median3(x[b]), da.nan, da.nan)
     #
     # b = da.from_array(b_ok, chunks=chunks, meta=('Tfilt', 'f8'))
     # with ProgressBar():
@@ -1336,10 +1360,23 @@ def coef_zeroing(g_xyz_0, Ag_old, Cg, Ah_old) -> Tuple[np.ndarray, np.ndarray]:
     # hangs:
     # Tfilt = dd.map_partitions(interp_after_median3, a['Temp'], da.from_array(b_ok, chunks=cfg_out['chunksize']), meta=('Tfilt', 'f8')).compute()
 
-    # Tfilt = np.interp(da.arange(len(b_ok)), da.flatnonzero(b_ok), median3(a['Temp'][b_ok]), da.NaN,da.NaN)
+    # Tfilt = np.interp(da.arange(len(b_ok)), da.flatnonzero(b_ok), median3(a['Temp'][b_ok]), da.nan,da.nan)
     # @+node:korzh.20180524213634.8: *3* main
     # @+others
     # @-others
+
+
+def format_timedelta(dt: timedelta) -> str:
+    days = dt.days
+    str_parts = [f"{days} days"] if days else []
+
+    seconds_remainder = dt.seconds
+    if seconds_remainder:
+        hours, seconds_remainder = divmod(seconds_remainder, 3600)
+        minutes, seconds = divmod(seconds_remainder, 60)
+        str_parts += [f"{hours:02}:{minutes:02}:{seconds:02}"]
+
+    return ' '.join(str_parts) if str_parts else 'no'
 
 
 def year_fraction(date: datetime) -> float:
@@ -1373,8 +1410,9 @@ def mag_dec(lat, lon, time: datetime, depth: float = 0):
     return mag.decl if (isinstance(lat, Iterable) or isinstance(lon, Iterable)) else mag.decl.item(0)
 
 
-def filt_data_dd(a, dt_between_bursts=None, dt_hole_warning: Optional[np.timedelta64] = None, cfg_filter=None
-                 ) -> Tuple[dd.DataFrame, np.array]:
+def filt_data_dd(
+    a, dt_between_bursts=None, dt_hole_warning: Optional[np.timedelta64] = None, cfg_filter=None
+) -> Tuple[dd.DataFrame, np.array]:
     """
     Filter and get burst starts (i.e. finds gaps in data)
     :param a:
@@ -1416,106 +1454,13 @@ def filt_data_dd(a, dt_between_bursts=None, dt_hole_warning: Optional[np.timedel
         return a, i_burst
 
 
-def set_full_paths_and_h5_out_fields(cfg: MutableMapping, is_aggregating: bool) -> List[Path]:
-    """
-    1. Depending on input path and wheather aggregating is required switches output and input source:
-    - returning input paths `in_paths`: if averaging is required and input are text files, then switches to
-      default raw DB name. This allows to load previously saved data in subsequent runs, but if raw db not
-      exist then raise.
-    - cfg['in']['tables']: replace "incl{id}" with `pid` if loading from processed noAvg DB
-    2. Sets ouput database parameters in cfg['out'] (wraps `h5out_init()`).
-
-    :param is_aggregating:
-    :param cfg: should contain
-    'in' fields:
-    - is_counts
-    'out' fields:
-    - raw_db_path
-    :updates cfg:
-    ['in'] fields:
-    - tables
-    ['out'] fields:
-    - db_path
-    - raw_db_path
-    - not_joined_db_path
-    - text_path
-    - b_incremental_update = False
-    :return: in_paths - list of full input paths (to use instead of cfg['in']['paths'])
-    Modifies:
-    cfg['in']['tables'],
-    cfg['out']
-    - db_path: switch to averaging DB (*proc.h5) if loading from processed noAvg DB
-    - text_path
-    - other fields, modified by `h5out_init()`
-    """
-    in_paths = cfg['in']['paths']
-    if is_aggregating:
-        if in_paths[0].suffix not in hdf5_suffixes:
-            # Switch input paths to default raw DB name
-            __, in_paths = in_paths, []
-            for p in __:  # cfg['in']['paths'] bigger priority than cfg['out']['raw_db_path']
-                p, proc_dir = get_full_raw_db_path(cfg['out']['raw_db_path'], path_in=p)
-                in_paths.append(p)
-
-        # If loading processed data then change input db and tables to that are in .proc_noAvg
-        if not cfg['in']['is_counts']:
-            _ = []
-            for i, p in enumerate(in_paths):
-                if '.proc_noAvg' not in p.suffixes[-2:-1]:
-                    # If .proc_noAvg db was not set explicitly, then try load db with default name
-                    db_path_proc_orig_fr = p.parent.with_name(p.stem).with_suffix('.proc_noAvg.h5')  # default
-                    if not db_path_proc_orig_fr.is_file():
-                        raise FileNotFoundError(
-                            f"Not found processed data {db_path_proc_orig_fr} for "
-                            f"{cfg['out']['aggregate_period']}-averaging.")
-                    in_paths[i] = db_path_proc_orig_fr
-                    _.append('{}/{}'.format(*db_path_proc_orig_fr.parts[-2:]))
-            cfg['in']['tables'] = [tbl.replace('incl', 'i') for tbl in cfg['in']['tables']]
-            lf.info(
-                'Using found {} db and its {} tables as source for averaging', ', '.join(_), cfg['in']['tables']
-            )
-
-    raw_db_path, proc_dir = get_full_raw_db_path(cfg['out']['raw_db_path'], in_paths[0])
-
-    if not cfg['out']['db_path'].is_absolute():
-        out_db_path_stem = cfg['out']['db_path'].stem
-        if not out_db_path_stem:
-            out_db_path_stem = stem_proc_db(proc_dir)
-        cfg['out']['db_path'] = (proc_dir / out_db_path_stem).with_suffix('').with_suffix(f'.proc.h5')
-
-    if not is_aggregating:
-        if cfg['out']['not_joined_db_path'] is True or (
-            not cfg['out']['not_joined_db_path'] and                                        # not defined
-            (not cfg['in']['is_counts'] or cfg['in']['aggregate_period_min_to_load_proc'])  # but will be needed
-        ):
-            cfg['out']['not_joined_db_path'] = (
-                cfg['out']['db_path'].with_suffix('').with_suffix('').with_suffix('.proc_noAvg.h5')
-            )
-        cfg['out']['db_path'] = cfg['out']['not_joined_db_path']
-
-    cfg_out_table = cfg['out']['tables']  # not need fill  # old: save because will need to change for h5_append()
-    h5out_init(cfg['in'], cfg['out'])
-    cfg['out']['tables'] = cfg_out_table
-    cfg['out']['b_incremental_update'] = False  # todo: To can use You need provide info about chunks that will be loaded
-
-    if (in_paths[0].suffix not in hdf5_suffixes) and raw_db_path:
-        # Prepare to save raw data from csv to raw.h5 hdf5
-        cfg['out']['raw_db_path'] = raw_db_path
-
-    if (cfg['out']['text_path'] is not None and not
-        cfg['out']['text_path'].is_absolute()):
-        cfg['out']['text_path'] = proc_dir / cfg['out']['text_path']
-
-    return in_paths
-
-
 def stem_proc_db(proc_dir: Path) -> Path:
     proc_db_stem = (
         proc_dir.name if proc_dir.name[0].isdigit() else
         proc_dir.parent.name if proc_dir.parent.name[0].isdigit() or
         proc_dir.name.startswith('inclinometer') else
         proc_dir.name
-    ).replace('@', '_').split('_')[0]
+    ).replace('@', '_', 1).split('_')[0]
     return proc_db_stem
 
 
@@ -1574,11 +1519,11 @@ def get_full_raw_db_path(raw_db_path, path_in) -> Tuple[Path, Path]:
             else:
                 _ = raw_subdir.stem
                 raw_db_name = (
-                    _.replace('@', '_').split('_')[0] if raw_subdir.is_dir() and _[0].isdigit() else None
+                    _.replace('@', '_', 1).split('_')[0] if raw_subdir.is_dir() and _[0].isdigit() else None
                     )
         else:
             raw_db_name = None
-        # If no "_raw" dir was found then try get db name from cruise dir: parent dir that starts from digits
+        # If no "_raw" dir was found then try get DB name from cruise dir: parent dir that starts from digits
         if not raw_db_name:
             raw_db_name = stem_proc_db(proc_dir)
 
@@ -1586,68 +1531,244 @@ def get_full_raw_db_path(raw_db_path, path_in) -> Tuple[Path, Path]:
     return raw_db_path, proc_dir
 
 
-def load_coefs(store, tbl: str):
+def set_full_paths_and_h5_out_fields(cfg_out: MutableMapping, path, **cfg_in) -> List[Path]:
     """
-    Finds up to 2 levels of coefficients, collects to 1 level, accepts any paths
-    :param store: hdf5 file with group "``tbl``/coef"
+    Sets ouput database parameters in cfg_out (wraps `h5.out_init()`).
+    :param path: input path. It can be relative to `proc_dir` if one of cfg_out fields: "db_path",
+    not_joined_db_path", "text_path" are full path (`proc_dir` is a common parent of them)
+    :param cfg_in: other input configuraton parameters to call `h5.out_init()`
+    :param cfg_out: should contain
+    - raw_db_path
+    :updates `cfg_out` fields:
+    - raw_db_path
+    - not_joined_db_path
+    - db_path: switch to averaging DB (*proc.h5) if loading from processed noAvg DB
+    - text_path
+    - other fields, modified by `h5.out_init()`
+    return path: absoulute input path
+    """
+
+    proc_dir = None
+    if not path.is_absolute():
+        for p in [cfg_out["db_path"], cfg_out["not_joined_db_path"], cfg_out["text_path"]]:
+            if p.is_absolute():
+                proc_dir = p.parent
+                break
+        path = proc_dir / str(path)
+
+    # raw DB full path
+    cfg_out["raw_db_path"], proc_dir = get_full_raw_db_path(
+        cfg_out["raw_db_path"], path_in=path if proc_dir is None else path
+        )
+
+    # .proc DB full path
+    if not cfg_out["db_path"].is_absolute():
+        out_db_path_stem = cfg_out["db_path"].stem
+        if not out_db_path_stem:
+            out_db_path_stem = stem_proc_db(proc_dir)
+        cfg_out["db_path"] = (proc_dir / out_db_path_stem).with_suffix("").with_suffix(".proc.h5")
+
+    # .proc_noAvg DB full path
+    not_joined_db_path = path if path.suffix[0].startswith(".proc_noAvg") else None
+    if not_joined_db_path:  # If input path is .proc_noAvg DB then use it
+        cfg_out["not_joined_db_path"] = not_joined_db_path
+    elif cfg_out["not_joined_db_path"] is True or not cfg_out["not_joined_db_path"]:  # Need to set to default
+        cfg_out["not_joined_db_path"] = (
+            cfg_out["db_path"].with_suffix("").with_suffix("").with_suffix(".proc_noAvg.h5")
+        )  # old: raw_db_path.parent.with_name(raw_db_path.stem).with_suffix(".proc_noAvg.h5")
+    elif not cfg_out["not_joined_db_path"].is_absolute():  # Need to set absolute
+        cfg_out["not_joined_db_path"] = proc_dir / cfg_out["not_joined_db_path"]
+
+    # Output text data full path
+    if cfg_out["text_path"] is not None and not cfg_out["text_path"].is_absolute():
+        cfg_out["text_path"] = proc_dir / cfg_out["text_path"]
+
+
+    # Init hdf5 data loading parameters
+    cfg_out_table, tables_log = cfg_out["tables"], cfg_out["tables_log"]  # not need fill
+    # we set tables as not want auto set it but it sets "tables_log", [f"{cfg_out['table']}/logFiles"]) if not exist
+    call_with_valid_kwargs(h5.out_init, cfg_out, **cfg_in, table='prevent_auto')
+    cfg_out["tables"], cfg_out["tables_log"] = cfg_out_table, tables_log
+
+    # # todo: To can use You need provide info about chunks that will be loaded:
+    # cfg_out['b_incremental_update'] = False
+
+    return path
+
+
+def get_input_db(path_in, dt_bins, raw_db_path, not_joined_db_path, dt_min_binning_proc, **kwargs):
+    """
+    Switches current input source between raw DB and not avg DB:
+    This allows to load previously saved data in subsequent runs, but if raw DB not
+    exist then raise.
+    :param path_in: The configuration setting for the input path, which can be
+    - a path to raw text or
+    - HDF5 data (usually under "_raw" directory) or
+    - processed HDF5 data (usually just above the "_raw" directory).
+    :param dt_bins, raw_db_path, not_joined_db_path, dt_min_binning_proc: output config parameters (see
+    `ConfigOut_InclProc`)
+    :param kwargs: not used
+    :return path_in: full input path
+    """
+    need_load_counts = True  # raw DB by default
+    p_sfx = path_in.suffixes[-2:-1]
+    if p_sfx and p_sfx[0].startswith(".proc"):
+        need_load_counts = any((not bin) or (bin <= dt_min_binning_proc) for bin in dt_bins)
+    for path in ([] if need_load_counts else [not_joined_db_path]) + [raw_db_path]:
+        if path.is_file():
+            return path
+    raise FileNotFoundError(f"Not found stored data {not_joined_db_path} or {raw_db_path}")
+
+
+
+def load_coefs(store: pd.HDFStore|Path, tbl: str):
+    """
+    Finds up to 2 levels of coefficients, collects to 1 level, accepts any coef paths
+    :param store: hdf5 file Path or opend pd.HDFStore with group "``tbl``/coef"
     :param tbl:
-    :return:
+    :return: dict with loaded coefs and 'dates' field having dict of the each parameter 'date' atrribute. None
+    if `tbl` node not found
     Example
     for coefs nodes:
     ['coef/G/A', 'coef/G/C', 'coef/H/A', 'coef/H/C', 'coef/H/azimuth_shift_deg', 'coef/Vabs0'])
     naming rule gives coefs this names:
     ['Ag', 'Cg', 'Ah', 'Ch', 'azimuth_shift_deg', 'kVabs'],
     """
-    coefs_dict = {'dates': {}}
-    node_coef = store.get_node(f'{tbl}/coef')
-    if node_coef is None:
-        return
-    else:
-        for node_name in node_coef.__members__:
-            node_coef_l2 = node_coef[node_name]
-            if getattr(node_coef_l2, '__members__', False):  # node_coef_l2 is group
-                for node_name_l2 in node_coef_l2.__members__:
-                    name = f'{node_name_l2}{node_name.lower() if node_name_l2[-1].isupper() else ""}'
-                    coefs_dict[name] = node_coef_l2[node_name_l2].read()
+    with nullcontext(store) if isinstance(store, pd.HDFStore) else pd.HDFStore(store, mode="r") as store:
+        node_coef = store.get_node(f'{tbl}/coef')
+        if node_coef is None:
+            return
+        else:
+            coefs_dict = {'dates': {}}
+            for node_name in node_coef.__members__:
+                node_coef_l2 = node_coef[node_name]
+                if getattr(node_coef_l2, '__members__', False):  # node_coef_l2 is group
+                    for node_name_l2 in node_coef_l2.__members__:
+                        name = f'{node_name_l2}{node_name.lower() if node_name_l2[-1].isupper() else ""}'
+                        coefs_dict[name] = node_coef_l2[node_name_l2].read()
+                        try:
+                            coefs_dict['dates'][name] = node_coef_l2[node_name_l2].attrs['timestamp']
+                            pass
+                        except KeyError:
+                            pass
+                else:  # node_coef_l2 is value
+                    name = node_name if node_name != 'Vabs0' else 'kVabs'
+                    coefs_dict[name] = node_coef_l2.read()
                     try:
-                        coefs_dict['dates'][name] = node_coef_l2[node_name_l2].attrs['timestamp']
+                        coefs_dict['dates'][name] = node_coef_l2.attrs['timestamp']
                         pass
                     except KeyError:
                         pass
-            else:  # node_coef_l2 is value
-                name = node_name if node_name != 'Vabs0' else 'kVabs'
-                coefs_dict[name] = node_coef_l2.read()
-                try:
-                    coefs_dict['dates'][name] = node_coef_l2.attrs['timestamp']
-                    pass
-                except KeyError:
-                    pass
-    return coefs_dict
+    try:  # Get last date record from old format of list of dates in microseconds since the Unix epoch
+        if isinstance(coefs_dict["date"].item(-1), (bytes, str)):
+            coefs_dict["date"] = np.nanmax(np.array(coefs_dict["date"], 'M8[s]'))
+        else:
+            coefs_dict["date"] = np.datetime64(int(np.nanmax(coefs_dict["date"])), "us")  # need?
+    except (KeyError, TypeError):  # No or has been converted already
+        pass
 
-
-def load_coefs_(coefs_path, tbl: str, coefs_ovr: Optional[Mapping[str, Any]] = None):
-    """Load coefs from path/tbl. Provide `coefs_ovr` to ovewrite"""
-    if not coefs_path:
-        return
-    if (  # Skip loading if all fields that by default not None already defined by `coefs_ovr`
-        coefs_ovr and all(
-        coefs_ovr.get(k) for k, v in ConfigInCoefs_InclProc.__dataclass_fields__.items() if v.default
-        )):
-        return coefs_ovr
-
-    with pd.HDFStore(coefs_path, mode='r') as store:
-        coefs_dict = load_coefs(store, tbl)
-    if coefs_dict is None:
-        lf.warning(
-            'Not found coefficients table "{:s}" ', tbl
+    if coefs_dict["dates"]:  # If no date attributes in DB, as for old coefs, then keep 'date' undefined
+        coefs_dict["date"] = max(
+            [coefs_dict["date"]] + [np.datetime64(d) for d in coefs_dict["dates"].values()]
         )
-    if coefs_ovr:
-        if OmegaConf.is_config(coefs_ovr):
-            coefs_dict =  OmegaConf.to_container(coefs_ovr)
-        coefs_dict.update(coefs_ovr)
     return coefs_dict
 
-def coefs_format_for_h5(coef: Mapping[str, Any], pid: str, date: Optional[str] = None) -> Mapping[str, Any]:
+
+def get_coefs(
+    coefs_paths: Sequence[str | pd.HDFStore], tbl: str, coefs_ovr: Optional[Mapping[str, Any]] = None
+) -> Optional[Dict[str, Any]]:
+    """
+    Load coefficients and overlay with optional overrides. Convert lists to arrays. Add 'date' field equal to
+    last found date or now
+
+    :param coefs_paths: Paths to input coefficients or opened store. 1st found will be used.
+    :param tbl: Table name for coefficients.
+    :param coefs_ovr: Overrides for coefficients with optional 'date' field.
+    :return: Coefficients dictionary with lists converted to arrays and 'date' field processed: None if no
+        `coef_ovr`, if exist but has no 'date', then current date.
+    """
+    # Fields that by default are not None
+    defaults = {
+        k: v_def
+        for k, v in ConfigInCoefs_InclProc.__dataclass_fields__.items()
+        if (v_def := cfg_d.get_field_default(v)) is not None
+        and not (isinstance(v_def, (list, dict)) and ((not v_def) or not any(lst != [] for lst in v_def)))
+    }
+    now = datetime.now()
+    coefs_ovr_dates = {}
+    if coefs_ovr:  # Always True in this module so detect whether it is not the default
+        # Fields that also not redefined by `coefs_ovr`
+        not_ovr = [
+            k for k, v_def in defaults.items() if (
+                (v_ovr := coefs_ovr.get(k)) == v_def or
+                (isinstance(v_ovr, list) and ((not v_ovr) or not any(lst != [] for lst in v_ovr)))
+            )
+        ]
+
+        if len(not_ovr) < len(defaults):    # Some coefs redefined
+            if not not_ovr:
+                # All coefs redifined by `coefs_ovr`
+                coefs_paths = []  # Not need load coefs
+                if OmegaConf.is_config(coefs_ovr):
+                    coefs_ovr = OmegaConf.to_container(coefs_ovr)
+
+            # If ovr dates is not set, then set it to "date" or now
+            coefs_ovr_dates, _ = coefs_ovr.get("dates", coefs_ovr_dates), coefs_ovr.get("date", now)
+            coefs_ovr_dates = {
+                k: coefs_ovr_dates.get(k) or now for k in coefs_ovr if k in defaults and k not in not_ovr
+            }
+    else:
+        not_ovr = list(defaults)
+
+    # Load coefs from HDF5 and overwrite them with (not default) `coefs_ovr`
+    if coefs_paths:
+        for coefs_path in coefs_paths:
+            coefs_load = load_coefs(coefs_path, tbl)
+            if coefs_load is not None:
+                break
+        if coefs_load is None:
+            lf.error(
+                'Not found coefficients table "{:s}" in {}, {:s} redefined from current run config!',
+                tbl,
+                coefs_paths,
+                "but all are" if not not_ovr else
+                f"and {not_ovr} are not" if len(not_ovr) < len(defaults) else
+                "and no one are"
+            )
+            if len(not_ovr) == len(defaults):
+                raise ValueError("No coefficients provided / found")
+            coefs_load = {**coefs_ovr, "dates": coefs_ovr_dates}
+        else:
+            coefs_load_dates = coefs_load.get("dates", coefs_ovr_dates)
+            for k, v in coefs_ovr.items():
+                if v is not None and k in defaults and k not in not_ovr:
+                    coefs_load[k] = v
+                    coefs_load_dates[k] = coefs_ovr_dates[k]  # Overwrite loaded dates
+            coefs_load["dates"] = coefs_load_dates
+    else:
+        coefs_load = {**coefs_ovr, "dates": coefs_ovr_dates}
+
+    # Convert lists to arrays
+    if coefs_load:
+        coefs_load = {
+            k: np.float64(v) if (isinstance(v, list) and v is not None and k != "dates") else v
+            for k, v in coefs_load.items()
+        }
+
+    # Update 'date' to max found date
+    out_dates = [
+        datetime.fromisoformat(d) if isinstance(d, str) else d
+        for d in [coefs_load.get("date")] + list(coefs_load["dates"].values())
+        if d
+    ]
+    if out_dates:
+        coefs_load["date"] = max(out_dates)
+    return coefs_load
+
+
+def coefs_format_for_h5(
+    coef: Mapping[str, Any], pcid: str = None, date: Optional[str] = None
+) -> Mapping[str, Any]:
     """
     Create coefficients dict to save to hdf5:
         - A: for accelerometer:
@@ -1662,14 +1783,18 @@ def coefs_format_for_h5(coef: Mapping[str, Any], pid: str, date: Optional[str] =
     - Rz: zero calibration for accelerometer and magnetometer rotation matrix
     - Pt: pressure with temperature compensation polynom matrix
     :param coef:
+    :param pcid: to exclude writing not needed defaults and to write it as metadata
     :return:
     """
     if coef is None:
         # making default coef matrix
         coef = ConfigInCoefs_InclProc().__dict__
         del coef['g0xyz']
-        if not pid.startswith('p'):
+        if not pcid.split("_")[-1].startswith('p'):  # device with pressure sensor
             del coef['P_t']
+    elif 'Rz' not in coef:  # added for compability with old coefs (todo: better get by diagonalize G)
+        coef['Rz'] = np.eye(3)
+
     coef_no_rename = ['Rz']
     if 'P_t' in coef:
         coef_no_rename += ['P_t']
@@ -1681,68 +1806,9 @@ def coefs_format_for_h5(coef: Mapping[str, Any], pid: str, date: Optional[str] =
         '//coef//H//azimuth_shift_deg': coef['azimuth_shift_deg'],
         '//coef//Vabs0': coef['kVabs'],
         **{f'//coef//{p}': coef[p] for p in coef_no_rename},
-        '//coef//pid': pid,
+        '//coef//pid': pcid,
         '//coef//date': date or datetime.now().replace(microsecond=0).isoformat()
     }
-
-
-def map_to_suffixed(names, suffix):
-    """Adds tbl suffix to output columns before accumulate in cycle for different tables"""
-    return {col: f"{col}_{suffix}" for col in names}
-
-
-def probes_gen(cfg_in: Mapping[str, Any], cfg_out: None = None) -> Iterator[Tuple[str, Tuple[Any, ...]]]:
-    """
-    Yield table names with associated coefficients which are loaded from '{tbl_in}/coef' node of hdf5 file.
-    :param cfg_in: dict with fields:
-    - tables: tables names search pattern or sequence of table names
-    - path: hdf5 file with tables which have coef group nodes.
-    :param cfg_out: not used but kept for the requirement of h5_dispenser_and_names_gen() argument
-    :return: iterator that returns (table_name, coefficients).
-    - table_name is same as input tables names except that "incl" replaced with "i"
-    - coefficients are None if path ends with 'proc_noAvg'.
-     "Vabs0" coef. name are replaced with "kVabs"
-    Updates cfg_in['tables'] - sets to list of found tables in store
-    """
-
-    with pd.HDFStore(cfg_in['path'], mode='r') as store:
-        _ = cfg_in.get('tables'); n = len(_) if _ else 0
-        tables = h5find_tables(store, _[0]) if n == 1 else _
-
-        # message all not found coefs
-        b_bad_coef = False
-        coefs_dicts = {}
-        for tbl_in in tables:
-            if cfg_in['path'].suffixes[0].startswith('.proc'):  # coefs not need if source data is already processed
-                coefs_dicts[tbl_in] = None
-                continue
-            coefs_dicts[tbl_in] = load_coefs(store, tbl_in)
-            if coefs_dicts[tbl_in] is None:  # and cfg_in.get('skip_if_no_coef'):
-                lf.warning('"{:s}" - not found coefs!', tbl_in)  #Skipping this table
-                b_bad_coef = True
-                continue
-        if b_bad_coef:
-            raise ValueError('Not all coefs found')
-
-        for tbl_in in tables:
-            if '.proc_noAvg' in cfg_in['path'].suffixes[-2:-1]:
-                # Loading already processed data: not cfg_in['is_counts']
-                tbl_in = tbl_in.replace('incl_', 'i').replace('incl', 'i')
-
-            cfg_in['table'] = tbl_in
-            # fields that need to be updated for h5del_obsolete() if this func used with it inside generator:
-            if len(cfg_in['tables']) == 1:
-                cfg_in['tables'] = [tbl_in]
-
-            # tables names need to be updated for h5del_obsolete() if this func used with it inside generator:
-            # if not cfg['out']['table']:
-            col_out, pid = out_col_name(tbl_in)
-            if cfg_out:
-                aggregate_period = cfg_out.get('aggregate_period')
-                cfg_out['table'] = f'i_bin{aggregate_period}' if aggregate_period else col_out
-            yield tbl_in, col_out, pid, coefs_dicts[tbl_in]
-    return
-
 
 def separate_cfg_in_for_probes(cfg_in, in_many={}, probes=None
     ) -> Tuple[Dict[str, Dict[str, str]], Dict[str, Any]]:
@@ -1758,6 +1824,7 @@ def separate_cfg_in_for_probes(cfg_in, in_many={}, probes=None
     meaning as fields of cfg['in'/'filter'] but used to set parameter for each probe. Originated from
     `ConfigInMany_InclProc` class:
     :param probes: output grouped_cfg keys. If None, then auto infered from `tables`, not used in `incl_h5clc`
+    module
     :return: (grouped_cfg, cfg_in_common)
     - cfg_in_common dict: inmput parameters with removed plural fields
     - grouped_cfg: dict with dicts for each probe, i.e.:
@@ -1766,25 +1833,26 @@ def separate_cfg_in_for_probes(cfg_in, in_many={}, probes=None
         - keys: singular named keys obtained from found plural named arguments/in_many keys,
         - values: have value of argument/in_many values for each key
     """
-    # Combine all input parameters different for different probes we need to convert to this dict, renaming
-    # fields to singular form:
-    cfg_many = {}
-    cfg_in_common = in_many.copy()
-    for k in [  # single_name_to_many_vals
-        'min_date',
-        'max_date',
-        'time_ranges',
-        'time_ranges_zeroing',
-        'date_to_from',
-        'bad_p_at_bursts_starts_period',
-        'coordinates'
-    ]:
-        try:
-            cfg_many[k] = cfg_in_common.pop(k)
-        except KeyError:
-            continue
-    cfg_in_common.update(cfg_in.copy())
-
+    # # Combine all input parameters different for different probes we need to convert to this dict, renaming
+    # # fields to singular form:
+    # cfg_many = {}
+    # cfg_in_common = in_many.copy()  # temporary
+    # for k in [  # single_name_to_many_vals
+    #     'min_date',
+    #     'max_date',
+    #     'time_ranges',
+    #     'time_ranges_zeroing',
+    #     'date_to_from',
+    #     'bad_p_at_bursts_starts_period',
+    #     'coordinates'
+    # ]:
+    #     try:
+    #         cfg_many[k] = cfg_in_common.pop(k)
+    #     except KeyError:
+    #         continue
+    # cfg_in_common.update(cfg_in.copy())
+    cfg_in_common = cfg_in.copy()
+    cfg_many = in_many.copy()
 
     def delistify(vals):
         # Here only gets table item from 'tables' parameter (that is of type list with len=1)
@@ -1825,9 +1893,7 @@ def separate_cfg_in_for_probes(cfg_in, in_many={}, probes=None
                 probe_vals = dict(zip(probes, probe_vals))
             if isinstance(probe_vals, Mapping):
                 for probe, val in probe_vals.items():
-                    probe = out_col_name(probe.lower())[0]  # not a `pid` as out_col_name(pid) not always work
-                    # if probe.startswith('i') and probe[1].isalpha():
-                    #     probe = f'i_{probe[1:]}'  # pid_to_col_out(pid[])
+                    probe = to_pcid_from_name(probe)
                     # Filter out not needed probes (result keeps only needed to iterate and load)
                     if probe in probes or (probes_ptn and re.match(probes_ptn, probe)):
                         if probe in cfg_probes:
@@ -1843,426 +1909,820 @@ def separate_cfg_in_for_probes(cfg_in, in_many={}, probes=None
             return {'*': {param: delistify(probe_vals) for param, probe_vals in param_dicts.items()}}
 
     if len(cfg_in['tables']) > 0 and not probes:
-        probes = [out_col_name(tbl)[0] for tbl in cfg_in["tables"]]  # tbl.rsplit('_', 1)[-1]
+        probes = [to_pcid_from_name(tbl) for tbl in cfg_in["tables"]]  # tbl.rsplit('_', 1)[-1]
     return cfg_in_common, group_dict_vals(cfg_many, probes)
 
 
-def pid_to_col_out(pid, probe_type='i'):
+def pcid_to_raw_name(pcid: str):
     """
-    Column name suffix in processed DB for probe:
-    {pid} for inclinometers without model else {probe_type}_{pid}.
-    Instead inputing `pid` for inclinometers may put just number
-    :param pid: probe id,
-    :param probe_type: probe type ('i' for inclinometers)
-    :return: column name (that is just pid for inclinometers)
+    :param pcid: Probe output Column ID (pcid):
+    # {type}_{model}{number} or if no model then {type}{number}:  may be i/w for inclinometer/wave gage.
+    # Inclinometers with pressure sensor currently have only model "p"
+    :return: table name in **raw** or **not averaged** data DB
     """
-    if pid[0].isdigit():
-        pid = f'{probe_type}{pid}'
-        col_out = pid
-    else:
-        if pid[0] == 'i':
-            if probe_type == 'i':
-                probe_type = ''
-            _ = ''
-        else:
-            _ = '_'
-        col_out = f'{probe_type}{_}{pid}'
-    return col_out
+    return f"incl{pcid[1:]}" if pcid[0] == "i" else pcid
 
 
-def out_col_name(tbl_group: str):
+def to_pcid_from_name(probe_name: str|int, probe_type: str = "i"):
     """
-    Output column name and pid from raw table / raw file stem search pattern/name / output column name
-    :param tbl_group: input table
-    :return: (col_out, pid)
-    - col_out: output column name (= name in hydra specific for this probe config)
-    - pid for input
+    Get Probe output Column ID (pcid)
+    :param probe_name: any of
+    - output column name
+    - raw table name
+    - raw file stem search pattern/name
+    - pid str of 3 chars probe id or just number
+    :param probe_type: probe type ('i' for inclinometers), used if `probe_name` is digit
+    :return: pcid: our standartisied probe name, used in
+    - output column name in Avg/noAvg db
+    - column suffix in combined table
+    - name in specific for this probe hydra conig `ConfigInMany_InclProc`
     """
+    if (isinstance(probe_name, str) and probe_name[0].isdigit()) or isinstance(probe_name, int):
+        return f"{probe_type}{probe_name:0>2}"
 
-    pattern_name_parts = parse_name(tbl_group.replace('.', ''))
+    # pid to pcid
+    if isinstance(probe_name, str) and len(probe_name) == 3 and probe_name[1:].isdigit():
+        if probe_name[0] == probe_type == "i":
+            return probe_name
+        elif probe_name[0].isalpha():
+            return f"{probe_type}_{probe_name}"
+
+    pattern_name_parts = parse_name(probe_name.replace('.', ''))
     if pattern_name_parts:
-        pid = '{model}{number}'.format_map(pattern_name_parts)
-        probe_type = pattern_name_parts['type']   # tbl_group[0]
+        return call_with_valid_kwargs(pcid_from_parts, **pattern_name_parts)
     else:
-        return '*', '*'
-
-    col_out = pid_to_col_out(pid, probe_type)
-    return col_out, pid
+        return '*'
 
 
-def cfg_copy_for_pid(cfg: Mapping[str, Any], cfg_in_common: Mapping[str, Any], cfg_in_cur: Mapping[str, Any]
-    ) -> Mapping[str, Any]:
+def cur_cfg(
+        pcid: str,
+        cfg_in_for_probes: Mapping[str, Any], cfg_in_common: Mapping[str, Any], cfg: Mapping[str, Any]
+) -> Tuple[Mapping[str, Any], str, str]:
     """
-    Combine fields from cfg, cfg_in_common, cfg_in_cur to processing configuration for current probe
-    """
-    cfg1 = {
-        'in': {**cfg_in_common.copy(), **cfg_in_cur},
-        'out': cfg['out'].copy(),  # actually may not need copy() here
-        'filter': cfg['filter'].copy()
-    }
-    return cfg1
-
-def get_pid_cfg_(
-    cfg: Mapping[str, Any], cfg_in_common: Mapping[str, Any], cfg_in_for_probes: Mapping[str, Any], tbl_raw: str
-    ) -> Tuple[Mapping[str, Any], str, str]:
-    """
-    Return processing configuration for probe with id `pid` when loading txt
-    :param cfg:
+    Get a copy of all required processing configuration for probe `pcid`
+    :param pcid: Probe output Column ID
     :param cfg_in_for_probes: config for current probe
     :param cfg_in_common: input config common to all probes
-    :param tbl_raw: table name in raw db according to historical convension ("incl{id}")
-    :return: (cfg1, col_out, pid)
-    - cfg1: dict with
-      - copy of `cfg` fields that can be changed (to can change without modifying `cfg`)
+    :param cfg:
+    :return: cfg1: dict, config for 1 probe with
+      - copy of `cfg` fields that can be changed (to can change them without modifying `cfg`)
       - coefs
-    - col_out: output column suffix in combined table parsed from tbl_raw
-    - pid: pid parsed from tbl_raw
     """
-    # `pid` key to get data from cfg_in_for_probes
-    col_out, pid = out_col_name(tbl_raw)
-    # col_out = col_out if col_out in cfg_in_for_probes else '*'
-    cfg1 = cfg_copy_for_pid(cfg, cfg_in_common, cfg_in_for_probes.get(col_out, {}))
-
-    # Output table name
-    aggregate_period = cfg1['out'].pop('aggregate_period')
-    cfg1['out']['table'] = f'i_bin{aggregate_period}' if aggregate_period else col_out
-
+    # Combine fields from cfg, cfg_in_common, cfg_in_cur to processing configuration for current probe
+    cfg1 = {
+        'in': {**cfg_in_common.copy(), **cfg_in_for_probes.get(pcid, {})},
+        'out': cfg["out"].copy(),  # actually may not need copy() here
+        'filter': cfg['filter'].copy()
+    }
     # Load coefs
-    cfg1['in']['coefs'] = load_coefs_(cfg['in']['coefs_path'], tbl_raw, coefs_ovr=cfg1['in']['coefs'])
-    if cfg1['in']['coefs']:
-        cfg1['in']['coefs'] = {
-            k: np.float64(v) if (isinstance(v, list) and v is not None) else v
-            for k, v in cfg1['in']['coefs'].items()
-        }
-    return cfg1, col_out, pid
+    cfg1["in"]["coefs"] = get_coefs(
+        ([cfg["in"]["path"]] if '.raw' in cfg["in"]["path"].suffixes[-2:-1] else []
+        ) + [cfg["in"]["coefs_path"]],
+        pcid_to_raw_name(pcid), coefs_ovr=cfg1["in"]["coefs"]
+    )
+    return cfg1
 
 
-def gen_subconfigs(
+def get_coef_azimuth_shift(azimuth_add, coordinates, azimuth_shift_deg, data_date=datetime.now(), **kwargs):
+    """
+    Shift azimuth if user configured angle or coordinates to find it from inclination there
+
+    """
+    # Azimuth correction `azimuth_shift_deg` from `azimuth_add` and `coordinates`
+    if azimuth_add or coordinates:
+        msgs = ["(coef. {:g})".format(azimuth_shift_deg.item())]
+        if azimuth_add:
+            # individual or the same correction for each table:
+            msgs.append("(azimuth_shift_deg {:g})".format(azimuth_add))
+            azimuth_shift_deg += azimuth_add
+        if coordinates:  # add magnetic declination at coordinates [Lat, Lon]
+            mag_decl = mag_dec(
+                *coordinates,
+                data_date,
+                depth=-1,  # depth has negligible effect if it is less than several km
+            )
+            msgs.append("(magnetic declination {:g})".format(mag_decl))
+            azimuth_shift_deg += mag_decl
+
+        lf.warning("Azimuth correction updated to {:g} = {}°", azimuth_shift_deg.item(), " + ".join(msgs))
+    return azimuth_shift_deg
+
+
+def get_coef_zeroing_matrix(
+    Rz=None, g0xyz=None, Ag=None, Cg=None, **kwargs
+):
+    """
+    g0xyz overwrites Rz
+    """
+    if g0xyz is not None:
+        Rz = coef_zeroing_rotation(g0xyz[:, None], np.float64(Ag), Cg)
+        msg_rotated = "with new rotation to user defined zero point (g0xyz) "
+    elif Rz is not None and (Rz != np.eye(3)).any():  # need?
+        msg_rotated = ""
+    else:
+        Rz, msg_rotated = None, ""
+    return Rz, msg_rotated
+
+
+def coef_prepare(coefs, time_ranges_zeroing, azimuth_add, coordinates, data, data_date):
+    """
+    Add dates and absent fields to new coef from previous preseriving reference and save to db
+    coefs: dict of ndarrays, original loaded coefs
+    """
+
+    coefs_new = {
+        "azimuth_shift_deg": get_coef_azimuth_shift(
+            azimuth_add, coordinates, coefs["azimuth_shift_deg"], data_date
+        )
+    }
+    # Get rotation coefficient Rz (if data time range for zeroing is specified)
+    msg_zeroed = ""
+    if time_ranges_zeroing:
+        _ = coef_zeroing_rotation_from_data(data, **coefs, time_ranges=time_ranges_zeroing)
+        if _ is None:
+            lf.debug("time_ranges_zeroing not in current data range")
+        else:
+            coefs_new["Rz"] = _
+            msg_zeroed = "with new rotation to direction averaged on configured time_ranges_zeroing interval "
+
+    # Get rotation coefficient from other coefs config and save
+    coef_zeroing_matrix, msg_rotated = get_coef_zeroing_matrix(**coefs)
+
+    # Prepare to save coefficient dates (some of them can be updated below)
+    try:
+        dates = coefs["dates"]
+    except (KeyError, TypeError, AttributeError):  # why AttributeError?
+        dates = {}
+    # Set `dates` items to True for changed and new coef to be replaced with current date in `h5copy_coef()`
+    for k, v in coefs_new.items():
+        try:
+            cur_prev = coefs[k]
+            if all(cur_prev == v) if isinstance(cur_prev, np.ndarray) else cur_prev == v:
+                continue
+        except (KeyError, TypeError):
+            pass
+        else:
+            continue
+        dates[k] = True
+
+    # Return old coef updated with new
+    return {**coefs, **coefs_new}, coef_zeroing_matrix, dates, msg_zeroed + msg_rotated
+
+
+def binning(d, dt_bin, repartition_freq=None, print_binning="{}-binning, "):
+    """
+    Do binning, repartition, persist
+    :param dt_bin: resulting resampled period in seconds
+    """
+    b_binning = dt_bin and dt_bin > timedelta(0)  # else repartition and persist only
+    if b_binning:
+        if print_binning:
+            print(print_binning.format(format_timedelta(dt_bin)), end="")
+
+        # If period > data time span then convert to one row dask dataframe with index = mean index
+        if dt_bin > np.diff(d.divisions[0 :: (len(d.divisions) - 1)]).item():
+            df = d.mean().compute().to_frame().transpose()
+            df.index = [d.index.compute().mean()]
+            if df.empty:
+                return None
+            return dd.from_pandas(df, npartitions=1)
+
+        # Do binning and remove all bins with less than 10% of values
+
+        # Number of existed values in each bin (using 1st column)
+        n_good = (~d.iloc[:, 0].isna()).resample(dt_bin).count()
+
+        d = d.resample(
+            dt_bin,
+            # closed='right' if 'Pres' in cfg['in']['path'].stem else 'left'
+            # 'right' for burst mode
+            # because the last value of interval used in wavegauges is round - not true?
+        ).mean()
+        d = d.where(n_good > n_good[n_good > 0].mean() / 10).dropna(how="all")  # axis=0 is default
+
+    if repartition_freq:
+        try:  # repartition for ascii splitting (helps to prevent MemoryError also)
+            d = d.repartition(freq=repartition_freq)
+        except TypeError as e:
+            return None
+
+    # Persist to greatly speedup next calculations
+    try:
+        d.persist()  # excludes missed values?
+    except MemoryError:
+        lf.info(
+            "Skipped persisting to speedup: not enough memory for {}-aggregated data...",
+            dt_bin
+        )
+
+    return d
+
+
+def to_physical(
+    df_raw: pd.DataFrame | dd.DataFrame,
+    coefs,
+    coef_zeroing_matrix,
+    cfg_filter,
+    dt_bins: Sequence[timedelta],
+    dt_min_binning_proc: timedelta = timedelta(seconds=2),
+    tbl='',
+    dt_dask_partition=pd.Timedelta(1, 'D'),
+    df_physical=None
+) -> Tuple[Optional[dd.DataFrame], List[dd.DataFrame]]:
+    """
+    Calculate physical parameters and binning.
+
+    :param df_raw:
+    :param coefs: `incl_calc_velocity` and `calc_pressure` keyward arguments (which are mostly coefs)
+    :param coef_zeroing_matrix:
+    :param cfg_filter:
+    :param dt_bins:
+    :param dt_min_binning_proc: There is should be no more than one `dt_bin` (except 0s-bin) that is <= than this param
+    :param tbl: table name for more informative logging error messages if will be error
+    :param dt_dask_partition:
+    :param df_physical: ready not avg physical data to use or output instead calc here
+    :return: list of physical params dataframes for each of `dt_bins`, if no 0s-bin required then 1st is None
+    d, d_avg = to_physical(
+        ...
+        dt_dask_partition=cfg["out"]["split_period"]
+    )
+    """
+    if not dt_bins:
+        return None, []
+    dt_bin_min = min(dt_bins)
+    if dt_dask_partition is None and dt_bin_min > timedelta(0):
+        # By default, we restrict dask partition size to 100000 bins to prevent memory overflow
+        dt_dask_partition = 100000 * dt_bin_min
+
+    # Raw data processing
+    df_raw = filter_local(df_raw, cfg_filter, ignore_absent={"h_minus_1", "g_minus_1"})
+    # d_raw[['Mx','My','Mz']] = d_raw[['Mx','My','Mz']].mask(lambda x: x>=4096)
+    # todo: message of filtered especially if all was filt out
+
+    # Apply loaded or calculated rotation to Ag & Ah coefficients (with copying to new coef object to not cumulate)
+    if coef_zeroing_matrix:
+        coefs = {**coefs, **{c: coef_zeroing_matrix @ coefs[c] for c in ["Ag", "Ah"]}}
+    else:
+        lf.info("No rotation (Rz) in loaded coefficient. Suppose rotations already applied")
+
+    if isinstance(df_raw, pd.DataFrame):
+        d_raw = dd.from_pandas(df_raw, npartitions=1)
+        d_raw.length = df_raw.shape[0]  # save length because getting it is a long operation in dask
+    else:
+        d_raw = df_raw
+
+    need_d_out = dt_bins[0] == timedelta(0)  # timedelta(0) in dt_bins
+    if df_physical is None:
+        d = None
+        need_d = need_d_out or any(dt > dt_min_binning_proc for dt in dt_bins)  # need creterea
+    else:
+        d = dd.from_pandas(df_physical, npartitions=1)  # chunksize | if None will be calc if needed
+        if dt_bins and need_d_out:
+            dt_bins = dt_bins[1:]
+        need_d = False
+
+    # Binning and physical parameters calculation
+    d_avgs = []
+    for dt_bin in dt_bins:
+        # Binning before physical parameters calculation (if bin <= 2s by default)
+        bin_before_physical = dt_bin <= dt_min_binning_proc
+        if bin_before_physical:
+            d_raw = binning(d_raw, dt_bin, repartition_freq=dt_dask_partition)
+            if d_raw is None:
+                lf.error("No data after raw {} {}-binning  => Skipping. Continue...", tbl, dt_bin)
+                continue
+
+        if bin_before_physical or need_d:
+
+            # Velocity
+            d_avg = incl_calc_velocity(d_raw, filt_max=cfg_filter["max"], **coefs)
+
+            # Pressure
+            d_avg = calc_pressure(d_avg, **coefs)
+            # **{(pb := 'bad_p_at_bursts_starts_period'): cfg['filter'][pb]},
+
+            if need_d:
+                d = d_avg
+                need_d = False
+                if dt_bin == timedelta(0):
+                    continue
+            else:  # bin_before_physical
+                d_avgs.append(d_avg)
+                continue
+
+        # Binning after physical parameters calculation
+        if not bin_before_physical:
+            d_avg = binning(
+                d, dt_bin, repartition_freq=dt_dask_partition, print_binning="{}-binning. "
+            )
+            if d_avg is None:
+                lf.error("No data after processed {} {}-binning  => Skipping. Continue...", tbl, dt_bin)
+            d_avgs.append(d_avg)
+        else:
+            print(end='. ')
+    print()
+    return [d] + d_avgs
+
+
+def gen_physical(
     cfg: MutableMapping[str, Any],
-    fun_gen=probes_gen,
-    **in_many) -> Iterator[Tuple[dd.DataFrame, Dict[str, np.array], str, int]]:
+    incl_calc_kwargs={},
+    **in_many
+) -> Iterator[Tuple[dd.DataFrame, Dict[str, np.array], str, int]]:
     """
     Yields parameters to process many paths, tables, dates_min and dates_max. For hdf5 data uses
-    `h5_dispenser_and_names_gen(fun_gen)`, for text input - `load_csv.load_from_csv_gen()`
+    `h5.dispenser_and_names_gen(fun_gen)`, for text input - `load_csv.load_from_csv_gen()`
 
     :param cfg: dict with fields
     - in:
-      - is_counts: if True then use raw (not averaged) input db tables (if input is *.h5)
-    - out: dict with fields
-      - aggregate_period
-      - ...
+        - table: pattern to search input tables (any input to `to_pcid_from_name`)
+          letter type prefix (incl) for data in counts else one letter (i). After is porobe identificator separated with "_" if not start with "i" else just 2 digits    - out: dict with fields
+    - out:
+        - table: pattern to construct output table based on input tables found using `in.table` search pattern
+        - dt_bins: list of bins to average
     - ...
     - program: if this dict has field 'return_' equal to '<cfg_input_files>' then returned `d` will have only
     edge rows
-    :param fun_gen: generator of (tbl, coefs)
-
-    Other ):
     :param: in_many: fields originated from ConfigInMany_InclProc: these fields will be replaced by single valued fields like in ConfigIn_InclProc:
     - path: Union[str, Path], str/path of real path or multiple paths joined by '|' to be split in list cfg['paths'],
-    - table: not one letter type prefix (incl) for data in counts else one letter (i). After is porobe identificator
-     separated with "_" if not start with "i" else just 2 digits
+
     - min_date:
     - max_date:
     - dt_between_bursts, dt_hole_warning - optional - arguments
     and optional plural named fields - same meaning as keys of cfg['in'/'filter'] but for many probes:
 
-    :return: Iterator(d, cfg1, tbl, col_out, pid, i_tbl_part), where:
+    :return: Iterator((d, (cfg1, tbl, pcid, i_tbl_part))), where:
     - d - data
-    - cfg1.coefs, tbl, col_out, pid - fun_gen output:
+    - cfg1.coefs, tbl, pcid - fun_gen output:
     tbl: name of tables in coefs database (same as in .raw.h5) and, in proc_noAvg.h5, or in proc.h5
     - i_tbl_part - part number if loading many parts in same output table
+
+    --------------------------
+    for d, (tbl, pcid, probe_continues) in gen_physical(...):
+
     """
-    # Construct config for 1 probe (cfg1)
+
     # Separate config for each probe from cfg['in_many'] fields
     cfg_in_common, cfg_in_for_probes = separate_cfg_in_for_probes(cfg["in"], in_many)
 
-    b_input_is_h5 = cfg['in']['paths'][0].suffix in hdf5_suffixes
+    # Prepare to save coefs to DB
+    save_coef_funcs = []  # container for functions that saves coefs
+
+    def factory_save_coef(is_db_a_pandas_store=True, **kwards):
+        """Save coefs function factory
+        :param is_db_a_pandas_store: set to False if you've open `db` by h5py
+        :param kwards: tbl_raw, dict_matrices, dates
+        """
+        def h5copy_coef_to_db(db):
+            # can't create dataset using h5py in the opened pandas store, so close and reopen
+            if is_db_a_pandas_store:
+                db.close()
+            table_written = h5copy_coef(None, db.filename if is_db_a_pandas_store else db, **kwards)
+            if is_db_a_pandas_store:
+                db.open()
+            return table_written
+
+        return h5copy_coef_to_db
+
+    pcid_prev = None
+    pcid_part = 0
+
+    def calc(
+        df_raw,
+        cfg_in,
+        cfg_filter,
+        pcid,
+        b_raw_data_from_db=None,
+        df_physical=None,
+        dt_bins=cfg["out"]["dt_bins"],
+        dt_dask_partition=cfg["out"]["split_period"]
+    ):
+        """
+        Prepare coef, calculate and average physical parameters data (calls `coef_prepare`, `to_physical`)
+        :param b_raw_data_from_db: if set then do not save coefs to DB as data (with coefs) is there already
+        """
+        nonlocal pcid_part, pcid_prev
+
+        probe_continues = (pcid == pcid_prev)
+        if probe_continues:
+            pcid_part += 1  # next part of same csv
+        else:
+            pcid_prev = pcid
+            pcid_part = 0
+
+        tbl_raw = pcid_to_raw_name(pcid)
+        lf.warning(
+            "Raw {:s}{:s}{:s} data loaded. Processing...",
+            tbl_raw,
+            "" if b_raw_data_from_db is None else
+            (" raw db" if df_physical is None else " raw/noAvg db") if b_raw_data_from_db else " csv",
+            "" if not pcid_part else f" (part {pcid_part})"
+        )
+        # lf.warning(
+        #     "{: 2d}. {:s} from {:s}{:s}",
+        #     ipid,
+        #     pcid,
+        #     tbl_in,
+        #     msg,
+        # )
+        coefs, coef_zeroing_matrix, dates, msg_coefs = call_with_valid_kwargs(
+            coef_prepare,
+            **cfg_in,
+            data=df_raw,
+            data_date=getattr(df_raw, 'divisions' if isinstance(df_raw, dd.DataFrame) else 'index')[0]
+        )
+
+        # Save coeff. (postpone save by h5py to raw db as now it can be opened by pandas)
+        if not (b_raw_data_from_db or probe_continues):
+            lf.info(f"Coefficients will be saved {msg_coefs}to {tbl_raw}")
+            save_coef_funcs.append(factory_save_coef(
+                is_db_a_pandas_store=False,
+                dict_matrices=coefs_format_for_h5(coefs, pcid),
+                tbl=tbl_raw,
+                dates=dates,
+                )
+            )
+
+        d_avgs = to_physical(
+            df_raw,
+            {
+                **coefs,
+                **incl_calc_kwargs,
+                "max_incl_of_fit_deg": cfg_in["max_incl_of_fit_deg"],
+                "calc_version": cfg_in["calc_version"],
+            },
+            coef_zeroing_matrix,
+            cfg_filter=cfg_filter,
+            dt_bins=dt_bins,
+            dt_min_binning_proc=cfg_in["dt_min_binning_proc"],
+            tbl=tbl_raw,
+            dt_dask_partition=dt_dask_partition,
+            df_physical=df_physical,
+        )
+        return d_avgs, probe_continues
+
+
+    b_input_is_h5 = cfg["in"]["paths"][0].suffix in hdf5_suffixes
     if b_input_is_h5:
-        # Loading from hdf5
+        # Loading from HDF5
         ###################
 
-        # Output table pattern to get out tables from input tables names
-        _ = cfg['out'].get('tables'); n = len(_) if _ else 0
-        table_out_ptn = _[0] if n == 1 else _
-        _ = cfg['out'].get('tables_log'); n = len(_) if _ else 0
-        table_log_out_ptn = _[0] if n == 1 else _
+        # Determine whether we need input raw data or averaged data
+        cfg["in"]["path"] = get_input_db(
+            cfg["in"]["path"], dt_min_binning_proc=cfg["in"]["dt_min_binning_proc"], **cfg["out"]
+        )
+        b_raw = '.raw' in cfg["in"]["path"].suffixes[-2:-1]
 
-        for tbl_out_fill, cfg_in_cur in cfg_in_for_probes.items():
-            # if table explicitly defines input tables list then skip redundant tables from other plural
-            # parameters
-            if 'table' not in cfg_in_cur:
-                continue
-            # Output table name
-            aggregate_period = cfg['out']['aggregate_period']
-            # tbl_out_fill, pid = out_col_name(tbl_in_abbr)
-            if isinstance(aggregate_period, str) and aggregate_period:  # all probes to one table
-                cfg['out']['table'] = f'i_bin{aggregate_period}'
-            elif not aggregate_period:
-                if '{' in cfg_in_cur['table']:
-                    # Convert out table name to input table to fill in search patten
-                    if tbl_out_fill.startswith('*'):
-                        tbl_out_fill = f'.{tbl_out_fill}'  # make valid regex
-                else:
-                    lf.warning(  # group msg
-                        f'All found tables by pattern {cfg_in_cur["table"]} will be loaded to table '
-                        '{tbl_out_fill} based on current config group name. Consider to use {} in table name '
-                        'search pattern to fill each input group output name with input table name instead'
-                    )
-                if table_out_ptn:
-                    cfg['out']['table'] = table_out_ptn.replace('.*', '').format(tbl_out_fill)
-                if table_log_out_ptn:
-                    cfg['out']['table_log'] = table_log_out_ptn.replace('.*', '').format(tbl_out_fill)
-            else:
-                raise ValueError('Config parameter out.aggregate_period should be str or None')
-            # Input table name
-            cfg_search_in = {
-                'path': cfg_in_cur['path'],
-                'tables': [
-                    cfg_in_cur.pop('table').format(  # removing old table info. Changes cfg_in_for_probes!
-                        tbl_out_fill.replace('i', 'incl')
-                        if cfg['in']['is_counts'] and tbl_out_fill[0] == 'i'
-                        else tbl_out_fill
-                    ).replace('.*.*', '.*')]  # redundant regex
-            }
+        def gen_raw(skip_for_meta: Callable[[Any], Any]):
+            """
+            Search and generate data from raw / noAvg DB
+            For use as argument of `h5.append_through_temp_db_gen()` to update noAvg / Avg DB through temp DB
+            :param skip_for_meta: function to send meta to the caller `h5.append_through_temp_db_gen` that
+            determines wherther to reuse saved noAvg data instead of this function output to calc it
+            yields df_raw_or_None, (df_raw, meta_raw_db) where:
+            - df_raw_or_None: raw data or None if skip_for_meta,
+            - df_raw: raw data,
+            - meta_raw_db: (i1pid, pcid, path_csv), rec_raw, tbl_raw
+            Call in calc phys. cycle inside `h5.append_through_temp_db_gen` that can reuse data from noAvg DB
+            """
+
             n_yields = 1
-            for itbl, (tbl_in, col_out, pid, coefs_dict) in h5_dispenser_and_names_gen(  # opens output DB
-                    cfg_search_in, cfg['out'], fun_gen=fun_gen, b_close_at_end=False
-            ):  # also gets cfg['out']['db'] to write, updats cfg['out']['b_remove_duplicates']
 
-                # Set current configuration: add copy of fields that can be changed (to not change initial cfg
-                # each cycle we are starting from)
-                try:
-                    cfg1 = cfg_copy_for_pid(cfg, cfg_in_common, cfg_in_for_probes[col_out])
-                except KeyError:
-                    lf.warning(
-                        'No data for existed configuration: {}! Skipping...', col_out)
-                    continue
-                cfg1['in']['table'] = tbl_in
-                cfg1['in']['path'] = cfg_in_cur['path']
+            def yielding(d_raw, df_log, tbl_raw, msg=""):
+                """
+                return (df, (df_raw, (i1pid, pcid, path_csv), rec_raw, tbl_raw)): compatible output with
+                `gen_avg_updating_no_avg_db` input equal to output of other `gen_raw` version below
+                """
+                time_st, time_en = d_raw.divisions[:: len(d_raw.divisions) - 1]
+                df_log_raw = df_log[(time_en >= df_log["DateEnd"])&(df_log.index >= time_st)]
+                meta_raw_db = ((msg, tbl_raw.replace("incl", "i", 1), []), df_log_raw, tbl_raw)  # `to_record_avg_db` compartible
+                # Send meta to the caller `table_from_meta`, `meta_to_record` to reuse saved noAvg data
+                b_skip_dt0 = skip_for_meta(meta_raw_db)
+                return None if b_skip_dt0 else d_raw, (d_raw, meta_raw_db)
 
-                # Possibility to overwrite probe with specific settings in "probes/{table}.yaml"
-                try:  # Warning: Be careful especially if update 'out' config
-                    cfg_hy = hydra.compose(overrides=[f"+probes={tbl_in}"])
-                    if cfg_hy:
-                        with open_dict(cfg_hy):
-                            cfg_hy.pop('probes')
-                        if cfg_hy:
-                            lf.warning(
-                                'Loaded YAML Hydra configuration for data table "{:s}" {}', tbl_in, cfg_hy)
-                            for k, v in cfg_hy.items():
-                                cfg1[k].update(v)
-                except hydra.errors.MissingConfigException:
-                    pass
 
-                # ``time_ranges`` must be specified before loading so filling with dumb values where no info.
-                if cfg1['in']['time_ranges'] is None and (cfg1['in']['min_date'] or cfg1['in']['max_date']):
-                    cfg1['in']['time_ranges'] = [
-                        cfg1['in']['min_date'] or '2000-01-01',
-                        cfg1['in']['max_date'] or pd.Timestamp.now()
-                    ]
-
-                def yielding(d, msg=':', i_part=None):
-                    """
-                    Yield with message and changes the name of the output table from incl to i (my convention
-                    for processed data storage)
-                    :param d:
-                    :param msg:
-                    :return:
-                    """
-                    lf.warning(
-                        '{: 2d}. {:s} from {:s}{:s}{:s}',
-                        itbl, col_out, tbl_in, ': ' if i_part is None else f'.{i_part}: ', msg
-                    )
-                    # copy to not cumulate the coefs corrections in several cycles of generator consumer for
-                    # same probe and convert to numpy arrays:
-                    if coefs_dict is None:
-                        pass
-                    elif cfg1['in']['coefs'] is None:
-                        cfg1['in']['coefs'] = coefs_dict
-                    else:
-                        # coefs_dict = None if coefs is None else {
-                        #     k: np.float64(v) if (isinstance(v, list) and v is not None) else v
-                        #     for k, v in (coefs if isinstance(coefs, dict) else OmegaConf.to_container(coefs)).items()
-                        # }
-                        cfg1['in']['coefs'].update(coefs_dict)
-                    return d, cfg1, tbl_in.replace('incl', 'i'), col_out, pid, i_part
-
-                with pd.HDFStore(cfg1['in']['path'], mode='r') as cfg1['in']['db']:
-                    if ('.proc_noAvg' in cfg1['in']['path'].suffixes[-2:-1] and
-                        not cfg['out']['b_split_by_time_ranges']):
-                        # assume not need global filtering/get intervals for such input database
-                        d = h5_load_range_by_coord(
-                            **cfg1['in'], db_path=cfg1['in']['path'], range_coordinates=None)
-                        yield yielding(d)
-                    else:
-                        # query and process several independent intervals
-                        # Get index only and find indexes of data
-                        try:
-                            index_range, i0range, iq_edges = h5coords(
-                                cfg1['in']['db'], tbl_in, q_time=cfg1['in']['time_ranges'] or None
-                            )
-                        except TypeError:  # skip empty nodes
-                            # cannot create a storer if the object is not existing nor a value are passed
-                            lf.warning('Skipping {} without data table found', tbl_in)
-                            continue
-                        n_parts = round(len(iq_edges) / 2)
-                        if n_parts < 1:
-                            lf.warning('Skipping {0}: no data found{1}{2}{4}{3}', tbl_in, *(
-                                (' in range ', *cfg1['in']['time_ranges'], ' - ')
-                                if cfg1['in']['time_ranges'] else
-                                ['']*4)
-                            )
-                            continue
-                        for i_part, iq_edges_cur in enumerate(zip(iq_edges[::2], iq_edges[1::2])):
-                            n_rows_to_load = -np.subtract(*iq_edges_cur)
-                            if n_rows_to_load == 0:  # empty interval - will get errors in main circle
-                                continue  # ok when used config with many intervals from different databases
-                            ddpart = h5_load_range_by_coord(
-                                db_path=cfg1['in']['path'], **cfg1['in'], range_coordinates=iq_edges_cur
-                            )
-                            d, i_burst = filt_data_dd(
-                                ddpart, cfg1['in'].get('dt_between_bursts'),
-                                cfg1['in'].get('dt_hole_warning'),
-                                cfg1['in']
-                                )
-                            if index_range is not None:
-                                yield yielding(d, msg='{:%Y-%m-%d %H:%M:%S} – {:%m-%d %H:%M:%S}'.format(
-                                    *index_range[iq_edges_cur - i0range]),
-                                    i_part=i_part if n_parts > 1 else None
-                                )
-                            else:
-                                yield yielding(d)
-                            n_yields += 1
-    else:
-        # Load CSV data
-        ###############
-
-        if cfg['out']['aggregate_period']:
-            ...
-        if cfg['program']['return_'] and cfg['program']['return_'].startswith("<cfg_input_files"):
-            # Yield metadata:
-            # df_raw    # dataframes with edge rows
-            # cfg1      # calculating parameters
-            # tbl_raw   # same as pid with i replaced to "incl" (if no specific porbe model: pid starts from same letter as probe_type) or "incl_"
-            # col_out   # output col name suffix: {probe_type}{_}{pid} ({pid} if no specific probe model)
-            # pid       # 3-alphanumeric symbols word
-
-            # load only 1st and last row for each probe (metadata to return)
-            for itbl, pid, path_csv, df_raw in load_from_csv_gen(
-                cfg_in_common, cfg_in_for_probes, cfg['program']['return_']
-                ):
-                # output table
-                tbl_raw = (
-                    cfg['out']['table'] or
-                    pid.replace('i', 'incl') if pid[0] == 'i' else f'incl_{pid}'
+            # Output table pattern to get out tables from input tables names (set None if len > 1 to not use)
+            table_out_ptns = {
+                key: (lambda t: val_default if not t else (t[0] or val_default) if len(t) == 1 else None)(
+                    cfg["out"].get(key)
                 )
-                # Configuration for current pid
-                cfg1, col_out, pid = get_pid_cfg_(cfg, cfg_in_common, cfg_in_for_probes, tbl_raw)
-                cfg1['in']['path'] = path_csv  # corrected raw txt
+                for key, val_default in [("tables", "{}"), ("tables_log", "{}/logFiles")]
+            }
+
+            # Tables fill parameter cycle (to fill patten with it, if has "*" then later with search results)
+            for fill, cfg_in_cur in cfg_in_for_probes.items():
+
+                # Fill input table name pattern
+                try:
+                    tbl_raw_ptn = cfg_in_cur.pop("table")
+                except KeyError:
+                    # continue
+                    tbl_raw_ptn = '{}'
+
+                # Convert out table name to input table to fill in search patten
+                if fill.startswith("*"):
+                    fill = f".{fill}"  # make valid regex
+                tbl_raw_ptn = tbl_raw_ptn.format(fill)
+                if tbl_raw_ptn[0] == "i" and "incl" not in tbl_raw_ptn:
+                    tbl_raw_ptn = f"incl{tbl_raw_ptn[1:]}"
+                tbl_raw_ptn = tbl_raw_ptn.replace(".*.*", ".*")  # removes redundant regex
+
+                # Fill output table name (if fill is not pattern(found table))
+                if '*' not in fill:
+                    for key in ["tables", "tables_log"]:
+                        if table_out_ptns[key]:
+                            cfg["out"][key] = table_out_ptns[key].replace(".*", "").format(fill)
+                elif "{" in tbl_raw_ptn and "{" not in table_out_ptns["table"]:
+                    lf.warning(  # multiple input tables to one otput table warning
+                        f"All {fill} found tables by pattern {tbl_raw_ptn} will be loaded to table "
+                        f"{cfg['out']['tables'][0]} based on current config group name. Consider to use {{}} "
+                        "in table name search pattern to fill each input group output name with input table "
+                        "name instead"
+                    )
+
+                path_in = cfg_in_cur.get("path") or cfg_in_common["path"]
+                with pd.HDFStore(path_in, mode="r") as db:
+                    tables = h5.find_tables(db, tbl_raw_ptn)
+                    # Tables cycle for current probe, but change current probe if it is a pattern(table)
+                    for tbl_in in tables:
+                        # Change current probe
+                        if '*' in fill:
+                            tbl_out = tbl_in.replace("incl", "i", 1)
+                            cfg_in_cur = cfg_in_for_probes.get(tbl_out, cfg_in_cur)
+
+                            for key in ["tables", "tables_log"]:
+                                if table_out_ptns[key]:
+                                    cfg["out"][key] = table_out_ptns[key].replace(".*", "").format(tbl_out)
+
+                        df_log = h5.read_db_log(db, f"{tbl_in}/logFiles")
+
+                        # Config to load raw data from current table
+                        cfg_in_cur["table"] = tbl_in
+
+                        # Init ``time_ranges``
+                        if cfg_in_cur["time_ranges"] is None and (
+                            cfg_in_cur["min_date"] or cfg_in_cur["max_date"]
+                        ):
+                            cfg_in_cur["time_ranges"] = [
+                                cfg_in_cur["min_date"] or "2000-01-01",
+                                cfg_in_cur["max_date"] or pd.Timestamp.now(),
+                            ]
+
+                        # Query data by time interval(s) if loading from raw DB
+                        if cfg_in_cur["time_ranges"] and (
+                            cfg["out"]["b_split_by_time_ranges"] or ".raw" in path_in.suffixes[-2:-1]
+                        ):
+                            try:
+                                index_range, i0range, iq_edges = h5.coords(
+                                    cfg_in_cur["db"], tbl_in, q_time=cfg_in_cur["time_ranges"] or None
+                                )  # time range index and numeric indexes range of data
+                            except TypeError:  # skip empty nodes
+                                # cannot create a storer if the object is not existing nor a value are passed
+                                lf.warning("Skipping {} without data table found", tbl_in)
+                                continue
+                            n_parts = round(len(iq_edges) / 2)
+                            if n_parts < 1:
+                                lf.warning(
+                                    "Skipping {0}: no data found{1}{2}{4}{3}",
+                                    tbl_in,
+                                    *(
+                                        (" in range ", *cfg_in_cur["time_ranges"], " - ")
+                                        if cfg_in_cur["time_ranges"]
+                                        else [""] * 4
+                                    ),
+                                )
+                                continue
+                            for i_part, iq_edges_cur in enumerate(zip(iq_edges[::2], iq_edges[1::2])):
+                                n_rows_to_load = -np.subtract(*iq_edges_cur)
+                                if n_rows_to_load == 0:  # empty interval - would get errors in main circle
+                                    continue  # ok when used config with many intervals from different db
+                                ddpart = h5_load_range_by_coord(
+                                    db_path=path_in, **cfg_in_cur, range_coordinates=iq_edges_cur
+                                )
+                                # Filter by 'min'/'max' params if data is not proc. (that should've been filtered)
+                                if b_raw:
+                                    d, i_burst = filt_data_dd(
+                                        ddpart,
+                                        cfg_in_cur.get("dt_between_bursts"),
+                                        cfg_in_cur.get("dt_hole_warning"),
+                                        cfg_in_cur,
+                                    )
+                                else:
+                                    d = ddpart
+                                if index_range is not None:
+                                    yield yielding(
+                                        d,
+                                        df_log,
+                                        tbl_in,
+                                        msg="{}: {:%Y-%m-%d %H:%M:%S} – {:%m-%d %H:%M:%S}".format(
+                                            f" part {i_part}" if n_parts > 1 else "",
+                                            *index_range[iq_edges_cur - i0range],
+                                        ),
+                                    )
+                                else:
+                                    yield yielding(d, df_log, tbl_in)
+                                n_yields += 1
+                        else:
+                            # Process full range data
+                            d = h5_load_range_by_coord(**cfg_in_cur, db_path=path_in, range_coordinates=None)
+                            yield yielding(d, df_log, tbl_in)
+    else:
+        # Load CSV (meta)data
+        #####################
+        if cfg["in"]["path"]:
+            cfg["in"]["paths"] = []  # ignore
+        if cfg["out"]["dt_bins"]:
+            ...
+
+        # Load only metadata: probes list, optionally with 1st and last data row for each probe
+        raw_corrected = search_correct_csv_files(cfg_in_common, cfg["program"])
+
+        gen_csv = partial(
+            load_from_csv_gen,
+            raw_corrected=raw_corrected,
+            cfg_in=cfg_in_common,
+            cfg_in_probe=cfg_in_for_probes,
+        )
+
+        if cfg["program"]["return_"] and cfg["program"]["return_"].startswith("<cfg_input_files"):
+            # Yield metadata:
+            # cfg1: calc. parameters (including dataframes with edge rows if cfg["program"]["return_"] set so)
+            # pcid: output col name suffix
+            # tbl_raw: same as pcid with i replaced to "incl"
+
+            for df_raw, (ipid, pcid, path_csv) in gen_csv(
+                return_=cfg["program"]["return_"],
+            ):
+                # Configuration for current input pcid
+                cfg1 = cur_cfg(pcid, cfg_in_for_probes, cfg_in_common, cfg)
+                cfg1["in"]["path"] = path_csv  # corrected raw txt
                 if df_raw:
                     cfg1["time_ranges"] = [dt.isoformat() for dt in df_raw.index]
-                yield df_raw, cfg1, tbl_raw, col_out, pid, None
+                # output pcid
+                if cfg["out"]["table"]:
+                    pcid = to_pcid_from_name(cfg["out"]["table"])
+                yield cfg1, (False, pcid, None)
             return
 
-        tables_written_raw = set()
-        log_raw = {}
-        path_csv_prev = None
-        pid_prev = None
 
-        def load_from_csv_gen_for_h5_dispenser(cfg_in_common, cfg_out, **cfg_in_for_probes):
-            """
-            Wraps `load_from_csv_gen()` to use it in `h5_dispenser_and_names_gen()`
-            :param cfg_out: dict, must have fields:
-            - log: dict, with info about current data, must have fields for compare:
-              - 'fileName' - in format as in log table to be able to find duplicates
-              - 'fileChangeTime', datetime - to be able to find outdated data
-            - b_incremental_update: if True then not yields previously processed files. But if file was
-              changed then: 1. removes stored data and 2. yields `fun_gen(...)` result
-            - tables_written: sequence of table names where to create index
-            """
-            yield from load_from_csv_gen(cfg_in_common, cfg_in_for_probes)
 
-        # Can not use cfg["out"] as it prepared to save to `*.proc_noAvg.h5`, so we prepare new cfg by modifieng them:
-        cfg_out_raw_db = {
-            'db_path': cfg['out']['raw_db_path'],
-            'tables': cfg['out']['tables']
-            # - b_incremental_update: default False
-            # todo: check for existence of text data in *.raw.h5 load it if it matches input files metadata
+        # CSV to raw DB (`*.raw.h5`)
+
+        def to_record_raw(meta):
+            """
+            :param meta: tuple (ipid, pcid, csv) - `gen_csv()` metadata output
+            """
+            return h5.file_name_and_time_to_record(
+                meta[-1], *(cfg["out"].get("logfield_fileName_len") or (),)
+            )
+
+        def gen_raw(skip_for_meta: Callable[[Any], Any]):
+            """
+            Generate raw data and update raw DB (`*.raw.h5`) through temporary (`*.raw_not_sorted.h5`),
+            skipping to save the existed up to date text data in raw DB (in that case load it).
+            For use in `h5.append_through_temp_db_gen`
+            :param skip_for_meta: function to send meta to the caller `h5.append_through_temp_db_gen` that
+            determines wherther to reuse saved noAvg data instead of this function output to calc it
+            yields df_raw_or_None, (df_raw, metacsv_rec_tblraw) where:
+            - df_raw_or_None raw data or None if this data is not needed,
+            - df_raw: raw data,
+            - metacsv_rec_tblraw: tuple where `metacsv` is (ipid, pcid, csv) yelded by `load_from_csv_gen()`
+            Call in calc phys. cycle inside `h5.append_through_temp_db_gen` that can reuse data from noAvg DB
+            """
+            for df_raw, metacsv_rec_tblraw in h5.append_through_temp_db_gen(
+                gen_csv,
+                db_path=cfg["out"]["raw_db_path"],
+                # temp_db_path=cfg["out"]["temp_db_path"],  # need?
+                table_from_meta=(lambda meta_csv: pcid_to_raw_name(meta_csv[1])),
+                skip_fun=(
+                    partial(h5.keep_recorded_file, keep_newer_records=False)
+                    if cfg["out"]["b_incremental_update"]
+                    else (lambda cur, existing: False)
+                ),
+                meta_to_record=to_record_raw,
+            ):
+                # Send meta to the __caller__ `table_from_meta`, `meta_to_record` to reuse saved noAvg data
+                b_skip_dt0 = skip_for_meta(metacsv_rec_tblraw)
+                yield None if b_skip_dt0 else df_raw, (df_raw, metacsv_rec_tblraw)
+
+            # Write coefs to raw db (without temporary db)
+            if save_coef_funcs:
+                tables_written = []
+                with h5py.File(cfg["out"]["raw_db_path"], "a") as h5dest:
+                    for fun_save_coef in save_coef_funcs:
+                        tables_written += fun_save_coef(h5dest)
+                print(f"coefs written to raw db: {tables_written}")
+
+
+
+
+
+    # Raw to noAvg DB (`*.proc_noAvg.h5`)
+    cfg1 = None  # configuration for current probe in cycle with copy of cfg fields that can be changed
+    pcid = None  # name of probe in `cfg_many` config (Probe output Column ID in output composed table)
+
+    def to_record_avg_db(meta):
+        """
+        Extract noAvg DB log record, and init `cfg1` with coefficients as their date used here
+        :param meta: tuple (i1pid_pid_csv, csv_record, tbl_raw)
+        By the way we get `cfg1` and `pcid`
+        """
+        nonlocal cfg1, pcid
+        i1pid_pid_csv, csv_record, tbl_raw = meta
+
+        # Get coefficients time for metadata record and, by the way, vars needed later
+        pcid = to_pcid_from_name(tbl_raw)
+        cfg1 = cur_cfg(pcid, cfg_in_for_probes, cfg_in_common, cfg)
+
+        # Set metadata record with fileChangeTime = max time of sources that can affect result
+        record_file, record_max = (
+            [csv_record[k] for k in ["fileName", "fileChangeTime"]]
+            if isinstance(csv_record, Mapping)  # when not from raw db
+            else csv_record.loc[:, ["fileName", "fileChangeTime"]].values[0]
+        )
+        # to_record_raw(i1pid_pid_csv)["fileName"] if i1pid_pid_csv
+        return {
+            "fileName": record_file,
+            "fileChangeTime": max(
+                (d for d in [cfg1["in"]["coefs"].get("date"), record_max] if d is not None)
+            )
         }
-        for itbl, (itbl, pid, path_csv, df_raw) in h5_dispenser_and_names_gen(  # opens output DB
-            cfg_in_common,
-            cfg_out_raw_db,
-            fun_gen=load_from_csv_gen_for_h5_dispenser,
-            b_close_at_end=False,
-            **cfg_in_for_probes,
-        ):  # also gets cfg_out_raw_db['db'] to write, updats cfg['out']['b_remove_duplicates']
-            # also works without funcuionality of h5_dispenser_and_names_gen:
-            # db_out_raw = pd.HDFStore(cfg['out']['raw_db_path']) if cfg['out']['raw_db_path'] else None
 
-            # for itbl, pid, path_csv, df_raw in load_from_csv_gen(cfg_in_common, cfg_in_for_probes):
-            if path_csv_prev != path_csv:
-                path_csv_prev = path_csv
-                csv_part = 0
-            else:
-                csv_part += 1  # next part of same csv
-            # output table
-            tbl_raw = cfg['out']['table'] or pid.replace('i', 'incl') if pid[0] == 'i' else f'incl_{pid}'
+    def gen_avg_updating_no_avg_db(skip_for_meta: Callable[[Any], Any]):
+        """
+        Gen processed data (with updating noAvg DB). For use in `h5.append_through_temp_db_gen`
+        :param skip_for_meta: function defined inside `h5.append_through_temp_db_gen` to skip
+            averaging and load saved data from Avg DB and `table_from_meta` and `meta_to_record` args
+        yields (d_avg, meta_avg_db_bin):
+        - d_avg: processed data bin averaged with `dt_bin` (which can be 0 if need proc. not avg more)
+        - cont_pcid_bin_tbl_rec: metadata (probe_continues, pcid, tbl_raw, dt_bin, tbl, rec)
 
-            # Configuration for pid: `cfg1` with copy of cfg fields that can be changed in cycle
-            cfg1, col_out, pid = get_pid_cfg_(cfg, cfg_in_common, cfg_in_for_probes, tbl_raw)
-            cfg1['in']['path_csv'] = path_csv
+        """
+        for df, ((df_raw, metacsv_rec_tblraw), rec_noavg, tbl_noavg) in h5.append_through_temp_db_gen(
+            gen_raw,
+            db_path=cfg["out"]["not_joined_db_path"],
+            table_from_meta=lambda metacsv_rec_tblraw: metacsv_rec_tblraw[-1].replace("incl", "i", 1),
+            meta_to_record=to_record_avg_db,
+        ):
+            (i1pcid, pcid, path_csv), rec_raw, tbl_raw = metacsv_rec_tblraw
 
-            lf.warning(
-                '{: 2d}. csv {:s}{:s} loaded data processing...',
-                itbl, tbl_raw, '' if csv_part is None else f'.{csv_part}'
+            # `df` can be data from noAvg DB or raw data equal to `df_raw` have used to get `record`
+            if df.columns.to_list() == df_raw.columns.to_list():
+                df = None
+            #     rec_out = rec_raw
+            # else:
+            #     rec_out = rec_noavg
+
+            d_avgs, probe_continues = calc(
+                df_raw, cfg1["in"], cfg1["filter"], pcid,
+                b_raw_data_from_db=None if path_csv is None else isinstance(path_csv, list), df_physical=df
+            )  # `load_from_csv_gen` yields `path_csv` as a list if skips for the reuse of existed db data
+            dt_bins = cfg["out"]["dt_bins"]
+            i_avg_st = None if not dt_bins else (dt_bins[0] > timedelta(0))  # index of 1st averaging data
+            for d, dt_bin in zip(d_avgs[i_avg_st:], dt_bins[i_avg_st:]):
+                bin = int(dt_bin.total_seconds())
+                if not bin:
+                    continue
+
+                tbl_avg = f"{tbl_noavg}bin{bin}s"
+
+                # Send meta to the caller `table_from_meta`, `meta_to_record` to reuse saved Avg data
+                b_skip = skip_for_meta([rec_raw, tbl_avg])
+
+                yield None if b_skip else d, [probe_continues, pcid, dt_bin] #, tbl_avg, rec_out
+
+
+    if cfg["out"]["db_path"]:
+        # Configured writing csv data to raw (if csv), raw to noAvg DBs (through temporary DBs) is on
+
+        # Gen processed data separatly for each averaging bin (with updating Avg DB)
+        for d, (cont_pcid_bin, rec_avg, tbl_avg) in h5.append_through_temp_db_gen(
+            gen_avg_updating_no_avg_db,
+            db_path=cfg["out"]["not_joined_db_path"].parent
+            / cfg["out"]["not_joined_db_path"].name.replace("_noAvg", "_Avg", 1),
+            table_from_meta=(lambda rec_tbl: rec_tbl[1]),
+            meta_to_record=(lambda rec_tbl: rec_tbl[0]),
+        ):  # d can be pandas dataframe from Avg DB or dask dataframe obtained now
+            yield d, cont_pcid_bin
+
+    else:
+        # Not writing to DB / not reading DB data here (except config coefs)
+
+        for df_raw, (i1pcid, pcid, path_csv) in gen_csv():
+            # Configuration for pcid: `cfg1` with copy of cfg fields that can be changed in cycle
+            cfg1 = cur_cfg(pcid, cfg_in_for_probes, cfg_in_common, cfg)  # get coefs
+            d_avgs, probe_continues = calc(
+                df_raw, cfg1["in"], cfg1["filter"], pcid, b_raw_data_from_db=False
             )
+            if cfg["out"]["table"]:
+                pcid = to_pcid_from_name(cfg["out"]["table"])
+            dt_bins = cfg["out"]["dt_bins"]
+            for d, dt_bin in zip(d_avgs[(dt_bins[0] > timedelta(0)):], dt_bins):
+                bin = int(dt_bin.total_seconds())
+                if not bin:
+                    continue
 
-            df_raw = filter_local(df_raw, cfg1['filter'], ignore_absent={'h_minus_1', 'g_minus_1'})
-            d = dd.from_pandas(df_raw, npartitions=1)
-            data_len = df_raw.shape[0]
-
-            yield d, cfg1, tbl_raw, col_out, pid, csv_part
-
-            # Save raw data to hdf5 for future simplified loading here or needs of other programs
-            if cfg_out_raw_db['db'] is not None:
-                if csv_part:
-                    # we will save log only when we after last part for input file i.e. no '_part'
-                    log_raw['DateEnd'] = d.divisions[-1]
-                    log_raw['rows'] += len(d)
-                else:  # new file
-                    if pid != pid_prev:  # new pid
-
-                        log_raw = {
-                            'Date0': d.divisions[0],
-                            'DateEnd': None,
-                            'fileName': ','.join([
-                                f'{p.parent.name}/{p.stem}' for p in cfg1['in']['paths_csv']])[
-                                -cfg['out']['logfield_fileName_len']:],
-                            'fileChangeTime': datetime.fromtimestamp(
-                                path_csv[-1].stat().st_mtime),
-                            'rows': data_len
-                        }
-                    else:
-                        cfg1['in']['paths_csv'].append(path_csv)
-                tables_written_raw |= h5_append_to(
-                    d,
-                    tbl_raw,
-                    {**cfg_out_raw_db, "db": cfg_out_raw_db["db"], "b_log_ready": True},
-                    {} if csv_part else log_raw,
-                    msg=f"saving raw data to {tbl_raw}",
-                )
-
-        if tables_written_raw:
-            # Save info about last loaded csv info log
-            # h5_append(cfg_out_mod, pd.DataFrame(), log_raw)
-            tables_written_raw |= h5_append_to(
-                pd.DataFrame(),
-                tbl_raw,
-                {**cfg_out_raw_db, "db": cfg_out_raw_db["db"], "b_log_ready": True},
-                log_raw,
-                msg=f"data saved {tbl_raw}",
-            )
-            cfg_out_raw_db["db"].close()
+                yield d_avgs, [probe_continues, pcid, dt_bin]
 
 
 # -----------------------------------------------------------------------------------------------------------
@@ -2274,95 +2734,26 @@ def main(config: ConfigType) -> Union[None, Mapping[str, Any], pd.DataFrame]:
     Calculate new data or average by specified interval
     Combine this data to new table
     :param config:
+    Set to use raw input data for output bins < 2s by default else (not averaged) physical values
     :return:
     """
     global cfg
     if config.input.path is None and config.input.paths is None:
-        raise ValueError('At least one of input `path` or `paths` must be provided.')
+        raise ValueError('Input `path` or `paths` must be provided.')
     cfg = cfg_d.main_init(config, cs_store_name, __file__=None)
     cfg['input']['paths'] = (
         [Path(config.input['path'])] if config.input['paths'] is None
         else [Path(p) for p in config.input['paths']])
     cfg = cfg_d.main_init_input_file(cfg, cs_store_name, msg_action='Loading data from', in_file_field='path')
-    lf.info('Begin {:s}(aggregate_period={:s})', this_prog_basename(__file__),
-            cfg['out']['aggregate_period'] or 'None'
-            )
-    aggregate_period_timedelta = pd.Timedelta(pd.tseries.frequencies.to_offset(_)) if (
-        _ := ('0s' if (_ := cfg['out']['aggregate_period']) == '0' else _)  # allows "0" input
-    ) else None
-
-    # Use physical values from .proc_noAvg db as input to average data > 2s (set cfg['in']['is_counts'])
-    _ = cfg['in'].get('aggregate_period_min_to_load_proc', '2s')
-    cfg['in']['aggregate_period_min_to_load_proc'] = _ = pd.Timedelta(  # with allowing "0" input
-        pd.tseries.frequencies.to_offset(_ if (_ := ('0s' if _ == '0' else _)) else '2s'))
-
-    if aggregate_period_timedelta:
-        cfg['in']['is_counts'] = aggregate_period_timedelta <= _
-        # If 'split_period' not set use custom splitting to be in memory limits
-        cols_out_h5 = ['v', 'u', 'Pressure', 'Temp']  # absent here cols will be ignored
-
-        # Restricting number of counts to 100000 in dask partition to not overflow memory
-        split_for_memory = cfg["out"]["split_period"] or next(
-            iter(  # timedelta value of biggest unit component + 1
-                [
-                    f"{t + 1}{c}"
-                    for t, c in zip(tuple((100000 * aggregate_period_timedelta).components), "Dhms")
-                    if t > 0
-                ]
-            )
-        )
-
-        # Shorter out time format if milliseconds=0, microseconds=0, nanoseconds=0
-        if cfg['out']['text_date_format'].endswith('.%f') and not np.any(
-            aggregate_period_timedelta.components[-3:]):
-            cfg['out']['text_date_format'] = cfg['out']['text_date_format'][:-len('.%f')]
-    else:
-        cfg['in']['is_counts'] = True
-        cols_out_h5 = ['v', 'u', 'Pressure', 'Temp', 'inclination']  # may be  cols will be ignored
-
-        # Restricting dask partition size by time period
-        split_for_memory = cfg['out']['split_period'] or pd.Timedelta(1, 'D')
-        cfg['out']['aggregate_period'] = None  # 0 to None
-
-    for b_repeat in [False, True]:
-        try:
-            cfg['in']['paths'] = set_full_paths_and_h5_out_fields(cfg, bool(aggregate_period_timedelta))
-            b_input_is_h5 = cfg['in']['paths'][0].suffix in hdf5_suffixes
-            break
-        except FileNotFoundError:  # No raw db was found
-            # Switch to load text data to raw db this run as direct averaging of txt (controlled by
-            # aggregate_period_min_to_load_proc) is switched off
-            cfg['in']['is_counts'] = True
-            aggregate_period_timedelta = None
-            # config.hydra.multirun = True  # possible set to run this prog second time here?
-
-    # Set columns from incl_calc_velocity() we need to prepend: Vabs/dir columns needed only to save them in
-    # txt
-    if cfg['out']['text_path']:
-        incl_calc_kwargs = {}  # all its cols
-    else:
-        _ = [c for c in cols_out_h5 if c not in ('Pressure', 'Temp')]  # ('v', 'u', 'inclination')
-        incl_calc_kwargs = {'cols_prepend': _}
-
-    # Filtering values [min/max][M] could be specified with just key M to set same value for keys Mx My Mz
-    for lim in ['min', 'max']:
-        if 'M' in cfg['filter'][lim]:
-            for ch in ('x', 'y', 'z'):
-                set_field_if_no(cfg['filter'][lim], f'M{ch}', cfg['filter'][lim]['M'])
-
-    if cfg['program']['dask_scheduler'] == 'distributed':
-        from dask.distributed import Client, progress
-        # cluster = dask.distributed.LocalCluster(n_workers=2, threads_per_worker=1, memory_limit="5.5Gb")
-        client = Client(processes=False)
-        # navigate to http://localhost:8787/status to see the diagnostic dashboard if you have Bokeh installed
-        # processes=False: avoide inter-worker communication for computations releases the GIL (numpy, da.array)  # without is error
-    else:
-        if cfg['program']['dask_scheduler'] == 'synchronous':
-            lf.warning('using "synchronous" scheduler for debugging')
-        import dask
-        dask.config.set(scheduler=cfg['program']['dask_scheduler'])
-        progress = None
-        client = None
+    lf.info(
+        "Begin {:s} {:s}",
+        this_prog_basename(__file__),
+        "(no averaging)"
+        if cfg["out"]["dt_bins"] == [timedelta(0)]
+        else "(bins: {})".format(', '.join(format_timedelta(dt) for dt in cfg["out"]["dt_bins"]))
+    )
+    cfg["in"]["path"] = set_full_paths_and_h5_out_fields(cfg["out"], **cfg["in"])
+    cfg['in'].setdefault('dt_min_binning_proc', pd.Timedelta('2s'))
 
     if cfg['program']['return_']:
 
@@ -2381,212 +2772,129 @@ def main(config: ConfigType) -> Union[None, Mapping[str, Any], pd.DataFrame]:
                 dir_cfg_proc = None
             out_dicts = {}
             file_stems = set()
-            for df, cfg1, tbl, col_out, pid, _ in gen_subconfigs(
-                    cfg, fun_gen=probes_gen, **cfg['in_many']
-                ):
+            lf.info('Saving yaml configs')
+            for cfg1, (probe_continues, pcid, _) in gen_physical(cfg, **cfg['in_many']):
                 if dir_cfg_proc:
                     # Save calculating parameters
                     # rename incompatible to OmegaConf "in" name, remove paths as we save for each file
-                    cfg1 = {"input": {**cfg1.pop("in"), "tables": [tbl], "paths": None}, **cfg1}
-                    conf_ = cfg_d.omegaconf_merge_compatible(cfg1, ConfigType)
+                    cfg1 = {"input": {**cfg1.pop("in"), "paths": None}, **cfg1}
+                    cfg1["out"]["dt_bins"] = cfg["out"]["dt_bins"]
+                    # Fields that added here and are not in structured config
+                    del cfg1["out"]["tables"]
+                    del cfg1["out"]["nfiles"]
+                    del cfg1["out"]["b_del_temp_db"]
+                    del cfg1["out"]["temp_db_path"]
+                    del cfg1["out"]["b_incremental_update"]
+
+                    del cfg1["in"]["dt_min_binning_proc"]
+                    del cfg1["in"]["b_insert_separator"]
+                    del cfg1["in"]["cfgFile"]
+
+                    conf_ = cfg_d.to_omegaconf_merge_compatible(cfg1, ConfigType)
                     conf = OmegaConf.create(conf_)
 
                     # Save to `defaults` dir so we can use them as configs with new defaults to run later
-                    while True:  # Make unique file name (can gen_subconfigs yield same pid?)
-                        file_stem = file_name_pattern.format(id=pid)
+                    while True:  # Make unique file name (can gen_physical yield same pcid?)
+                        file_stem = file_name_pattern.format(id=pcid)
                         if file_stem in file_stems:  # change time-based name
                             file_name_pattern = f"{{id}}_{datetime.now():%Y%m%d_%H%M%S}.yaml"
                             continue
                         file_stems.add(file_stem)
                         break
-                    with dir_cfg_proc / file_stem.with_suffix('.yaml') as fp:
+                    print(f"{pcid}: {file_stem}", end=", ")
+                    with (dir_cfg_proc / file_stem).with_suffix('.yaml') as fp:
                         OmegaConf.save(conf, fp)  # or pickle.dump(conf, fp)
                         # fp.flush()
                 out_dicts[str(cfg1['input']['path'])] = cfg1  # [tbl]? cfg_?
+            print("\nOk.", end=" ")
             return out_dicts
 
+    if not (cfg["out"]["not_joined_db_path"] or cfg["out"]["text_path"]):
+        lf.error("Neither output hdf5 store nor text output was requested. The end")
+        return
+
+    # Set columns from incl_calc_velocity() we need to calculate: all calculated cols will be prepend if
+    # save txt and without Vabs/dir columns if not txt needed
+    cols_out_h5 = ['v', 'u', 'Pressure', 'Temp', 'inclination']  # absent here cols will be ignored
+
+    # Filtering config [min/max][M] could be specified with just key M to set same value for keys Mx My Mz
+    for lim in ["min", "max"]:
+        if "M" in cfg["filter"][lim]:
+            for ch in ("x", "y", "z"):
+                set_field_if_no(cfg["filter"][lim], f"M{ch}", cfg["filter"][lim]["M"])
+
+    if cfg["program"]["dask_scheduler"] == "distributed":
+        from dask.distributed import Client, progress
+
+        # cluster = dask.distributed.LocalCluster(n_workers=2, threads_per_worker=1, memory_limit="5.5Gb")
+        client = Client(processes=False)
+        # navigate to http://localhost:8787/status to see the diagnostic dashboard if you have Bokeh installed
+        # processes=False: avoide inter-worker communication for computations releases the GIL (numpy, da.array)  # without is error
+    else:
+        if cfg["program"]["dask_scheduler"] == "synchronous":
+            lf.warning('using "synchronous" scheduler for debugging')
+        import dask
+
+        dask.config.set(scheduler=cfg["program"]["dask_scheduler"])
+        progress = None
+        client = None
+
+    def map_to_suffixed(names, suffix):
+        """Adds tbl suffix to output columns before accumulate in cycle for different tables"""
+        return {col: f"{col}_{suffix}" for col in names}
+
     # Data processing cycle
-    dfs_all_list = []
-    tbls = []
-    dfs_all: Optional[pd.DataFrame] = None
-    cfg['out']['tables_written'] = set()
-    tables_written_not_joined = set()
-    tbl_prev = pid_prev = None
-    for d, cfg1, tbl, col_out, pid, i_tbl_part in gen_subconfigs(
-            cfg,
-            fun_gen=probes_gen,
-            **cfg['in_many']
-            ):
-        if i_tbl_part:
-            probe_continues = True
-        else:
-            probe_continues = (tbl == tbl_prev and pid == pid_prev)
-            tbl_prev = tbl
-            pid_prev = pid
+    dfs_all_bins: Mapping[str, List[pd.DataFrame]] = {
+        dt: [] for dt in cfg["out"]["dt_bins"] if dt > timedelta(0)}
+    tbls = {k: [] for k in dfs_all_bins.keys()}  # tables to add in log table, to joined suffix to comb. csv
+    cfg["out"]['tables_written'] = set()
+    probe_continue_file_name = None  # this line actually not needed, used just for Pylance
+    for d, (probe_continues, pcid, dt_bin) in gen_physical(
+        cfg,
+        **cfg["in_many"],
+        incl_calc_kwargs={"cols_prepend": [c for c in cols_out_h5 if c not in ("Pressure", "Temp")]}
+        if cfg["out"]["text_path"]
+        else {},  # keep min cols if not need to save txt: v, u, inclination
+    ):
+        if d is None:
+            continue
+        bin = int(dt_bin.total_seconds())
 
-        if b_input_is_h5:
-            d = filter_local(d, cfg1['filter'], ignore_absent={'h_minus_1', 'g_minus_1'})  # todo: message of filtered especially if all was filt out
-        # d[['Mx','My','Mz']] = d[['Mx','My','Mz']].mask(lambda x: x>=4096):
-        if cfg['in']['is_counts']:  # Raw data processing
-            try:  # prepare to save coefficient dates (some of them can be updated below)
-                dates = cfg1['in']['coefs'].pop('dates')
-            except (KeyError, AttributeError):
-                dates = {}
-            msg_rotated = ''
-            # Zeroing
-            if _ := cfg1['in']['time_ranges_zeroing']:
-                _ = coef_zeroing_rotation_from_data(d, _, **cfg1['in']['coefs'])
-                if _ is not None:
-                    dates['Rz'] = True
-                    msg_rotated = ("with new rotation to direction averaged on configured time_ranges_zeroing "
-                        "interval ")
-                else:
-                    lf.debug('time_ranges_zeroing not in current data range')
-            # Azimuth correction
-            if cfg1["in"]["azimuth_add"] or cfg1["in"]["coordinates"]:
-                msgs = ['(coef. {:g})'.format(cfg1['in']['coefs']['azimuth_shift_deg'].item())]
-                if cfg1['in']['azimuth_add']:
-                    # individual or the same correction for each table:
-                    msgs.append('(azimuth_shift_deg {:g})'.format(cfg1['in']['azimuth_add']))
-                    cfg1['in']['coefs']['azimuth_shift_deg'] += cfg1['in']['azimuth_add']
-                if cfg1["in"]["coordinates"]:  # add magnetic declination at coordinates [Lat, Lon]
-                    mag_decl = mag_dec(
-                        *cfg1["in"]["coordinates"],
-                        d.divisions[0],
-                        depth=-1,  # depth has negligible effect if it is less than several km
-                    )
-                    msgs.append("(magnetic declination {:g})".format(mag_decl))
-                    cfg1['in']['coefs']['azimuth_shift_deg'] += mag_decl
-
-                lf.warning('Azimuth correction updated to {:g} = {}°',
-                    cfg1['in']['coefs']['azimuth_shift_deg'].item(), ' + '.join(msgs)
-                )
-                dates['azimuth_shift_deg'] = True
-        if aggregate_period_timedelta:
-            # Binning
-            if cfg['in']['is_counts']:
-                lf.warning('Raw data {}-bin averaging before the physical parameters calculation',
-                    cfg['out']['aggregate_period'])
-            # else loading from {cfg['in']['path'].stem.removesuffix('.raw')}.proc_noAvg.h5
-            if aggregate_period_timedelta > np.diff(d.divisions[0::(len(d.divisions)-1)]).item():  # ~ period > data time span
-                # convert to one row dask dataframe with index = mean index
-                df = d.mean().compute().to_frame().transpose()
-                df.index = [d.index.compute().mean()]
-                d = dd.from_pandas(df, npartitions=1)
-            else:
-                counts = (~d.iloc[:, 0].isna()).resample(aggregate_period_timedelta).count()
-                d = d.resample(
-                    aggregate_period_timedelta,
-                    # closed='right' if 'Pres' in cfg['in']['path'].stem else 'left'
-                    # 'right' for burst mode because the last value of interval used in wavegauges is round - not true?
-                    ).mean()
-                # detect number of existed values in each resampled period (using 1st column)
-                d = d.where(counts > counts[counts > 0].mean()/10).dropna(how='all')  # axis=0 is default
-                try:  # persist speedups calc_velocity greatly but may require too many memory
-                    lf.debug('Persisting data aggregated by {:s}', cfg['out']['aggregate_period'])
-                    d.persist()  # excludes missed values?
-                except MemoryError:
-                    lf.info('Persisting failed (not enough memory). Continue...')
-
-            # Recalculating aggregated polar coordinates and angles that are invalid after the direct aggregating
-            d = dekart2polar_df_uv(d)
-            if cfg['out']['split_period']:  # for csv splitting only
-                d = d.repartition(freq=cfg['out']['split_period'])
-
-        if cfg['in']['is_counts']:
-            # Apply rotation to Ag & Ah coefficients
-            if cfg1['in']['coefs']:
-                need_update = (_ := cfg1['in']['coefs'].get('g0xyz')) is not None
-                if need_rotate := (cfg1['in']['coefs'].get('Rz') is not None) or need_update:
-                    if need_update:  # get Rz from g0xyz
-                        cfg1['in']['coefs']['Rz'] = coef_zeroing_rotation(
-                            _[:, None], np.float64(cfg1['in']['coefs']['Ag']), cfg1['in']['coefs']['Cg']
-                        )
-                        dates['Rz'] = True
-                        msg_rotated = 'with new rotation to user defined zero point (g0xyz) '
-
-            if not probe_continues and cfg['out']['raw_db_path'] and not b_input_is_h5:
-                lf.info(f'Saving coefficients {msg_rotated}to {tbl}')  # save to cfg['out']['raw_db_path']
-                # to save manually when b_input_is_h5: stop above and execute below, see 'auto' file in cwd
-                h5copy_coef(
-                    None, cfg['out']['raw_db_path'], tbl,
-                    dict_matrices=coefs_format_for_h5(cfg1['in']['coefs'], pid),
-                    dates=dates
-                )
-            if not (cfg['out']['not_joined_db_path'] or cfg['out']['text_path']):
-                continue
-            elif cfg1['in']['coefs'] is None:
-                if not probe_continues:
-                    lf.warning(f'Skipping processing {tbl} because no coefficients was defined')
-                continue
-            # Apply loaded or calculated rotation
-            if need_rotate:
-                for c in ['Ag', 'Ah']:
-                    cfg1['in']['coefs'][c] = cfg1['in']['coefs']['Rz'] @ cfg1['in']['coefs'][c]
-            else:
-                lf.info('No rotation coefficient (Rz) loaded. Suppose rotations already applied')
-
-            # Velocity calculation
-            # --------------------
-            try:  # with repartition for ascii splitting (also helps to prevent MemoryError)
-                d = d.repartition(freq=split_for_memory)
-            except TypeError as e:
-                lf.error('No data? Data length = {}, skipping {}. Continue...', len(d.index), tbl)
-                continue
-            d = incl_calc_velocity(
+        # Save csv (splitted by configured period)
+        if dt_bin >= cfg["out"]["dt_bins_min_save_text"]:
+            if isinstance(d, pd.DataFrame):
+                d = dd.from_pandas(d, npartitions=1)
+            if cfg["out"]["split_period"]:
+                d = d.repartition(freq=cfg["out"]["split_period"])
+            probe_continue_file_name = dd_to_csv(
                 d,
-                cfg_proc=cfg1["in"],
-                filt_max=cfg1["filter"]["max"],
-                **cfg1["in"]["coefs"],
-                **incl_calc_kwargs,
-            )
-            d = calc_pressure(              # [c for c in cols_out_h5 if c in d.columns] if cfg['out']['text_path']
-                d, **cfg1['in']['coefs']    # no redundant cols if not need save them to txt
-            )                               # **{(pb := 'bad_p_at_bursts_starts_period'): cfg['filter'][pb]},
-
-            # Write velocity to h5 - for each probe (group) in separated table
-            if cfg['out']['not_joined_db_path']:
-                try:  # select real file (that replaces the files pattern if it was used (as default raw_db_path)):
-                    path_in = cfg1['in']['path'] if b_input_is_h5 else cfg1['out']['raw_db_path']
-                except KeyError:  # need?
-                    try:
-                        path_in = cfg1['in']['path_csv']
-                    except KeyError:
-                        path_in = cfg1['in']['path']  # should be files pattern: not real file
-                log = {
-                    'Date0': d.divisions[0],
-                    'DateEnd': d.divisions[-1],
-                    'fileName': f"{path_in.parent.name}/{path_in.stem}"[-cfg['out']['logfield_fileName_len']:],
-                    'fileChangeTime': datetime.fromtimestamp(path_in.stat().st_mtime),
-                    'rows': len(d)
-                    }
-                tables_written_not_joined |= (
-                    h5_append_to(
-                        d, tbl, cfg['out'], log,
-                        msg=f'saving {tbl} to temporary store'
+                cfg["out"]["text_path"],
+                text_date_format=(  # Shorter out time format if seconds fractional part not needed
+                    (lambda dt: dt[: -len(".%f")] if dt.endswith(".%f") and bin % 1 == 0 else dt)(
+                        cfg["out"]["text_date_format"]
                     )
-                )
-        probe_continue_file_name = dd_to_csv(
-            d, cfg['out']['text_path'], cfg['out']['text_date_format'], cfg['out']['text_columns'],
-            cfg['out']['aggregate_period'], suffix=f'@{col_out}',
-            single_file_name=probe_continue_file_name if probe_continues else not cfg['out']['split_period'],
-            progress=progress, client=client, b_continue=probe_continues
-        )
+                ),
+                text_columns=cfg["out"]["text_columns"],
+                suffix=("bin{bin}s".format(bin=bin) if bin else "") + f"@{pcid}",
+                single_file_name=(
+                    probe_continue_file_name if probe_continues else not cfg["out"]["split_period"]
+                ),
+                progress=progress,
+                client=client,
+                b_continue=probe_continues,
+            )
 
-        # Combine data columns if we aggregate (in such case all data have index of equal period)
-        if aggregate_period_timedelta:
+        # Collect binned data (of equal index period with wich we can join data)
+        if bin:
             try:
                 cols_save = [c for c in cols_out_h5 if c in d.columns]
                 sleep(cfg["program"]["sleep_s"])
                 Vne = d[cols_save].compute()  # MemoryError((1, 12400642), dtype('float64'))
-
-                if not cfg['out']['b_all_to_one_col']:
-                    Vne.rename(
-                        columns=map_to_suffixed(cols_save, col_out),
-                        inplace=True
-                    )
-                dfs_all_list.append(Vne)
-                tbls.append(tbl)
+                dfs_all_bins[dt_bin].append(
+                    Vne if cfg["out"]['b_all_to_one_col'] else
+                    Vne.rename(columns=map_to_suffixed(cols_save, pcid))
+                )
+                tbls[dt_bin].append(pcid)
             except Exception as e:
                 lf.exception('Can not cumulate result! ')
                 raise
@@ -2594,150 +2902,99 @@ def main(config: ConfigType) -> Union[None, Mapping[str, Any], pd.DataFrame]:
 
         gc.collect()  # frees many memory. Helps to not crash
 
-    # Combined data to hdf5
-    #######################
+    # Combine data to hdf5
+    ######################
+    if not any(dfs_all_bins.values()):
+        return
 
-    if aggregate_period_timedelta:
-        if dfs_all_list:
-            # Concatenate several columns by one of method:
-            # - consequently, like 1-probe data or
-            # - parallel (add columns): dfs_all without any changes
-            dfs_all = pd.concat(
-                dfs_all_list, sort=True, axis=(0 if cfg['out']['b_all_to_one_col'] or probe_continues else 1)
+    tbl_avg_ptn = "i_bin{bin}s"
+
+    def gen_cobined_avg(skip_for_meta: Callable[[Any], Any] = None):
+        """
+        Collect accumulated data ,
+        skipping to save the existed up to date text data in raw DB (in that case load it).
+        For use in `h5.append_through_temp_db_gen`
+        :param skip_for_meta: function to send meta to the caller `h5.append_through_temp_db_gen` that
+        determines wherther to reuse saved noAvg data instead of this function output to calc it
+        yields df_raw_or_None, (df_raw, metacsv_rec_tblraw) where:
+        - df_raw_or_None raw data or None if this data is not needed,
+        - df_raw: raw data,
+        - metacsv_rec_tblraw: tuple where `metacsv` is (ipid, pcid, csv) yelded by `load_from_csv_gen()`
+        Call in calc phys. cycle inside `h5.append_through_temp_db_gen` that can reuse data from noAvg DB
+        """
+
+
+        for dt_bin, dfs in dfs_all_bins.items():
+            bin = int(dt_bin.total_seconds())
+            if len(dfs) <= 1:
+                if not dfs:
+                    lf.warning('No data found for bin = {}s', bin)
+                # else all data is from one device => not need concatenate (can be already saved in DB / csv)
+                continue
+
+            # # Allow save and log each df to proc DB consequently
+            # if cfg["out"]['b_all_to_one_col']
+            #     for df, tbl in zip(dfs, tbls[dt_bin]):
+            #         yield df, tbl
+
+            if skip_for_meta is not None:
+                # Send meta to the __caller__ `table_from_meta`, `meta_to_record` to reuse saved comb. avg
+                dfs_all_log = pd.DataFrame.from_records(
+                    [df.index[[0, -1]].to_list() + [tbl] for df, tbl in zip(dfs, tbls[dt_bin])],
+                    columns=["Time", "DateEnd", "table"],
+                    index="Time",
+                    # exclude=["Time"],
+                )  #.set_index('table_name')\ #.sort_index() #\
+                tbl_cmb_avg = tbl_avg_ptn.format(bin=bin)
+                b_skip = skip_for_meta((dfs_all_log, tbl_cmb_avg))
+            else:
+                b_skip = False
+
+            # Concatenate several columns in parallel (default: add columns) or consequently to 1-probe data
+            df = pd.concat(dfs, sort=True, axis=int(not cfg["out"]['b_all_to_one_col']))
+
+            yield None if b_skip else df, dt_bin
+
+
+    if cfg["out"]["db_path"]:
+        # Update accumulated avg DB (`*.proc.h5`) through temporary DB
+        for df, (dt_bin, rec, tbl) in h5.append_through_temp_db_gen(
+            gen_cobined_avg,
+            db_path=cfg["out"]["db_path"],
+            # temp_db_path=cfg["out"]["temp_db_path"],  # need?
+            table_from_meta=lambda rec_tbl: rec_tbl[1],
+            meta_to_record=lambda rec_tbl: rec_tbl[0],
+            skip_fun=(
+                partial(h5.keep_recorded_file, keep_newer_records=False)
+                if cfg["out"]["b_incremental_update"]
+                else (lambda cur, existing: False)
+            )
+        ):
+            dfs_all_bins[dt_bin] = df
+
+    # Write concatenated dataframe to ascii (? with resample if b_all_to_one_col)
+    for dt_bin, df in dfs_all_bins.items():
+        dd_to_csv(
+            (lambda x: x.resample(rule=dt_bin).first() if cfg["out"]["b_all_to_one_col"] else x)(
+                dd.from_pandas(df, chunksize=500000)
+            ),
+            text_path=cfg["out"]["text_path"],
+            text_date_format=(  # Shorter out time format if seconds fractional part not needed
+                (lambda dt: dt[: -len(".%f")] if dt.endswith(".%f") and not dt_bin.microseconds else dt)(
+                    cfg["out"]["text_date_format"]
                 )
-            dfs_all_log = pd.DataFrame(
-                [df.index[[0, -1]].to_list() for df in dfs_all_list], columns=['Date0', 'DateEnd']
-                ).assign(table_name=tbls) #.set_index('table_name')\
-                #.sort_index() #\
-
-            for after_remove_dup_index in [False, True]:
-                try:
-                    cfg['out']['tables_written'] |= (
-                        h5_append_to(dfs_all, cfg['out']['table'], cfg['out'], log=dfs_all_log,
-                                     msg='Saving accumulated data'
-                                     )
-                        )
-                    break
-                except ValueError as e:
-                    # ValueError: cannot reindex from a duplicate axis
-                    if dfs_all.index.is_unique and dfs_all_log.index.is_unique:
-                        lf.exception('Can not understand problem. Skipping saving to hdf5!')
-                        break
-                    lf.error('Removing duplicates in index')
-                    dfs_all = dfs_all.loc[~dfs_all.index.duplicated(keep='last')]
-        else:
-            lf.warning('No data found')
-    h5_close(cfg['out'])  # close temporary output store
-    if tables_written_not_joined:
-        try:
-            failed_storages = h5move_tables(
-                {**cfg['out'], 'db_path': cfg['out']['not_joined_db_path'], 'b_del_temp_db': False},
-                tables_written_not_joined
-            )
-        except Ex_nothing_done as e:
-            lf.warning('Tables {} of separate data not moved', tables_written_not_joined)
-    if cfg['out']['tables_written']:
-        try:
-            failed_storages = h5move_tables(cfg['out'], cfg['out']['tables_written'])
-        except Ex_nothing_done as e:
-            lf.warning('Tables {} of combined data not moved', cfg['out']['tables_written'])
-
-        # Write concatenated dataframe to ascii (? with resample if b_all_to_one_col)
-        if dfs_all is not None and len(dfs_all_list) > 1:
-            call_with_valid_kwargs(
-                dd_to_csv,
-                (lambda x:
-                    x.resample(rule=aggregate_period_timedelta)
-                    .first() if cfg['out']['b_all_to_one_col'] else x
-                 )(dd.from_pandas(dfs_all, chunksize=500000)),  # .fillna(0): absent values filling with 0  ???
-                **cfg['out'],
-                suffix=f"@{','.join(tbls)}",  # t.format() for t in cfg['in']['tables']
-                progress=progress, client=client
-            )
+            ),
+            text_columns=cfg["out"]["text_columns"],
+            suffix=(
+                (lambda bin: f"bin{int(bin)}s" if bin else "")(dt_bin.total_seconds())
+                + f"@{','.join(tbl.removeprefix('i_') for tbl in tbls[dt_bin])}"
+            ),
+            progress=progress,
+            client=client,
+        )
 
     print('Ok.', end=' ')
-    return dfs_all
-
+    return dfs_all_bins
 
 if __name__ == '__main__':
     main()
-
-r"""
-    # h5index_sort(cfg['out'], out_storage_name=f"{cfg['out']['db_path'].stem}-resorted.h5", in_storages= failed_storages)
-    # dd_out = dd.multi.concat(dfs_list, axis=1)
-
-# old coefs uses:
-da.degrees(da.arctan2(
-(Gxyz[0, :] * Hxyz[1, :] - Gxyz[1, :] * Hxyz[0, :]) * (GsumMinus1 + 1),
-Hxyz[2, :] * da.square(Gxyz[:-1, :]).sum(axis=0) - Gxyz[2, :] * ((Gxyz[:-1, :] * Hxyz[:-1, :]).sum(axis=0))))
-
-else:
-    Vdir = da.zeros_like(HsumMinus1)
-    lf.warning('Bad Vdir: set all to 0 degrees')
-
-a.drop(set(a.columns).difference(columns + [col]), axis=1)
-for c, ar in zip(columns, arrays_list):
-    # print(c, end=' ')
-    if isinstance(ar, da.Array):
-        a[c] = ar.to_dask_dataframe(index=a.index)
-    else:
-        a[c] = da.from_array(ar, chunks=GsumMinus1.chunks).to_dask_dataframe(index=a.index)
-        #dd.from_array(ar, chunksize=int(np.ravel(GsumMinus1.chunksize)), columns=[c]).set_index(a.index) ...??? - not works
-
-df = dd.from_dask_array(arrays, columns=columns, index=a.index)  # a.assign(dict(zip(columns, arrays?)))    #
-if ('Pressure' in a.columns) or ('Temp' in a.columns):
-    df.assign = df.join(a[[col]])
-
-# Adding column of other (complex) type separatly
-# why not works?: V = df['Vabs'] * da.cos(da.radians(df['Vdir'])) + 1j*da.sin(da.radians(df['Vdir']))  ().to_frame() # v + j*u # below is same in more steps
-V = polar2dekart_complex(Vabs, Vdir)
-V_dd = dd.from_dask_array(V, columns=['V'], index=a.index)
-df = df.join(V_dd)
-
-df = pd.DataFrame.from_records(dict(zip(columns, [Vabs, Vdir, np.degrees(incl_rad)])), columns=columns, index=tim)  # no sach method in dask
-
-
-
-    dfs_all = pd.merge_asof(dfs_all, Vne, left_index=True, right_index=True,
-                  tolerance=pd.Timedelta(cfg['out']['aggregate_period'] or '1ms'),
-                            suffixes=('', ''), direction='nearest')
-    dfs_all = pd.concat((Vne, how='outer')  #, rsuffix=tbl[-2:] join not works on dask
-    V = df['V'].to_frame(name='V' + tbl[-2:]).compute()
-if dfs_all is computed it is in memory:
-mem = dfs_all.memory_usage().sum() / (1024 ** 2)
-if mem > 50:
-    lf.debug('{:.1g}Mb of data accumulated in memory '.format(mem))
-
-df_to_csv(df, cfg_out, add_subdir='V,P_txt')
-? h5_append_cols()
-df_all = dd.merge(indiv, cm.reset_index(), on='cmte_id')
-
-
-old cfg
-
-    cfg = {  # how to load:
-        'in': {
-            'db_path': '/mnt/D/workData/BalticSea/181116inclinometer_Schuka/181116incl.h5', #r'd:\WorkData\BalticSea\181116inclinometer_Schuka\181116incl.h5',
-            'tables': ['incl.*'],
-            'chunksize': 1000000, # 'chunksize_percent': 10,  # we'll repace this with burst size if it suit
-            'min_date': datetime.strptime('2018-11-16T15:19:00', '%Y-%m-%dT%H:%M:%S'),
-            'max_date': datetime.strptime('2018-12-14T14:35:00', '%Y-%m-%dT%H:%M:%S')
-            'split_period': '999D',  # pandas offset string (999D, H, ...) ['D' ]
-            'aggregate_period': '2H',  # pandas offset string (D, 5D, H, ...)
-            #'max_g_minus_1' used only to replace bad with NaN
-        },
-        'out': {
-            'db_path': '181116incl.proc.h5',
-            'table': 'V_incl',
-
-    },
-        'program': {
-            'log': str(scripts_path / 'log/incl_h5clc.log'),
-            'verbose': 'DEBUG'
-        }
-    }
-
-    # optional external coef source:
-    # cfg['out']['db_coef_path']           # defaut is same as 'db_path'
-    # cfg['out']['table_coef'] = 'incl10'  # defaut is same as 'table'
-"""

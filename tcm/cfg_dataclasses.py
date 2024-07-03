@@ -10,7 +10,7 @@
 import os
 import sys
 
-from dataclasses import dataclass, field, fields, is_dataclass, make_dataclass, MISSING as dataclasses_missing
+from dataclasses import dataclass, Field, field, fields, is_dataclass, make_dataclass, MISSING as dataclasses_missing
 from datetime import date as datetime_date
 
 # from collections.abc import Mapping
@@ -378,7 +378,7 @@ def get_generic_and_actual_type(type_hint):
     return generic_type, type_hint
 
 
-def convert_value(value, field_type, default_value=None):
+def to_omegaconf_compatible_type(value, field_type, default_value=None):
     """
     Convert value to OmegaConf compatible type and handle optional nested structured configs.
     This function can handle the following types:
@@ -388,7 +388,7 @@ def convert_value(value, field_type, default_value=None):
     - Collections including list, tuple, and dict (recursively converts their elements)
     - Common types such as int, float, str, and bool
     - Numpy arrays and numpy scalar types (converted to Python lists / scalars reducing dimension if need)
-    - Date, datetime, and timedelta (converted to ISO format strings)
+    - Date, datetime, and timedelta: converted to ISO format strings or timedelta to int seconds
     If the value can't be converted to the specified field type, raises a TypeError.
     If the converted value is equal to the default value, returns None.
     :param value: The value to be converted.
@@ -410,7 +410,7 @@ def convert_value(value, field_type, default_value=None):
                 _, value_type = field_type
                 for k, v in value.items():
                     # k = convert_value(k, key_type, schema)
-                    v = convert_value(
+                    v = to_omegaconf_compatible_type(
                         v, value_type, default_value.get(k) if
                         default_value not in (dataclasses_missing, None) else None
                         )  # For dict, convert each value.
@@ -422,19 +422,18 @@ def convert_value(value, field_type, default_value=None):
             else:  # for list, tuple types we use its base type  # convert each element.
                 if hasattr(value, 'dtype'):
                     value = value.tolist()
-                return [convert_value(item, field_type[0]) for item in value]
+                return [to_omegaconf_compatible_type(item, field_type[0]) for item in value]
 
     # If the field type is a dataclass, we recurse
     if is_dataclass(field_type):
-        return omegaconf_merge_compatible(value, field_type)
+        return to_omegaconf_merge_compatible(value, field_type)
 
     # squeeze array element of bigger dimensions to schema
     if field_type in (int, float, str, bool):
         if isinstance(value, list) and len(value) == 1:
             value = value[0]
-        elif isinstance(value, timedelta):  # allow timedelta to be converted to int seconds
+        elif isinstance(value, timedelta):
             return int(value.total_seconds())
-
 
     if hasattr(value, "dtype"):
         value = value.item()
@@ -454,7 +453,17 @@ def convert_value(value, field_type, default_value=None):
     return str(value)
 
 
-def omegaconf_merge_compatible(unstructured: Dict[str, Any], schema) -> Dict[str, Any]:
+def get_field_default(fld: Field):
+    return (
+        fld.default
+        if fld.default is not dataclasses_missing
+        else None
+        if fld.default_factory is dataclasses_missing
+        else fld.default_factory()
+    )
+
+
+def to_omegaconf_merge_compatible(unstructured: Dict[str, Any], schema) -> Dict[str, Any]:
     """
     Converts an unstructured dictionary to one that is compatible with OmegaConf creation and merging.
     Excludes None fields (keeps None elements in lists) and fields equal to default values in schema
@@ -463,26 +472,21 @@ def omegaconf_merge_compatible(unstructured: Dict[str, Any], schema) -> Dict[str
     :param schema: The dataclass schema to conform to.
     :return: A dictionary compatible with OmegaConf.
     Usage:
-    conf = omegaconf_merge_compatible(my_not_structured_dict, MyDataClassSchema)
+    conf = to_omegaconf_merge_compatible(my_not_structured_dict, MyDataClassSchema)
     conf_full = OmegaConf.merge(OmegaConf.create(conf), existing_conf)
     """
     if not is_dataclass(schema):
         raise TypeError("Provided schema is not a dataclass.")
-    schema_fields = {
-        fld.name: (
-            fld.type,
-            fld.default if fld.default is not dataclasses_missing else
-            None if fld.default_factory is dataclasses_missing else
-            fld.default_factory()
-        )
-        for fld in fields(schema)
-    }
+    schema_fields = {fld.name: (fld.type, get_field_default(fld)) for fld in fields(schema)}
     converted = {}
     for key, value in unstructured.items():
-        if key in schema_fields and value is not None:
-            converted_value = convert_value(value, *schema_fields[key])
-            if converted_value != schema_fields[key][1]:
-                converted[key] = converted_value
+        if key in schema_fields:
+            if value is not None:
+                converted_value = to_omegaconf_compatible_type(value, *schema_fields[key])
+                if converted_value != schema_fields[key][1]:
+                    converted[key] = converted_value
+        else:
+            lf.warning('Field "{}" is not in config: removed', key)
     return converted
 
 

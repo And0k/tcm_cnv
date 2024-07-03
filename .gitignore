@@ -167,6 +167,8 @@ scripts/text_output/
 # My tests data
 tests/data/
 
+.pnotes/notes.md
+
 # vscode
 .vscode/
 

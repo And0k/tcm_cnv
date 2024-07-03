@@ -2312,7 +2312,7 @@ def append_on_inconsistent_index(cfg_out, tbl_parent, df, df_append_fun, e, msg_
         df = df.reindex(df_ref.columns, axis="columns", copy=False)
         for col, typ in df_ref[columns].dtypes.items():
             fill_value = np.array(
-                0 if np.issubdtype(typ, np.integer) else np.NaN if np.issubdtype(typ, np.floating) else "",
+                0 if np.issubdtype(typ, np.integer) else np.nan if np.issubdtype(typ, np.floating) else "",
                 dtype=typ,
             )
             df[col] = fill_value
@@ -2552,7 +2552,7 @@ def append_dummy_row(
     for name, field in df.dtypes.items():
         typ = field.type
         dict_dummy[name] = (
-            typ(0) if np.issubdtype(typ, np.integer) else np.NaN if np.issubdtype(typ, np.floating) else ""
+            typ(0) if np.issubdtype(typ, np.integer) else np.nan if np.issubdtype(typ, np.floating) else ""
         )
         if same_types:
             if typ != tip0:
@@ -2577,13 +2577,13 @@ def append_dummy_row(
         return pd.concat([df, df_dummy])  # df.append(df_dummy)
 
     # np.array([np.int32(0) if np.issubdtype(field.type, int) else
-    #           np.NaN if np.issubdtype(field.type, float) else
+    #           np.nan if np.issubdtype(field.type, float) else
     #           [] for field in df.dtypes.values]).view(
     #     dtype=np.dtype({'names': df.columns.values, 'formats': df.dtypes.values})))
 
     # insert separator # 0 (can not use np.nan in int) [tim[-1].to_pydatetime() + pd.Timedelta(seconds = 0.5/cfg['in']['fs'])]
     #   df_dummy= pd.DataFrame(0, columns=cfg_out['names'], index= (pd.NaT,))
-    #   df_dummy= pd.DataFrame(np.full(1, np.NaN, dtype= df.dtype), index= (pd.NaT,))
+    #   df_dummy= pd.DataFrame(np.full(1, np.nan, dtype= df.dtype), index= (pd.NaT,))
     # used for insert separator lines
 
 

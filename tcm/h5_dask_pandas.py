@@ -444,11 +444,11 @@ def filter_local_arr(d: Mapping[str, Sequence],
             if ('*' in key) or ('[' in key):  # get multiple keys by regex
                 # Filter multiple columns at once
                 keys = [c for c in d.columns if re.fullmatch(key, c)]
-                d[keys][f_compare(d[keys], v)] = np.NaN
+                d[keys][f_compare(d[keys], v)] = np.nan
                 key = ', '.join(keys)  # for logging only
             else:
                 try:
-                    d[key][f_compare(d[key], v)] = np.NaN
+                    d[key][f_compare(d[key], v)] = np.nan
                 except KeyError as e:  # allow redundant parameters in config
                     lf.warning('Can not filter this parameer {:s}', standard_error_info(e))
             lf.debug('filtering {:s}({:s}) = {:g}', limit, key, v)

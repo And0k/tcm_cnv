@@ -708,7 +708,7 @@ def convertNumpyArrayOfStrings(date: Union[np.ndarray, pd.Series],
                 date.ffill(inplace=True)
                 # 'nearest' interpoating datime is not works, so
                 # s2 = date.astype('i8').astype('f8')
-                # s2[t_is_bad] = np.NaN
+                # s2[t_is_bad] = np.nan
                 # s2.interpolate(method='nearest', inplace=True)
                 # date[t_is_bad] = pd.to_datetime(s2[t_is_bad])
             return date
@@ -1101,7 +1101,7 @@ def time_corr(
     # make initial shape: paste NaNs back
     if n_bad_in and cfg_in.get('b_keep_not_a_time'):
         # place initially bad elements back
-        t, t_in = (np.NaN + np.empty_like(b_ok_in)), t
+        t, t_in = (np.nan + np.empty_like(b_ok_in)), t
         t[b_ok_in] = t_in
         b_ok_in[b_ok_in] = b_ok
         b_ok = b_ok_in

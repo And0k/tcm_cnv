@@ -112,7 +112,7 @@ def plot_prepare_input(ax,
     Next arguments not used if callback is None.
     :param mask: mask to fill by False in selected range
     :param x: array with same length as mask. If not sorted then last must be > 1st to detect it
-    :param ys: sequence of arrays with same length as mask to fill by np.NaN in selected range
+    :param ys: sequence of arrays with same length as mask to fill by np.nan in selected range
     :param lines: list of plot.line of length len(data - 1): data[0] is x data and next are
          y1, y2... data of same length as x data
     :return:
@@ -202,7 +202,7 @@ def plot_prepare_input(ax,
                 mask[sl] = False  # np.diff(plt_select.x_range_arr) > 0
             for i in range(-1, -len(ys) - 1, -1):  # from the end
                 data = ys[i].copy()  # lines[i].get_ydata()
-                data[~mask] = np.NaN
+                data[~mask] = np.nan
                 # if i > 0: print(np.sum(np.isnan(lines[i]._y)))
                 lines[i].set_ydata(data)
             ax.figure.canvas.draw()
@@ -309,7 +309,7 @@ def make_figure(x: Optional[Sequence] = None,
             # add last line with already applied mask
             mask_data = (plot_kwrgs := dict(mask_kwrgs)).pop('data')  # removes 'data' from copy of mask_kwrgs to use as plot kwrgs
             _ = y_data.copy()
-            _[~mask_data] = np.NaN
+            _[~mask_data] = np.nan
             lines += ax.plot(x, _, **{'color': 'r', 'label': 'masked initial', **plot_kwrgs})
 
         ax.legend(prop={'size': 10}, loc='upper right')

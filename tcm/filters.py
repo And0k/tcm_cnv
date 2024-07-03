@@ -51,14 +51,14 @@ def rep2mean(y, bOk=None, x=None):
             b = np.logical_and(b, bOk)
         if b.sum() == 0:
             print('rep2mean can not replace NaNs')
-            return y + np.NaN  # (np.NaN if bOk is None else
+            return y + np.nan  # (np.nan if bOk is None else
         else:  # may be 1 good point? - return constant
             print('rep2mean: strange condition on Exception!')
-            return np.where(bOk if bOk is not None else b, y[b], np.NaN)
+            return np.where(bOk if bOk is not None else b, y[b], np.nan)
     # def rep2mean(x, bOk):
-    # old= lambda x, bOk: np.interp(np.arange(len(x)), np.flatnonzero(bOk), x[bOk], np.NaN,np.NaN)
+    # old= lambda x, bOk: np.interp(np.arange(len(x)), np.flatnonzero(bOk), x[bOk], np.nan,np.nan)
 
-#    x[~bOk]= np.interp(np.arange(len(x)), np.flatnonzero(bOk), x[bOk], np.NaN,np.NaN)
+#    x[~bOk]= np.interp(np.arange(len(x)), np.flatnonzero(bOk), x[bOk], np.nan,np.nan)
 
 @njit
 def b1spike(a, max_spike=0):
@@ -923,7 +923,7 @@ def find_sampling_frequency(tim: np.ndarray,
     if tim.size < 2:
         with objmode():
             l.warning('can not find freq')
-        return np.NaN, n_same, n_dec, np.zeros(1, np.int64)  # zeros() is for numba only
+        return np.nan, n_same, n_dec, np.zeros(1, np.int64)  # zeros() is for numba only
 
     dt = np.ediff1d(tim.view(np.int64), to_end=1)
     # all increased positions
@@ -958,7 +958,7 @@ def find_sampling_frequency(tim: np.ndarray,
     if n_inc < 2:
         with objmode():
             l.warning("Can't find freq if Time have less than 2 increased values!")
-        return np.NaN, n_same, n_dec, np.zeros(1, np.int64)
+        return np.nan, n_same, n_dec, np.zeros(1, np.int64)
 
     n_nondec = dt.size - n_inc
     if n_nondec > 0:
@@ -995,7 +995,7 @@ def find_sampling_frequency(tim: np.ndarray,
     n_decrease = 0
     n_same_r = 0
     if Time.size < 2:
-        freq = np.NaN
+        freq = np.nan
         b_ok = np.ones(1, dtype=np.bool_)
     else:
         dt = np.pad(np.diff(Time), (0, 1), 'mean')

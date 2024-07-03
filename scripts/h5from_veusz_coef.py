@@ -206,7 +206,7 @@ def main(new_arg=None, veusze=None):
                 coef_matices_for_h5.update({
                     f'//coef//Vabs{i}': coef_list,
                     f'//coef//date': np.float64(
-                        [np.NaN, np.datetime64(datetime.now()).astype(np.int64)])
+                        [np.nan, np.datetime64(datetime.now()).astype(np.int64)])
                 })
                 # h5savecoef(cfg['out']['path'], path=f'//{table}//coef//Vabs{i}', coef=coef_list)
                 txt_results[names_get_txt_results[i]][table] = str(coef)

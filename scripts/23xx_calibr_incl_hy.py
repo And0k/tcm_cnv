@@ -92,7 +92,7 @@ if st(10, 'Magnetometer and accelerometer calibration of devices listed in cfg_p
 if st.end >= 15:
     # 1. tank data
     db_path_tank = path_db_raw
-    
+
     path_on_drive_d(  # or other path to load calibration data (add newer on top of first and comment old item)
         # r'd:\WorkData\_experiment\inclinometer\231010_stand,tank@i52-56\_raw\231011tank.raw.h5'
         # r'd:\WorkData\_experiment\inclinometer\230614_tank@i3,4,15,19,28,33,37,38;В27-30\230614tank.raw.h5'
