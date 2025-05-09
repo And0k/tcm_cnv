@@ -7,43 +7,40 @@
 """
 Save/modify coef in hdf5 data in "/coef" table of PyTables (pandas hdf5) store
 """
+
 from datetime import datetime
 import re
 from typing import Iterable, Mapping, Union, Tuple
-from pathlib import Path
+from pathlib import Path, PurePath
 import h5py
 import numpy as np
+from contextlib import nullcontext
+
 # my
-from .utils2init import FakeContextIfOpen, standard_error_info, my_logging
+from .utils2init import standard_error_info, my_logging  # FakeContextIfOpen,
 
 lf = my_logging(__name__)
 
 
 def rot_matrix_x(c, s) -> np.ndarray:
-    """ Rotation matrix to rotate 3D vector around x axis
+    """Rotation matrix to rotate 3D vector around x axis
     :param c, s: - cos() and sin() of rotation angle
     """
-    return np.array([[1, 0, 0],
-                     [0, c, -s],
-                     [0, s, c]], np.float64)
+    return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], np.float64)
 
 
 def rot_matrix_y(c, s) -> np.ndarray:
-    """ Rotation matrix to rotate 3D vector around y axis
+    """Rotation matrix to rotate 3D vector around y axis
     :param c, s: - cos() and sin() of rotation angle
     """
-    return np.array([[c, 0, s],
-                     [0, 1, 0],
-                     [-s, 0, c]], np.float64)
+    return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], np.float64)
 
 
 def rot_matrix_z(c, s) -> np.ndarray:
-    """ Rotation matrix to rotate 3D vector around z axis
+    """Rotation matrix to rotate 3D vector around z axis
     :param c, s: - cos() and sin() of rotation angle
     """
-    return np.array([[c, -s, 0],
-                     [s, c, 0],
-                     [0, 0, 1]], np.float64)
+    return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], np.float64)
 
 
 def rotate_x(a2d, angle_degrees=None, angle_rad=None):
@@ -98,9 +95,9 @@ def h5savecoef(h5file_dest, path, coef):
     h5_savecoef(h5file_dest, path='//incl01//coef//Vabs', coef)
     """
     if np.any(~np.isfinite(coef)):
-        lf.error('NaNs in coef detected! Aborting')
+        lf.error("NaNs in coef detected! Aborting")
     else:
-        with h5py.File(h5file_dest, 'a') as h5dest:
+        with h5py.File(h5file_dest, "a") as h5dest:
             # or if you want to replace the dataset with some other dataset of different shape:
             # del f1['meas/frame1/data']
             try:
@@ -108,21 +105,26 @@ def h5savecoef(h5file_dest, path, coef):
                 return
             except (OSError, RuntimeError) as e:
                 try:
-                    print(f'updating {h5file_dest}/{path}')  # .keys()
+                    print(f"updating {h5file_dest}/{path}")  # .keys()
                     h5dest[path][...] = coef
                     h5dest.flush()
                     return
                 except Exception as e:
                     pass  # prints error message?
-                lf.exception('Can not save/update coef to hdf5 %s. There are error ', h5file_dest)
+                lf.exception("Can not save/update coef to hdf5 %s. There are error ", h5file_dest)
 
 
 # @+node:korzh.20180525125303.1: ** h5copy_coef
-def h5copy_coef(h5file_source=None, h5file_dest=None, tbl=None, tbl_source=None, tbl_dest=None,
-                dict_matrices: Union[Mapping[str, np.ndarray], Iterable[str], None] = None,
-                dates=None,
-                ok_to_replace_group=False
-                ):
+def h5copy_coef(
+    h5file_source=None,
+    h5file_dest=None,
+    tbl=None,
+    tbl_source=None,
+    tbl_dest=None,
+    dict_matrices: Union[Mapping[str, np.ndarray], Iterable[str], None] = None,
+    dates=None,
+    ok_to_replace_group=False,
+):
     """
     Copy tbl from h5file_source to h5file_dest overwriting tbl + '/coef/H/A and '/coef/H/C' with H and C if
     provided. Skip to write `dict_matrices` elements that are None, but check that they are not exist else
@@ -131,23 +133,24 @@ def h5copy_coef(h5file_source=None, h5file_dest=None, tbl=None, tbl_source=None,
     :param h5file_dest: name of hdf5 file to paste structure
     :param dict_matrices: dict of numpy arrays - to write or list of paths to coefs (to matrices) under tbl -
     to copy them. See `dict_matrices_for_h5()` to create standard paths from dict with fields Ag, Cg, ...
-    :param dates: date attributes for dict_matrices keys that will be written to HDF5
+    :param dates: date attributes for dict_matrices keys that will be written to HDF5, if True then add current dates to all keys
     :param tbl:
     :param tbl_source:
     :param tbl_dest:
     :param ok_to_replace_group:
 
     # Example save H and C: 3x3 and 1x3, rotation and shift matrices
-    >>> h5copy_coef(h5file_source,h5file_dest,tbl)
-            dict_matrices={'//coef//H//A': H,
-                           '//coef//H//C': C})
+    >>> h5copy_coef(
+            h5file_source, h5file_dest, tbl)
+            dict_matrices={'//coef//H//A': H, '//coef//H//C': C}
+            )
     """
 
     if h5file_dest is None:
         h5file_dest = h5file_source
     if h5file_source is None:
         if h5file_dest is None:
-            print('skipping: output not specified')
+            print("skipping: output not specified")
             return
         h5file_source = h5file_dest
 
@@ -194,23 +197,28 @@ def h5copy_coef(h5file_source=None, h5file_dest=None, tbl=None, tbl_source=None,
         """
         nonlocal dict_matrices
         table_written = None
-        with FakeContextIfOpen(lambda f: h5py.File(f, 'a'), h5file_dest) as h5dest:
+        with (
+            h5py.File(h5file_dest, "a")
+            if isinstance(h5file_dest, (str, PurePath))
+            else nullcontext(h5file_dest)
+        ) as h5dest:
+            # with FakeContextIfOpen(lambda f: h5py.File(f, "a"), h5file_dest) as h5dest:
             try:  # we may generate FileExistsError error that to catch (not real error if use dict_matrices)
                 if h5source is None:
                     if tbl_dest != tbl_source:
                         h5source = h5dest
                     else:
-                        raise FileExistsError(f'Can not copy to itself {h5dest.filename}//{tbl_dest}')
+                        raise FileExistsError(f"Can not copy to itself {h5dest.filename}//{tbl_dest}")
                 elif path_h5(h5dest) == path_h5(h5source) and tbl_dest == tbl_source:
-                    raise FileExistsError(f'Can not copy to itself {h5dest.filename}//{tbl_dest}')
+                    raise FileExistsError(f"Can not copy to itself {h5dest.filename}//{tbl_dest}")
 
                 # Copy using provided paths:
                 if h5source:
                     coef_path_src = f"//{tbl_source}//coef"
                     lf.info(
                         f'copying "coef" from {path_h5(h5source)}//{tbl_source} '
-                        f'to {h5dest.filename}//{tbl_dest}'
-                        )
+                        f"to {h5dest.filename}//{tbl_dest}"
+                    )
                     # Reuse previous calibration structure:
                     # import pdb; pdb.set_trace()
                     # h5source.copy('//' + tbl_source + '//coef', h5dest[tbl_dest + '//coef'])
@@ -234,48 +242,51 @@ def h5copy_coef(h5file_source=None, h5file_dest=None, tbl=None, tbl_source=None,
 
             if dict_matrices:  # not is None:
                 have_values = isinstance(dict_matrices, dict)
-                lf.info(f'updating {h5file_dest}/{tbl_dest}/{{}}', str(dict_matrices))  # .keys()
+                lf.info(f"updating {h5file_dest}/{tbl_dest}/{{}}", str(dict_matrices))  # .keys()
                 if have_values:
                     # Save provided values
                     date_now_str = datetime.now().replace(microsecond=0).isoformat()
                     for rel_path in dict_matrices.keys():
-                        path = f'{tbl_dest}{rel_path}'
+                        path = f"{tbl_dest}{rel_path}"
                         data = dict_matrices[rel_path]
                         if data is None:
                             continue
                         if isinstance(dict_matrices[rel_path], (int, float)) and not (
-                            isinstance(dict_matrices[rel_path], bool) and rel_path.endswith('date')):
+                            isinstance(dict_matrices[rel_path], bool) and rel_path.endswith("date")
+                        ):
                             data = np.atleast_1d(data)  # to can load in Veusz (can't load 0d single values)
                         try:
                             if isinstance(data, (str, bool)):
-                                if rel_path.endswith('date'):
+                                if rel_path.endswith("date"):
                                     if isinstance(data, bool):
                                         data = date_now_str
                                         dict_matrices[rel_path] = data
-                                    dtype = 'S19'
+                                    dtype = "S19"
                                 else:
-                                    dtype = 'S10'  # 'pid' is only currently possible rel_path str
+                                    dtype = "S10"  # 'pid' is only currently possible rel_path str
                                 try:
                                     dset = h5dest.create_dataset(path, data=data, dtype=dtype)
                                 except ValueError as e:
                                     lf.info(
                                         'Can not create {} to write text "{}". Already exist? => Writing...',
-                                        path, data
+                                        path,
+                                        data,
                                     )
                                     h5dest[path][...] = data
                             else:
                                 dtype = np.float64
                                 b_isnan = np.isnan(data)
                                 if np.any(b_isnan):
-                                    lf.warning('not writing NaNs: {}{}...', rel_path, np.flatnonzero(b_isnan))
+                                    lf.warning("not writing NaNs: {}{}...", rel_path, np.flatnonzero(b_isnan))
                                     h5dest[path][~b_isnan] = data[~b_isnan]
                                 else:
                                     h5dest[path][...] = data
                                 dset = h5dest[path]
                         except TypeError as e:
                             lf.error(
-                                'Replacing dataset "{}" TypeError: {} -> recreating...', path,
-                                '\n==> '.join([a for a in e.args if isinstance(a, str)])
+                                'Replacing dataset "{}" TypeError: {} -> recreating...',
+                                path,
+                                "\n==> ".join([a for a in e.args if isinstance(a, str)]),
                             )
                             try:
                                 # to replace the dataset with some other dataset of different shape
@@ -287,16 +298,20 @@ def h5copy_coef(h5file_source=None, h5file_dest=None, tbl=None, tbl_source=None,
                             lf.debug('Creating "{}"', path)
                             dset = h5dest.create_dataset(path, data=data, dtype=dtype)
                         if dates:
-                            date = isinstance(dates, bool) or dates.get(rel_path) or dates.get(
-                                rel_path.rsplit('//', 1)[-1])
+                            date = (
+                                isinstance(dates, bool)
+                                or dates.get(rel_path)
+                                or dates.get(rel_path.rsplit("//", 1)[-1])
+                            )
                             if date:
                                 if isinstance(date, str):
                                     date = str(date)  # required if date is numpy.str_
                                 try:
                                     dset.attrs.modify(
-                                        'timestamp', date if isinstance(date, str) else date_now_str)
+                                        "timestamp", date if isinstance(date, str) else date_now_str
+                                    )
                                 except Exception as e:
-                                    dset.attrs['timestamp'] = date if isinstance(date, str) else date_now_str
+                                    dset.attrs["timestamp"] = date if isinstance(date, str) else date_now_str
                 else:
                     paths = list(dict_matrices)
                     dict_matrices = {}
@@ -306,8 +321,10 @@ def h5copy_coef(h5file_source=None, h5file_dest=None, tbl=None, tbl_source=None,
                             dict_matrices[path] = h5source[path][...]
                         except AttributeError as e:  # 'ellipsis' object has no attribute 'encode'
                             lf.error(
-                                'Skip update coef: dict_matrices must be None or its items must point to '
-                                'matrices {}', '\n==> '.join(a for a in e.args if isinstance(a, str)))
+                                "Skip update coef: dict_matrices must be None or its items must point to "
+                                "matrices {}",
+                                "\n==> ".join(a for a in e.args if isinstance(a, str)),
+                            )
                             continue
                         h5dest[path][...] = dict_matrices[path]
                 h5dest.flush()
@@ -327,15 +344,17 @@ def h5copy_coef(h5file_source=None, h5file_dest=None, tbl=None, tbl_source=None,
             del h5dest[path]
             h5source.copy(path, h5dest[tbl_dest])
         else:
-            lf.error('Skip copy coef{}!', f': {standard_error_info(e)}' if e else '')
+            lf.error("Skip copy coef{}!", f": {standard_error_info(e)}" if e else "")
 
     # try:
-    with FakeContextIfOpen(
-            (lambda f: h5py.File(f, 'r')) if h5file_source != h5file_dest else None, h5file_source
+    with (
+        h5py.File(h5file_source, "r") if h5file_source != h5file_dest else nullcontext(h5file_source)
     ) as h5source:
+        # with FakeContextIfOpen(
+        #     (lambda f: h5py.File(f, "r")) if h5file_source != h5file_dest else None, h5file_source
+        # ) as h5source:
         _ = save_operation(h5source)
         tables_written = [_] if _ else []
-
 
     # if h5file_source != h5file_dest:
     #     with h5py.File(h5file_source, 'r') as h5source:
@@ -348,7 +367,11 @@ def h5copy_coef(h5file_source=None, h5file_dest=None, tbl=None, tbl_source=None,
     # Confirm the changes were properly made and saved:
     b_ok = True
     if dict_matrices:
-        with FakeContextIfOpen(lambda f: h5py.File(f, 'r'), h5file_dest) as h5dest:
+        with (
+            h5py.File(h5file_dest, "r") if isinstance(h5file_dest, (str, PurePath))
+            else nullcontext(h5file_dest)
+        ) as h5dest:
+            # with FakeContextIfOpen(lambda f: h5py.File(f, "r"), h5file_dest) as h5dest:
             for rel_path, v in dict_matrices.items():
                 if isinstance(v, str):
                     if h5dest[tbl_dest + rel_path][...].item().decode() != v[:19]:
@@ -357,13 +380,14 @@ def h5copy_coef(h5file_source=None, h5file_dest=None, tbl=None, tbl_source=None,
                 elif v is None:
                     assert (tbl_dest + rel_path) not in h5dest
                 elif not np.allclose(h5dest[tbl_dest + rel_path][...], v, equal_nan=True):
-                    lf.error('h5copy_coef(): coef. {}{} not updated!', tbl_dest, rel_path)
+                    lf.error("h5copy_coef(): coef. {}{} not updated!", tbl_dest, rel_path)
                     b_ok = False
         if b_ok:
-            print('h5copy_coef() updated coefficients Ok>')
+            print("h5copy_coef() updated coefficients Ok>")
         else:
             tables_written = []
     return tables_written
+
 
 def h5_rotate_coef(h5file_source, h5file_dest, tbl):
     """
@@ -375,12 +399,12 @@ def h5_rotate_coef(h5file_source, h5file_dest, tbl):
     with h5py.File(h5file_source) as h5source:
         with h5py.File(h5file_dest, "a") as h5dest:
             # Reuse previous calibration structure:
-            in2d = h5source[tbl + '//coef//G//A'][...]
+            in2d = h5source[tbl + "//coef//G//A"][...]
             out2d = rotate_x(in2d, 180)
-            h5dest[tbl + '//coef//G//A'][:, :] = out2d
+            h5dest[tbl + "//coef//G//A"][:, :] = out2d
             h5dest.flush()
 
-    print('h5copy_coef(): coefficients updated.')
+    print("h5copy_coef(): coefficients updated.")
 
 
 def channel_cols(channel: str) -> Tuple[str, str]:
@@ -389,26 +413,23 @@ def channel_cols(channel: str) -> Tuple[str, str]:
     :param channel: magnetometer (M) or accelerometer (A)
     :return: (col, coef) = ('M', 'H') or ('A', 'G') letters denoting channel
     """
-    str_col__coef = (
-        ('M', 'H') if channel in ('magnetometer', 'M') else
-        ('A', 'G')
-        )
+    str_col__coef = ("M", "H") if channel in ("magnetometer", "M") else ("A", "G")
     return str_col__coef
 
 
-def dict_matrices_for_h5(coefs=None, tbl=None, channels=None, msg='Saving coefficients'):
+def dict_matrices_for_h5(coefs=None, tbl=None, channels=None, msg="Saving coefficients"):
     """
     Create coefficients dict with fields of fixed size (fill with dummy values if no corresponded coefs):
     - A: for accelerometer:
-      - A: A 3x3 scale and rotation matrix
-      - C: U_G0 accelerometer 3x1 channels shifts
+        - A: A 3x3 scale and rotation matrix
+        - C: U_G0 accelerometer 3x1 channels shifts
     - M: for magnetometer:
-      - A: M 3x3 scale and rotation matrix
-      - C: U_B0 3x1 channels shifts
-      - azimuth_shift_deg: Psi0 magnetometer direction shift to the North, radians
+        - A: M 3x3 scale and rotation matrix
+        - C: U_B0 3x1 channels shifts
+        - azimuth_shift_deg: Psi0 magnetometer direction shift to the North, radians
     - Vabs0: for calculation of velocity magnitude from inclination - 6 element vector:
-      - 5 coefs of trigonometric approx fun
-      - its linear extrapolation start, degrees
+        - 5 coefs of trigonometric approx fun
+        - its linear extrapolation start, degrees
 
     :param coefs: fields from: {
     'M': {'A', 'b', 'azimuth_shift_deg'},
@@ -420,7 +441,7 @@ def dict_matrices_for_h5(coefs=None, tbl=None, channels=None, msg='Saving coeffi
     :return: dict_matrices
     """
     if channels is None:
-        channels = ['M', 'A']
+        channels = ["M", "A"]
 
     # Fill coefs where not specified
     dummies = []
@@ -433,24 +454,25 @@ def dict_matrices_for_h5(coefs=None, tbl=None, channels=None, msg='Saving coeffi
     for channel in channels:
         if not coefs.get(channel):
             coefs[channel] = (
-                {'A': np.identity(3) * 0.00173, 'b': np.zeros((3, 1))} if channel == 'M' else
-                              {'A': np.identity(3) * 6.103E-5, 'b': np.zeros((3, 1))}
-                              )
+                {"A": np.identity(3) * 0.00173, "b": np.zeros((3, 1))}
+                if channel == "M"
+                else {"A": np.identity(3) * 6.103e-5, "b": np.zeros((3, 1))}
+            )
             if b_have_coefs:
                 dummies.append(channel)
-        if channel == 'M':
-            if not coefs['M'].get('azimuth_shift_deg'):
-                coefs['M']['azimuth_shift_deg'] = 180
-                if b_have_coefs and not 'M' in dummies:
-                    dummies.append('azimuth_shift_deg')  # only 'azimuth_shift_deg' for M channel is dummy
+        if channel == "M":
+            if not coefs["M"].get("azimuth_shift_deg"):
+                coefs["M"]["azimuth_shift_deg"] = 180
+                if b_have_coefs and not "M" in dummies:
+                    dummies.append("azimuth_shift_deg")  # only 'azimuth_shift_deg' for M channel is dummy
 
-    if coefs.get('Vabs0') is None:
-        coefs['Vabs0'] = np.float64([10, -10, -10, -3, 3, 70])
+    if coefs.get("Vabs0") is None:
+        coefs["Vabs0"] = np.float64([10, -10, -10, -3, 3, 70])
         if b_have_coefs:
-            dummies.append('Vabs0')
+            dummies.append("Vabs0")
 
     if dummies or not b_have_coefs:
-        lf.warning('{:s} {:s} - dummy!', msg, ','.join(dummies) if b_have_coefs else 'all')
+        lf.warning("{:s} {:s} - dummy!", msg, ",".join(dummies) if b_have_coefs else "all")
     else:
         lf.info(msg)
 
@@ -458,21 +480,23 @@ def dict_matrices_for_h5(coefs=None, tbl=None, channels=None, msg='Saving coeffi
     dict_matrices = {}
     if tbl:
         # Coping probe number to coefficient to can manually check when copy manually
-        i_search = re.search('\d*$', tbl)
+        i_search = re.search("\d*$", tbl)
         if i_search:
             try:
-                dict_matrices['//coef//i'] = int(i_search.group(0))
+                dict_matrices["//coef//i"] = int(i_search.group(0))
             except Exception as e:
                 pass
-        dict_matrices['//coef//Vabs0'] = coefs['Vabs0']
+        dict_matrices["//coef//Vabs0"] = coefs["Vabs0"]
 
     for channel in channels:
         (col_str, coef_str) = channel_cols(channel)
         dict_matrices.update(
-            {f'//coef//{coef_str}//A': coefs[channel]['A'],
-             f'//coef//{coef_str}//C': coefs[channel]['b'],
-             })
-        if channel == 'M':
-            dict_matrices[f'//coef//{coef_str}//azimuth_shift_deg'] = coefs['M']['azimuth_shift_deg']
+            {
+                f"//coef//{coef_str}//A": coefs[channel]["A"],
+                f"//coef//{coef_str}//C": coefs[channel]["b"],
+            }
+        )
+        if channel == "M":
+            dict_matrices[f"//coef//{coef_str}//azimuth_shift_deg"] = coefs["M"]["azimuth_shift_deg"]
 
     return dict_matrices

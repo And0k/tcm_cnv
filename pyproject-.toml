@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "absioras-tcm"
+version = "0.1.0"
+description = "console program to convert raw data files meaured by AB SIO RAS tilt current meters to csv o hdf5 data files with physical units optionally with filtering/averaging"
+authors = ["Andrey Korzh <ao.korzh@gmail.com>"]
+license = "MIT"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.11"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+line-length = 110

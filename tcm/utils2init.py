@@ -25,7 +25,7 @@ from pathlib import Path, PurePath
 from typing import Any, Callable, Dict, Mapping, MutableMapping, Optional, Iterable, Iterator, BinaryIO, Sequence, TextIO, TypeVar, Tuple, Union
 from inspect import currentframe
 import io
-from functools import wraps  # reduce
+from functools import wraps
 from dataclasses import dataclass
 
 if sys.platform == "win32":
@@ -361,7 +361,9 @@ def cfgfile2dict(arg_source: Union[Mapping[str, Any], str, PurePath, None] = Non
                     on it unless this parser is used
                 """
                 try:
-                    from ruamel.yaml import safe_load as yaml_safe_load
+                    from ruamel.yaml import YAML
+                    yaml = YAML(typ="safe", pure=True)
+                    yaml_safe_load = yaml.load
                 except ImportError:
                     try:
                         from yaml import safe_load as yaml_safe_load
@@ -402,13 +404,11 @@ def type_fix(name: str, opt: Any) -> Tuple[str, Any]:
     :param name: option's name. If special prefix/suffix provided then opt's type will be converted accordingly
     :param opt: option's value, usually str that need to convert to the type specified by oname's prefix/suffix.
     For different oname's prefix/suffixes use this formatting rules:
-    - 'dict': do not use curles, field separator: ',' if no '\n' in it else '\n,', key-value separator: ': ' (or ':' if no ': ')
+    - 'dict': do not use curls, field separator: ',' if no '\n' in it else '\n,', key-value separator: ': ' (or ':' if no ': ')
     - 'list', 'names': do not use brackets, item separator: "'," if fist is ``'`` else '",' if fist is ``"`` else ','
-
     ...
     :return: (new_name, new_opt)
     """
-
     key_splitted = name.split('_')
     key_splitted_len = len(key_splitted)
     if key_splitted_len < 1:
@@ -478,7 +478,6 @@ def type_fix(name: str, opt: Any) -> Tuple[str, Any]:
             else:  # Call type_fix() only to set name_out
                 name_out, val = type_fix(name[:-1] if name.endswith('lists') else name, None)
                 opt_out = {}
-
             return name_out or name, opt_out
 
         if suffix == 'dict':
@@ -500,7 +499,6 @@ def type_fix(name: str, opt: Any) -> Tuple[str, Any]:
                 return name_out, dict_fixed
             else:
                 return type_fix(name_new, opt)  # ???
-
 
         if prefix == 'b':
             return name, literal_eval(opt)
@@ -1763,10 +1761,12 @@ class FakeContextIfOpen:
     # see better contextlib.nullcontext
     """
 
-    def __init__(self,
-                 fn_open_file: Optional[Callable[[Any], Any]] = None,
-                 file: Optional[Any] = None,
-                 opened_file_object = None):
+    def __init__(
+        self,
+        fn_open_file: Optional[Callable[[Any], Any]] = None,
+        file: Optional[Any] = None,
+        opened_file_object=None,
+    ):
         """
         :param fn_open_file: if bool(fn_open_file) is False then context manager will do nothing on exit
         :param file:         if not str or PurePath then context manager will do nothing on exit
@@ -1856,7 +1856,11 @@ def open_csv_or_archive_of_them(filename: Union[PurePath, Iterable[Union[Path, s
             from zipfile import ZipFile as ArcFile
         elif arc_suffix == '.rar':
             import rarfile
-            rarfile.UNRAR_TOOL = r"c:\Programs\_catalog\TotalCmd\Plugins\arc\UnRAR.exe"  # Set Your UnRAR executable
+            # Set Your UnRAR executable
+            rarfile.UNRAR_TOOL = r"C:\Programs\_catalog\TotalCmd\Plugins\arc\Rar64.exe"
+            # r"c:\Programs\_catalog\TotalCmd\Plugins\arc\UnRAR.exe"
+            if not Path(rarfile.UNRAR_TOOL).is_file():
+                raise FileNotFoundError("Set Your UnRAR executable")
             ArcFile = rarfile.RarFile
             try:  # only try increase performance
                 # Configure RarFile Temp file size: keep ~1Gbit free, always take at least ~20Mbit:
@@ -2026,8 +2030,39 @@ if sys.platform == "win32":
             if self.mutex: CloseHandle(self.mutex)
 
 
+def update_cfg_time_ranges(cfg_in_cur, min_date=None, max_date=None):
+    """
+    Update ``cfg_in_cur['time_ranges']`` with ``min_date`` and ``max_date``
+    :param cfg_in_cur: dict
+    :param min_date: min value to set if not None
+    :param max_date: max value to set if not None
+    """
+    if min_date or max_date:
+        n_lims = 0 if cfg_in_cur["time_ranges"] is None else len(cfg_in_cur["time_ranges"])
 
-
+        if not n_lims:
+            cfg_in_cur["time_ranges"] = [min_date or "2000-01-01"]
+            n_lims = 1
+        elif min_date:
+            for i, tim in enumerate(cfg_in_cur["time_ranges"][:-1:-1]):
+                if tim < min_date:
+                    n_lims -= i
+                    if not n_lims:
+                        n_lims = 1
+                    del cfg_in_cur["time_ranges"][n_lims:]
+                    cfg_in_cur["time_ranges"][0] = min_date
+                    break
+        if max_date:
+            for i, tim in enumerate(cfg_in_cur["time_ranges"][1:], start=1):
+                if tim > max_date:
+                    del cfg_in_cur["time_ranges"][i:]
+                    n_lims = i
+                    break
+            if n_lims % 2:  # not even
+                cfg_in_cur["time_ranges"] += [max_date]
+            else:
+                if max_date < cfg_in_cur["time_ranges"][-1]:
+                    cfg_in_cur["time_ranges"][-1] = max_date
 
 
 

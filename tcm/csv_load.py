@@ -3,7 +3,7 @@ import re
 import sys
 from collections import defaultdict
 from functools import partial, update_wrapper
-from itertools import islice
+from itertools import islice, dropwhile
 from io import StringIO
 from pathlib import Path, PurePath
 import glob
@@ -27,19 +27,21 @@ from typing import (
     Iterator,
 )
 from operator import gt, lt
-
 import numpy as np
 import pandas as pd
 # from pandas.tseries.frequencies import to_offset
 # from yaml import safe_dump as yaml_safe_dump
+
+# Import my scripts
 # import cfg_dataclasses as cfg_d
 # import incl_h5clc_hy
 from . import (csv_specific_proc, utils_time_corr)
-# import my scripts
 # from to_pandas_hdf5.csv2h5 import main as csv2h5
 from .utils2init import (
     Ex_nothing_done, ExitStatus, LoggingStyleAdapter, set_field_if_no, dir_create_if_need,
-    this_prog_basename, init_logging, open_csv_or_archive_of_them, standard_error_info,  # open_csv_or_archive_of_them ...
+    this_prog_basename, init_logging, open_csv_or_archive_of_them, standard_error_info,
+    update_cfg_time_ranges,
+    # open_csv_or_archive_of_them ...
     FakeContextIfOpen
 )
 lf = LoggingStyleAdapter(logging.getLogger(__name__))
@@ -192,9 +194,9 @@ a list from the header by splitting it and removing format specifiers.
     if 'cols_loaded_save_b' in cfg_in:  # list to array
         cfg_in['cols_loaded_save_b'] = np.bool_(cfg_in['cols_loaded_save_b'])
     else:
-        cfg_in['cols_loaded_save_b'] = np.logical_not(np.array(
-            [cfg_in['dtype'].fields[n][0].char == 'S' for n in
-             cfg_in['dtype'].names]))  # a.dtype will = cfg_in['dtype']
+        cfg_in["cols_loaded_save_b"] = np.logical_not(
+            np.array([cfg_in["dtype"].fields[n][0].char == "S" for n in cfg_in["dtype"].names])
+        )  # a.dtype will = cfg_in['dtype']
 
         if 'coldate' in cfg_in:
             cfg_in['cols_loaded_save_b'][
@@ -226,44 +228,49 @@ def csv_process(
     df: pd.DataFrame, cfg_in: Mapping[str, Any], t_prev=None
 ) -> Tuple[Optional[pd.DataFrame], Optional[pd.Series]]:
     """
-
-    :param df:
+    Execute `cfg_in['fun_proc_loaded']` on DataFrame and filter its `Time` column
+    prepended with `t_prev` by `time_cor()`
+    :param df: DataFrame
     :param cfg_in:
     :param t_prev: will be prepended to df.Time before time filtering and removed after
-    :return:
+    :return: new (df, t_prev):
+    - df: input df after filtering and concatenation
+    - t_prev: last part of filtered df.Time that can be used to prepend next call df.Time
     """
-    utils_time_corr.tim_min_save = pd.Timestamp('now', tz='UTC')  # initialisation for time_corr_df()
+    utils_time_corr.tim_min_save = pd.Timestamp('now', tz='UTC')  # initialization for time_corr_df()
     utils_time_corr.tim_max_save = pd.Timestamp(0, tz='UTC')
     n_overlap = 2 * int(np.ceil(cfg_in['fs'])) if cfg_in.get('fs') else 50
     b_overlap = t_prev is not None
     # Convert df columns (at least get date)
-    try:
-        # Use `meta_out` attribute, that was used historically with dask, indicating comlex output type to
-        # determine whether we must get modified dataframe in fun_proc_loaded
-        if hasattr(cfg_in['fun_proc_loaded'], 'meta_out'):
-            # fun_proc_loaded() will replace our input data DataFrame
-            lf.debug("converting csv columns with time correction...")
-            df = cfg_in['fun_proc_loaded'](df, cfg_in)
-            date = df.Time
-        else:
-            # fun_proc_loaded() gives only Time column
-            lf.debug('time correction...')
-            date = cfg_in['fun_proc_loaded'](df, cfg_in)
+    # try:
 
-        if b_overlap:
-            date = pd.concat([t_prev, date])
-        time_cor, b_ok = utils_time_corr.time_corr(date, cfg_in)  # may be long
-        if b_overlap:
-            _ = t_prev.shape[0]
-            time_cor = time_cor[_:]
-            b_ok = b_ok[_:]
+    # Use `meta_out` attribute (that was used historically with dask, indicating complex output type) to
+    # determine whether we must get modified dataframe in fun_proc_loaded
+    if hasattr(cfg_in['fun_proc_loaded'], 'meta_out'):
+        # fun_proc_loaded() will replace our input data DataFrame
+        lf.debug("converting csv columns with time correction...")
+        df = cfg_in['fun_proc_loaded'](df, cfg_in)
+        date = df.Time
+    else:
+        # fun_proc_loaded() gives only Time column
+        lf.debug('time correction...')
+        date = cfg_in['fun_proc_loaded'](df, cfg_in)
 
-        # functions defined under csv_specific_param dict keys 'fun' and 'add' was added to cfg_in['fun_proc_loaded'], so this not needed:
-        # if cfg_in.get('csv_specific_param'):
-        #     df = csv_specific_proc.loaded_corr(df, cfg_in, cfg_in['csv_specific_param'])
-    except IndexError:
-        lf.warning('No data?')
-        return None
+    if b_overlap:
+        date = pd.concat([t_prev, date])
+    time_cor, b_ok = utils_time_corr.time_corr(date, cfg_in)  # may be long
+    if b_overlap:
+        _ = t_prev.shape[0]
+        time_cor = time_cor[_:]
+        b_ok = b_ok[_:]
+
+    # functions defined under csv_specific_param dict keys 'fun' and 'add' was added to cfg_in['fun_proc_loaded'], so this not needed:
+    # if cfg_in.get('csv_specific_param'):
+    #     df = csv_specific_proc.loaded_corr(df, cfg_in, cfg_in['csv_specific_param'])
+
+    # except IndexError:
+    #     lf.warning('No data?')
+    #     return None, None
 
     # # Show message # commented as it shows many non-increased time rows set as bad
     # nbad_time = len(b_ok) - b_ok.sum()
@@ -274,12 +281,17 @@ def csv_process(
     #         ' (shows first 20)' if nbad_time > 20 else ''
     #     )
 
-    # Filter data that is out of config range (after range_message()' args defined as both uses df_time_ok['b_ok'])
-    for date_lim, op in [('min_date', lt), ('max_date', gt)]:  # todo: time_range also
-        date_lim = cfg_in.get(date_lim)
-        if not date_lim:
-            continue
-        b_ok[op(time_cor, pd.Timestamp(date_lim, tz=None if date_lim.tzinfo else 'UTC'))] = False
+    # Filter data that is out of config range
+    # (after args of range_message() defined as both uses df_time_ok['b_ok'])
+
+    # for date_lim, op in [('min_date', lt), ('max_date', gt)]:
+    #     date_lim = cfg_in.get(date_lim)
+    #     if not date_lim:
+    #         continue
+    #     b_ok[op(time_cor, pd.Timestamp(date_lim, tz=None if date_lim.tzinfo else 'UTC'))] = False
+
+    # Also mask by time_ranges if it was set
+    apply_time_ranges_mask(time_cor, time_ranges=cfg_in.get('time_ranges'), mask=b_ok)
 
     t_prev = df.loc[df.index[-n_overlap:], 'Time']
     # Removing rows with bad time
@@ -298,16 +310,36 @@ def csv_process(
     return df_filt, t_prev
 
 
+def apply_time_ranges_mask(time, time_ranges, mask=None):
+    """
+    Update input ``mask`` by ``time_ranges`` or return time ranges mask
+    """
+    if not time_ranges:
+        return
+    elif len(time_ranges) % 2:
+        time_ranges += [pd.NaT]
+    b_ok_t = np.zeros(time.size, dtype=bool)
+    for t_st, t_en in zip(time_ranges[::2], time_ranges[1::2]):
+        t_st = pd.Timestamp(t_st, tz=(t_st.tzinfo or time.tzinfo) if time.tzinfo else None)
+        if pd.isna(t_en):
+            b_ok_t[(t_st <= time)] = True
+        else:
+            t_en = pd.Timestamp(t_en, tz=(t_en.tzinfo or time.tzinfo) if time.tzinfo else None)
+            b_ok_t[(t_st <= time) & (time <= t_en)] = True
+    if mask is None:
+        return b_ok_t
+    mask &= b_ok_t
+
+
 def range_message(range_source, n_ok_time, n_all_rows):
     t = range_source() if isinstance(range_source, Callable) else range_source
     lf.info('loaded source range: {:s}',
             f'{t["min"]:%Y-%m-%d %H:%M:%S} - {t["max"]:%Y-%m-%d %H:%M:%S %Z}, {n_ok_time:d}/{n_all_rows:d} rows')
 
 
-def csv_read_gen(paths: Sequence[Union[str, Path]],
-                 edge_rows_only: bool = False,
-                 **cfg_in: Mapping[str, Any]
-    ) -> Iterator[Tuple[int, Path, Optional[pd.DataFrame]]]:
+def csv_read_gen(
+    paths: Sequence[Union[str, Path]], edge_rows_only: bool = False, **cfg_in: Mapping[str, Any]
+) -> Iterator[Tuple[int, Path, Optional[pd.DataFrame]]]:
     """
     Reads csv to pandas DataFrame in chunks
     Calls `cfg_in['fun_proc_loaded']()` (if specified)
@@ -328,7 +360,7 @@ def csv_read_gen(paths: Sequence[Union[str, Path]],
     - skiprows=cfg_in['skiprows']
 
     Also cfg_in has fields:
-    - dtype_out: numpy.dtype, which "names" field used to detrmine output columns
+    - dtype_out: numpy.dtype, which "names" field used to determine output columns
     - fun_proc_loaded: None or Callable[
     [Union[pd.DataFrame, np.array], Mapping[str, Any], Optional[Mapping[str, Any]]],
 
@@ -362,9 +394,12 @@ def csv_read_gen(paths: Sequence[Union[str, Path]],
         'skipinitialspace': True,
         'usecols': cfg_in['dtype'].names,
         'header': None})
-    # removing "ParserWarning: Both a converter and dtype were specified for column k - only the converter will be used"
+    # Removing "ParserWarning: Both a converter and dtype were specified for column k..."
     if read_csv_args['converters']:
-        read_csv_args['dtype'] = {k: v[0] for i, (k, v) in enumerate(read_csv_args['dtype'].fields.items()) if i not in read_csv_args['converters']}
+        read_csv_args['dtype'] = {
+            k: v[0] for i, (k, v) in enumerate(read_csv_args['dtype'].fields.items())
+                if i not in read_csv_args['converters']
+            }
 
     t_prev = None  #  not corrected part of previous time chunk for time_corr() filtering in csv_process()
     for i1_path, path in enumerate(paths, start=1):
@@ -378,7 +413,7 @@ def csv_read_gen(paths: Sequence[Union[str, Path]],
                 if edge_rows_only:
                     # Yield only 1st and last rows (metadata)
 
-                    # Remove `skiprows` `pandas.read_csv()` parameter as we'll skip rows other way
+                    # Remove `skiprows` parameter of `pandas.read_csv()` as we'll skip rows other way
                     read_csv_args_ = read_csv_args.copy()
                     skip_rows, read_csv_args_['skiprows'] = \
                         read_csv_args.get('skiprows', 0), 0
@@ -483,7 +518,7 @@ def config_text_header_dtype_regex(text_type) -> dict[str, Any]:
     }
 
 
-raw_pattern_default = '*{prefix:}{number:0>2}*.[tT][xX][tT]'
+raw_pattern_default = '*{prefix:}{number:0>3}*.[tT][xX][tT]'
 
 
 def correct_files(
@@ -511,7 +546,7 @@ def correct_files(
     :param probes: iterable of probes identifiers. Can be
     - digit: if only one device type for each prober number (include device type in prefix).
     - {model}{number}: {model} should not contain digits, do not repeat model in ``prefix``.
-    - None: we use numbers < 100 (we will format them as 2-digit words from '01' to '99')
+    - None: to use numbers < 100 (we will format them as 2-digit words from '01' to '99')
     :param fun_correct: callable returning Path of corrected file with arguments (as in
     csv_specific_proc.correct_txt() except ``sub_str_list`` argument):
         file_in,
@@ -550,11 +585,16 @@ def correct_files(
             ]))
 
     def gen_pids(probes):
-        def pid_pattern_from_number(number):
-            return f"[0bdp]{number:0>2}"  # 0 for allow 3-digits numbers inputs
+        nonlocal raw_pattern
 
-        all_models_search_pattern = "[bdp]"
+        def pid_pattern_from_number(number):
+            return f"[0bdp]{number:0>2}"  # 0 allows 3-digits numbers inputs
+
+        all_models_search_pattern = "[ibdpw]"
         if probes is None:
+            # Check all numbers in range 0-99
+            if 'number}' in raw_pattern:  # Ensure pattern is 2-digit to prevent ambiguity
+                raw_pattern = raw_pattern.replace("number}", "number:0>3}")
             model = all_models_search_pattern
             for number in range(1, 100):
                 yield model, number, pid_pattern_from_number(number)
@@ -579,99 +619,116 @@ def correct_files(
     arc_suffix_ = arc_suffix_[0] if arc_suffix_ else None
 
     # Search files matched `subdir`/`pattern` matched current probe `pid` or its parts:
-    for model, number, pid in gen_pids(probes):
-        # Fill patten's placeholders `prefix`, `model`, `number`, `id`:
-        # prefix_model = f"{prefix}{model}*"  #  if not prefix or prefix[-1] not in 'ibdpw' else '*'
-        subdir = raw_subdir.format(prefix=prefix, model=model, number=number, id=pid)
-        pattern = raw_pattern.format(prefix=prefix, model=model, number=number, id=pid)
+    for digits in [3, 2]:
+        for model, number, pid in gen_pids(probes):
+            # Fill patten's placeholders `prefix`, `model`, `number`, `id`:
+            # prefix_model = f"{prefix}{model}*"  #  if not prefix or prefix[-1] not in 'ibdpw' else '*'
+            subdir = raw_subdir.format(prefix=prefix, model=model, number=number, id=pid)
+            pattern = raw_pattern.format(prefix=prefix, model=model, number=number, id=pid)
 
-        # Search files for each probe sequentially (in dir specific to probe)
-        for cur_dir in [raw_parent] if arc_suffix_ else raw_parent.glob(subdir):
-            if arc_suffix_:
-                arc_suffix = arc_suffix_
-            else:
-                arc_suffix = cur_dir.suffix.lower()
-                arc_suffix = [sfx for sfx in arc_supported_suffixes if sfx == arc_suffix]
-                arc_suffix = arc_suffix[0] if arc_suffix else None
-
-            paths_not_corr = []
-            if arc_suffix:
-                # We will open archive and search inside later if no corrected files will be found in dir
-
-                # Corrected raw files output dir name if input is archive (for fun_correct())
-                _ = f"{str(cur_dir.stem).replace('/', '_')}@{arc_suffix[1:]}"
-                dir_cor_path = raw_parent / _
-
-                glob_processed_in_arc, pattern_to_get_corr_if_arc = \
-                    pattern, str(Path(glob.escape(dir_cor_path)) / pattern)
-                if not glob_processed_in_arc[0] == '@':
-                    glob_processed_in_arc = f'@{glob_processed_in_arc}'
-            else:
-                # Search inside current probe raw subdir or use provided path to raw file
-                if cur_dir.is_dir():
-                    paths_not_corr = list(
-                        file_in for file_in in cur_dir.glob(pattern) if not file_in.stem.startswith('@')
-                    )
-                    dir_cor_path = cur_dir
+            # Search files for each probe sequentially (in dir specific to probe)
+            for cur_dir in [raw_parent] if arc_suffix_ else (raw_parent.glob(subdir)):
+                if arc_suffix_:
+                    arc_suffix = arc_suffix_
                 else:
-                    dir_cor_path = raw_parent
-                    # else:
-                #     parent_path = ''  # no more search raw files here for current pid
-                glob_processed_in_arc = '@*'  # not compare name from archive
+                    arc_suffix = cur_dir.suffix.lower()
+                    arc_suffix = [sfx for sfx in arc_supported_suffixes if sfx == arc_suffix]
+                    arc_suffix = arc_suffix[0] if arc_suffix else None
 
-            # If already have corrected files for pid with glob name = fun_correct_name(pattern) then use them
-            model, glob_corrected = mod_name(
-                pattern_to_get_corr_if_arc if arc_suffix else pattern, parse=bool(pid))
-            paths = list((dir_cor_path if arc_suffix else cur_dir).glob(glob_corrected.name))
-            # or (raw_parent / cur_dir).glob(f"@{prefix_model}{number:0>2}.txt"  # f"{tbl}.txt"
-            if paths:
-                lf.info('Corrected csv files found:\n{:s}', ',\n'.join(r.name for r in paths))
-                if paths_not_corr:
-                    # keep only that paths that has no corresponding corrected path
-                    _, paths_not_corr = paths_not_corr, []
-                    for p in _:
-                        __, p_cor = mod_name(p, parse=False)
-                        if p_cor not in paths:
-                            paths_not_corr.append(p)
+                paths_not_corr = []
+                if arc_suffix:
+                    # We will open archive and search inside later if no corrected files will be found in dir
+
+                    # Corrected raw files output dir name if input is archive (for fun_correct())
+                    _ = f"{str(cur_dir.stem).replace('/', '_')}@{arc_suffix[1:]}"
+                    dir_cor_path = (raw_parent.parent if arc_suffix_ else raw_parent) / _
+
+                    glob_processed_in_arc, pattern_to_get_corr_if_arc = \
+                        pattern, str(Path(glob.escape(dir_cor_path)) / pattern)
+                    if not glob_processed_in_arc[0] == '@':
+                        glob_processed_in_arc = f'@{glob_processed_in_arc}'
+                else:
+                    # Search inside current probe raw subdir or use provided path to raw file
+                    if cur_dir.is_dir():
+                        paths_not_corr = list(
+                            file_in for file_in in cur_dir.glob(pattern) if not file_in.stem.startswith('@')
+                        )
+                        dir_cor_path = cur_dir
+                    else:
+                        dir_cor_path = raw_parent
+                        # else:
+                    #     parent_path = ''  # no more search raw files here for current pid
+                    glob_processed_in_arc = '@*'  # not compare name from archive
+
+                # If already have corrected files for pid with glob name = fun_correct_name(pattern) then use them
+                model, glob_corrected = mod_name(
+                    pattern_to_get_corr_if_arc if arc_suffix else pattern, parse=bool(pid))
+                paths = list((dir_cor_path if arc_suffix else cur_dir).glob(glob_corrected.name))
+                # or (raw_parent / cur_dir).glob(f"@{prefix_model}{number:0>2}.txt"  # f"{tbl}.txt"
+                if paths:
+                    lf.info('Corrected csv files found:\n{:s}', ',\n'.join(r.name for r in paths))
                     if paths_not_corr:
-                        lf.info('Not corrected yet:\n{:s}', ',\n'.join(r.name for r in paths_not_corr))
-            n_files = 0  # files for pid found
-            for file_in in (
-                (paths + paths_not_corr) or open_csv_or_archive_of_them(raw_parent / subdir, pattern=pattern)
-            ):
-                model, file = mod_name(file_in.name, parse=bool(pid))
-                # (".name" is required for mod_name() if file_in is TextIOWrapper)
-                file = fun_correct(
-                    file_in,
-                    dir_out=dir_cor_path, binary_mode=False,
-                    mod_file_name=lambda _: file,
-                    sub_str_list=(
-                        sub_str_list(model) if callable(sub_str_list) else
-                        # If file_in is already converted file in archive just extracts to output dir:
-                        None if PurePath(file_in.name).match(glob_processed_in_arc) else
-                        sub_str_list
+                        # keep only that paths that has no corresponding corrected path
+                        _, paths_not_corr = paths_not_corr, []
+                        for p in _:
+                            __, p_cor = mod_name(p, parse=False)
+                            if p_cor not in paths:
+                                paths_not_corr.append(p)
+                        if paths_not_corr:
+                            lf.info('Not corrected yet:\n{:s}', ',\n'.join(r.name for r in paths_not_corr))
+                n_files = 0  # files for pid found
+                for file_in in (
+                    (paths + paths_not_corr) or open_csv_or_archive_of_them(
+                        raw_parent / subdir, pattern=pattern
                     )
-                )
-                n_files += 1
-                for model_number, files in probes_found.items():
-                    if file in files:
-                        if model_number == (model, number):
-                            break
-                        raise FileExistsError(''.join([
-                            'Going to process same file again as another probe/data part! ',
-                            'Maximum one file should be matched for each probe number: correct input file '
-                            f'name pattern (current raw_pattern={raw_pattern}) or rename files. ',
-                            'Note: if You set path of input text file as dir, then default raw_pattern = '
-                            f'{raw_pattern_default} will be used which is usually Ok'
-                            if raw_pattern != raw_pattern_default else ''
-                        ]))
+                ):
+                    model, file = mod_name(file_in.name, parse=bool(pid))
+                    # (".name" is required for mod_name() if file_in is TextIOWrapper)
+                    file = fun_correct(
+                        file_in,
+                        dir_out=dir_cor_path, binary_mode=False,
+                        mod_file_name=lambda _: file,
+                        sub_str_list=(
+                            sub_str_list(model) if callable(sub_str_list) else
+                            # If file_in is already converted file in archive just extracts to output dir:
+                            None if PurePath(file_in.name).match(glob_processed_in_arc) else
+                            sub_str_list
+                        )
+                    )
+                    n_files += 1
+                    for model_number, files in probes_found.items():
+                        if file in files:
+                            if model_number == (model, number):
+                                break
+                            raise FileExistsError(
+                                "\n".join(
+                                    [
+                                        "Going to process same file again as another probe/data part! ",
+                                        "Maximum one file should be matched for each probe number: correct input file "
+                                        f'name pattern (current raw_pattern="{raw_pattern}") or rename files. ',
+                                        "Note: if You set path of input text file as dir, then default raw_pattern = "
+                                        f"{raw_pattern_default} will be used which is usually Ok"
+                                        if raw_pattern != raw_pattern_default
+                                        else "",
+                                        f"Current files to probe (model, number) classification:"
+                                    ] +
+                                    [f'{c}: {", ".join([n.name for n in f])}' for c, f in probes_found.items()]
+                                )
+                            )
+                    else:
+                        probes_found[(model, number)].append(file)
                 else:
-                    probes_found[(model, number)].append(file)
-            else:
-                if n_files == 0:
-                    (lf.debug if probes is None else lf.warning)('No {:s} files found', pattern)
-                    continue
-            n_files_total += n_files
+                    if n_files == 0:
+                        (lf.debug if probes is None else lf.warning)('No {:s} files found', pattern)
+                        continue
+                n_files_total += n_files
+        if n_files_total or raw_pattern != raw_pattern_default:
+            break
+        lf.warning(
+            'As no files found with default raw_pattern used, we try less digits in its {number} part...'
+        )
+        raw_pattern = raw_pattern_default.replace("0>3", "0>2")
+
 
     lf.info(*(
         (
@@ -697,7 +754,7 @@ cfg_default = {
         'on_bad_lines':       'warn',  #'error',
         # '--min_date', '07.10.2017 11:04:00',  # not output data < min_date
         # '--max_date', '29.12.2018 00:00:00',  # UTC, not output data > max_date
-        'blocksize':          1_000_000,  # 5_000_000  # 15_000_000 hangs my comp
+        'blocksize':          5_000_000,  # 1_000_000  # 15_000_000 hangs my comp
         'b_interact':         '0',
         'csv_specific_param': {
             'invert_magnetometer': True,
@@ -748,13 +805,13 @@ def search_correct_csv_files(
     provided as a list. Corrects data files based on probe identifiers.
 
     :param cfg_in: configuration for input files. Required fields:
-      - path: input directory/file mask
+    - path: input directory/file mask
     Other fields are optional (see global cfg_default). For example, overwrite this field:
-      - fun_proc_loaded: function to convert/process column data after loading csv pandas dataframe.
-      - text_type: to specify cfg_in fields 'text_line_regex', 'header', 'dtype' for known probes
+    - fun_proc_loaded: function to convert/process column data after loading csv pandas dataframe.
+    - text_type: to specify cfg_in fields 'text_line_regex', 'header', 'dtype' for known probes
         (specified in config_text_header_dtype_regex()). If probe not known then set these fields keeping
         default text_type = None
-      ...
+    ...
     in the cycle of loading probe data with settings specified to current probe
     :param cfg_program: dict with fields
     - log_file_name, verbose: logging parameters
@@ -769,13 +826,22 @@ def search_correct_csv_files(
 
     # Find raw files and preliminary format correction: non-regularity in source (primary) csv
     # todo: move correction into the load cycle
+
+    # try:  # Same effect code for arc
+    #     raw_parent = next(
+    #         dropwhile(lambda p: not p.suffix.lower() in (".zip", ".rar"), cfg_in["path"].parents)
+    #     )
+    #     raw_pattern = raw_parent.name
+    #     raw_subdir = cfg_in["path"].relative_to(raw_parent).parent
+    # except StopIteration:
+
     raw_parent = cfg_in['path'].parent
     raw_pattern = cfg_in['path'].name
     if cfg_in['path'].is_dir() or (not cfg_in['path'].suffix or
         sum(p.suffix.lower() in ('.zip', '.rar') or p.is_dir() for p in raw_parent.glob(raw_pattern))):
         # raw_parent was found
         raw_subdir = raw_pattern
-        raw_pattern = '{prefix}{id}*.[tT][xX][tT]'  # number:0>2
+        raw_pattern = raw_pattern_default  # pattern work if need match cfg_in['probes']
     else:
         raw_subdir = raw_parent.name
         raw_parent = raw_parent.parent
@@ -813,12 +879,17 @@ def pcid_from_parts(type: str = "i", model: str = None, number: str|int = None):
     :param probe_type: probe type ('i' for inclinometers)
     :return: pcid
     """
-    if model == "i":
-        if type == "i":
-            type = ""  # not repeat "i"
-            _ = ""
+    if type == "i":
+        if model:
+            if model == "i":
+                model = ""  # not repeat "i"
+                _ = ""
+            else:
+                _ = "_"
         else:
-            _ = "_"
+            _ = ""
+    elif type == "" and model == "i":
+        _ = ""
     else:
         _ = "_"
     return f"{type}{_}{model}{number:0>2}"
@@ -838,13 +909,13 @@ def load_from_csv_gen(
     provided as a list. Corrects data files based on probe identifiers.
     :param raw_corrected: {(model, number): files} dict of found probes returned by `correct_files()`
     :param cfg_in: configuration for input files. Required fields:
-      - path: input directory/file mask
+    - path: input directory/file mask
     Other fields are optional (see global cfg_default). For example, overwrite this field:
-      - fun_proc_loaded: function to convert/process column data after loading csv pandas dataframe.
-      - text_type: to specify cfg_in fields 'text_line_regex', 'header', 'dtype' for known probes
-        (specified in config_text_header_dtype_regex()). If probe not known then set these fields keeping
-        default text_type = None
-      ...
+    - fun_proc_loaded: function to convert/process column data after loading csv pandas dataframe.
+    - text_type: to specify cfg_in fields 'text_line_regex', 'header', 'dtype' for known probes
+    (specified in config_text_header_dtype_regex()). If probe not known then set these fields keeping
+    default text_type = None
+    ...
     :param cfg_in_probe: optional dict with fields named equal to probe(s) {pid}(s) to update cfg_in
     in the cycle of loading probe data with settings specified to current probe
     :param skip_for_meta: optional function to skip specific files taking `load_from_csv_gen` 2nd output argument
@@ -861,7 +932,7 @@ def load_from_csv_gen(
     """
     n_raw_cor_found = len(raw_corrected)
     if n_raw_cor_found == 0:
-        lf.warning("No {:s} raw files found!", str(cfg_in["path"]))
+        lf.warning("No raw files {:s} found!", str(cfg_in["path"]))
         sys.exit(ExitStatus.failure)
 
     # Optional return file list without any processing or configure to return only edge rows
@@ -942,10 +1013,18 @@ def load_from_csv_gen(
         cfg_in_cur = {**cfg_in, "paths": paths_csv}
         if cfg_in_probe and pid in cfg_in_probe:
             cfg_in_cur.update(cfg_in_probe[pid])
+        update_cfg_time_ranges(cfg_in_cur, cfg_in_cur.get("min_date"), cfg_in_cur.get("max_date"))
+
         if cfg_in_cur.get("date_to_from"):
-            cfg_in_cur["dt_from_utc"] = (
-                cfg_in_cur["date_to_from"][1] - cfg_in_cur["date_to_from"][0]
-            )
+            t_to, t_from = cfg_in_cur["date_to_from"][:2]
+            # todo: add specific_proc function to perform
+            # shift only if data less than `date_min` and `cfg_in_cur["date_to_from"][3,5,7...]`
+            # to `cfg_in_cur["date_to_from"][2,4,6...]`
+            #
+            # if len(cfg_in_cur["date_to_from"]) > 2:
+            #     # for t_to, t_from in (cfg_in_cur["date_to_from"][2:]):
+
+            cfg_in_cur["dt_from_utc"] = t_from - t_to
             lf.warning(
                 "Time shift to {} from {} will be performed ({} hours)",
                 *cfg_in_cur["date_to_from"],
@@ -987,7 +1066,9 @@ if __name__ == '__main__':
             dir_in, raw_pattern_file = sys.argv[1].split('*', 1)
             dir_in = Path(dir_in)
             raw_pattern_file = f'*{raw_pattern_file}' if raw_pattern_file else filenames_default
-            lf.info('Searching config file and input files in {:s} (default mask: {:s})', dir_in, raw_pattern_file)
+            lf.info(
+                "Searching config file and input files in {:s} (default mask: {:s})", dir_in, raw_pattern_file
+            )
         else:
             dir_in = Path.cwd().resolve()
             raw_pattern_file = filenames_default

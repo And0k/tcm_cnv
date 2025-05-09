@@ -34,13 +34,22 @@ if __debug__:
     plt.style.use('bmh')
 
 # import my functions:
-from .cfg_dataclasses import hydra_cfg_store, ConfigInHdf5_Simple, ConfigProgram, main_init, main_init_input_file  #  ConfigProgram is used indirectly
+from . import h5, cfg_dataclasses as cfg_d
 from .h5_dask_pandas import filter_local
-from . import h5
-
-from .incl_h5clc_hy import ConfigIn_InclProc, incl_calc_velocity_nodask, gen_subconfigs, probes_gen, norm_field
+from .incl_h5clc_hy import (
+    ConfigIn_InclProc,
+    ConfigInMany_InclProc,
+    incl_calc_velocity_nodask,
+    gen_raw_from_h5,
+    separate_cfg_in_for_probes,
+    set_full_paths_and_h5_out_fields,
+    pcid_to_raw_name,
+    to_pcid_from_name,
+    track_probe_closure,
+    norm_field
+)
+from .csv_load import pcid_from_parts
 from .h5inclinometer_coef import channel_cols, dict_matrices_for_h5, h5copy_coef
-
 from .utils2init import this_prog_basename, standard_error_info, my_logging
 from .filters_scipy import despike
 from .graphics import make_figure
@@ -53,7 +62,7 @@ hydra.output_subdir = 'cfg'
 drive_d = Path('D:/' if sys.platform == 'win32' else '/mnt/D')  # allows to run on both my Linux and Windows systems
 import_dir = drive_d.joinpath('Work/_Python3/And0K/h5toGrid/scripts/third_party')
 sys.path.append(str(Path(import_dir).parent.resolve()))
-from third_party.ellipsoid_fit import ellipsoid_fit
+from .calibration.ellipsoid_fit import ellipsoid_fit
 
 # @dataclass hydra_conf(hydra.conf.HydraConf):
 #     run: field(default_factory=lambda: defaults)dir
@@ -64,17 +73,25 @@ from third_party.ellipsoid_fit import ellipsoid_fit
 @dataclass
 class ConfigFilterComponent:
     """
-    Filter values specific to components, will overwrite common values of inherited ConfigFilter class next to this
+    Filter values specific to components, will overwrite common values of inherited ConfigFilter class next to
+    this
     """
     blocks: Optional[List[int]] = field(default_factory=lambda: [21, 7])
     offsets: Optional[List[float]] = field(default_factory=lambda: [1.5, 2])
     std_smooth_sigma: Optional[float] = 4
 
+
 @dataclass
 class ConfigFilterChannel(ConfigFilterComponent):
-    x: Optional[ConfigFilterComponent] = field(default_factory=lambda: ConfigFilterComponent(None, None, None))
-    y: Optional[ConfigFilterComponent] = field(default_factory=lambda: ConfigFilterComponent(None, None, None))
-    z: Optional[ConfigFilterComponent] = field(default_factory=lambda: ConfigFilterComponent(None, None, None))
+    x: Optional[ConfigFilterComponent] = field(
+        default_factory=lambda: ConfigFilterComponent(None, None, None)
+    )
+    y: Optional[ConfigFilterComponent] = field(
+        default_factory=lambda: ConfigFilterComponent(None, None, None)
+    )
+    z: Optional[ConfigFilterComponent] = field(
+        default_factory=lambda: ConfigFilterComponent(None, None, None)
+    )
     # = {c: ConfigFilterComponent(None, None, None) for c in 'xyz'}?
 
 @dataclass
@@ -96,6 +113,39 @@ class ConfigFilter(ConfigFilterComponent):
 
 
 @dataclass
+class ConfigInHdf5_InclCalibr(ConfigIn_InclProc):
+    """
+    Same as cfg_d.ConfigInHdf5_Simple + specific (inclinometer calibration) data properties:
+    channels: List: (, channel can be "magnetometer" or "M" for magnetometer and any else for accelerometer',
+    chunksize: limit loading data in memory (default='50000')
+    time_range: time range to use
+    time_ranges: time range to use for each inclinometer number (consisted of digits in table name), overwrites time_range
+    time_ranges_north_list: time range to zeroing north. Not zeroing North if not used')
+    time_ranges_north_dict: time range to zeroing north for each inclinometer number (consisted of digits in table name)')
+    """
+    # path_cruise: Optional[str] = None  # mainly for compatibility with incl_load but allows db_path be relative to this
+
+    channels: List[str] = field(default_factory=lambda: ['M', 'A'])
+    chunksize: int = 50000
+    # time_ranges: List[str] = field(default_factory=list)
+    time_ranges_north: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ConfigInMany_InclCalibr(ConfigInMany_InclProc):
+    # time_ranges: Optional[Dict[str, Any]] = field(
+    #         default_factory=dict
+    #     )  # Dict[int, str] not supported in omegaconf
+    time_ranges_north_dict: Dict[str, str] = field(default_factory=dict)  # Dict[int, str] not supported in omegaconf
+    # Dict[Optional[str], Optional[List[str]]]
+
+
+@dataclass
+class ConfigProgramSt(cfg_d.ConfigProgram):
+    step_start: int = 1
+    step_end: int = 1
+
+@dataclass
 class ConfigOut:
     """
     "out": all about output files:
@@ -103,54 +153,39 @@ class ConfigOut:
     db_paths: hdf5 stores paths where to write resulting coef. Tables will be the same as configured for input data
     (cfg[in].tables)
     """
+
     # raw_db_path: Any = 'auto'  # will be the parent of input.path dir for text files
-    table: str = ''         # not used but required by incl_h5clc_hy.gen_subconfigs()
-    table_log: str = ''     # not used but required by incl_h5clc_hy.gen_subconfigs()
+    table: str = ""  # not used but required by incl_h5clc_hy.gen_subconfigs()
+    table_log: str = ""  # not used but required by incl_h5clc_hy.gen_subconfigs()
     db_paths: Optional[List[str]] = field(default_factory=list)
+
+    # for compatibility with configs from incl_h5clc_hy:
+    db_path: Optional[str] = None
+    not_joined_db_path: Optional[str] = None
+    raw_db_path: Optional[str] = None
+    text_path: Optional[str] = None
+
 
 
 # @dataclass
-# class DictTimeRange(ConfigInHdf5_Simple):
+# class DictTimeRange(cfg_d.ConfigInHdf5_Simple):
 #     03: List[str] = field(default_factory=list)
 
 
-@dataclass
-class ConfigInHdf5_InclCalibr(ConfigIn_InclProc):
-    """
-    Same as ConfigInHdf5_Simple + specific (inclinometer calibration) data properties:
-    channels: List: (, channel can be "magnetometer" or "M" for magnetometer and any else for accelerometer',
-    chunksize: limit loading data in memory (default='50000')
-    time_range: time range to use
-    time_ranges: time range to use for each inclinometer number (consisted of digits in table name), overwrites time_range
-    time_range_nord_list: time range to zeroing north. Not zeroing Nord if not used')
-    time_range_nord_dict: time range to zeroing north for each inclinometer number (consisted of digits in table name)')
-    """
-    # path_cruise: Optional[str] = None  # mainly for compatibility with incl_load but allows db_path be relative to this
-
-    channels: List[str] = field(default_factory=lambda: ['M', 'A'])
-    chunksize: int = 50000
-    time_range: List[str] = field(default_factory=list)
-    time_ranges: Optional[Dict[str, Any]] = field(default_factory=dict)  # Dict[int, str] not supported in omegaconf
-    time_range_nord: List[str] = field(default_factory=list)
-    time_range_nord_dict: Dict[str, str] = field(default_factory=dict)  # Dict[int, str] not supported in omegaconf
-    # Dict[Optional[str], Optional[List[str]]]
-
-@dataclass
-class ConfigProgramSt(ConfigProgram):
-    step_start: int = 1
-    step_end: int = 1
-
-
 cs_store_name = Path(__file__).stem
-cs, ConfigType = hydra_cfg_store(
-    cs_store_name, {
-        'input': [ConfigInHdf5_InclCalibr],  # Load the config ConfigInHdf5_InclCalibr to the config group "input"
-        'out': [ConfigOut],  # Set as MISSING to require the user to specify a value on the command line.
-        'filter': [ConfigFilter],
-        'program': [ConfigProgramSt],
+cs, ConfigType = cfg_d.hydra_cfg_store(
+    cs_store_name,
+    {
+        "input": [
+            ConfigInHdf5_InclCalibr
+        ],  # Load the config ConfigInHdf5_InclCalibr to the config group "input"
+        "in_many": [ConfigInMany_InclCalibr],
+        "out": [ConfigOut],  # Set as MISSING to require the user to specify a value on the command line.
+        "filter": [ConfigFilter],
+        "program": [ConfigProgramSt],
     },
-    module=sys.modules[__name__]
-    )
+    module=sys.modules[__name__],
+)
 
 
 def fG(Axyz, Ag, Cg):
@@ -560,27 +595,27 @@ def calibrate_plot(raw3d: np.ndarray, a2d: np.ndarray, b, fig=None, window_title
     return fig
 
 
-def zeroing_azimuth(store: pd.HDFStore, tbl, time_range_nord, coefs=None, cfg_in=None,
+def zeroing_azimuth(store: pd.HDFStore, tbl, time_ranges_north, coefs=None, cfg_in=None,
                     filter_query='10 < inclination & inclination < 170') -> float:
     """
     Get correction of azimuth by:
-    1. calculating velocity (u, v) in ``time_range_nord`` interval of tbl data using coefficients to be adjusted,
+    1. calculating velocity (u, v) in ``time_ranges_north`` interval of tbl data using coefficients to be adjusted,
     2. filtering with ``filter_query`` and taking median,
     3. calculating direction,
     4. multiplying result by -1.
-    :param time_range_nord:
+    :param time_ranges_north:
     :param store: opened pandas HDFStore: interface to its objects in PyTables hdf5 store
     :param tbl: table name in store
     :param coefs: dict with fields having values of array type with sizes:
     'Ag': (3, 3), 'Cg': (3, 1), 'Ah': (3, 3), 'Ch': array(3, 1), 'azimuth_shift_deg': (1,), 'kVabs': (n,)
     :param cfg_in: dict with fields:
-        - time_range_nord
+        - time_ranges_north
         - other, needed in h5.load_ranges() and optionally in incl_calc_velocity_nodask()
     :param filter_query: upply this filter query to incl_calc_velocity*() output before mean azimuth calculation
     :return: azimuth_shift_deg: degrees
     """
-    lf.debug('Zeroing Nord direction')
-    df = h5.load_ranges(store, table=tbl, t_intervals=time_range_nord)
+    lf.debug('Zeroing North direction')
+    df = h5.load_ranges(store, table=tbl, t_intervals=time_ranges_north)
     if df.empty:
         lf.info('Zero calibration range out of data scope')
         return
@@ -595,7 +630,7 @@ def zeroing_azimuth(store: pd.HDFStore, tbl, time_range_nord, coefs=None, cfg_in
 
     # coefs['M']['A'] = rotate_z(coefs['M']['A'], dfv_mean.Vdir[0])
     azimuth_shift_deg = -np.degrees(np.arctan2(*dfv_mean.to_numpy()))
-    lf.info('Nord azimuth shifting coef. found: {:f} degrees', azimuth_shift_deg)
+    lf.info('North azimuth shifting coef. found: {:f} degrees', azimuth_shift_deg)
     return azimuth_shift_deg
 
 
@@ -614,7 +649,8 @@ def bin_avg_3d_partial(index: np.ndarray | pd.DatetimeIndex, vec3d: np.ndarray, 
     rtp = xyz2spherical(vec3d)  # spherical coord (radius, theta, phi)
     # We will set u=cos(phi) to be uniformly distributed (so we have du=sin(phi)d(phi))
 
-    # Compare required number of bins with recommended minimum to get 1 point in 2D if points positioned nealy ideal
+    # Compare required number of bins with recommended minimum to get 1 point in 2D if points positioned
+    # nearly ideal
     bins_min_recommended = int(np.sqrt(rtp.shape[1]))
     if bins is None:
         bins = bins_min_recommended
@@ -637,8 +673,12 @@ def bin_avg_3d_partial(index: np.ndarray | pd.DatetimeIndex, vec3d: np.ndarray, 
     # for display: all original points that will be replaced by averaging
     raw3d_other = vec3d[:, np.hstack([np.arange(*i_st_en) for i_st_en in intervals_avg[b_need_mean]])]
     # intact points that alone in grid cell and averaging other points in cell
-    vec3d = np.column_stack([vec3d[:, slice(*i_st_en)].mean(axis=1) if b_need else vec3d[:, i_st_en[0]] for
-                             i_st_en, b_need in zip(intervals_avg, b_need_mean)])
+    vec3d = np.column_stack(
+        [
+            vec3d[:, slice(*i_st_en)].mean(axis=1) if b_need else vec3d[:, i_st_en[0]]
+            for i_st_en, b_need in zip(intervals_avg, b_need_mean)
+        ]
+    )
     index = index[i_sort[i_bins_sorted_change[:-1]]]  # starts of vec3d
     index = index[i_sort := np.argsort(index)]
     vec3d = vec3d[:, i_sort]
@@ -660,6 +700,33 @@ def xyz2spherical(xyz):
     return rtp
 
 
+def gen_raw_without_splits(cfg):
+    """
+    yield combined data for each probe
+    """
+    cfg_in_common, cfg_in_for_probes = separate_cfg_in_for_probes(cfg["in"], cfg.get("in_many", {}))
+    dfs_loaded = []
+    pcid_prev = None
+    track_probe = track_probe_closure(b_input_is_h5=True)
+    # waits for next probe or stop to yield
+    for df_raw, ((i1pcid, pcid, path_csv), rec_raw, tbl_raw) in gen_raw_from_h5(
+        cfg_in_for_probes, cfg_in_common, cfg_out=cfg["out"], b_raw=True
+    ):
+        probe_continues = track_probe(pcid)
+        if probe_continues:
+            dfs_loaded.append(df_raw)
+        elif pcid_prev is None:  # not yield 1st time
+            pcid_prev = pcid
+            dfs_loaded.append(df_raw)
+        else:
+            pcid_prev = pcid
+            df_out = pd.concat(dfs_loaded) if len(dfs_loaded) > 1 else dfs_loaded[0]
+            dfs_loaded = [df_raw]
+            yield df_out, pcid_prev
+
+    df_out = pd.concat(dfs_loaded) if len(dfs_loaded) > 1 else df_raw
+    yield df_out, pcid, tbl_raw
+
 
 cfg = {}
 
@@ -675,60 +742,66 @@ def main(config: ConfigType) -> None:
     also.
     2. Loads device data of calibration in laboratory from hdf5 database (cfg['in']['db_path'])
     2. Calibrates configured by cfg['in']['channels'] channels ('accelerometer' and/or 'magnetometer'): soft iron
-    3. Wrong implementation - not use cfg['in']['time_range_nord']! todo: Rotate compass using cfg['in']['time_range_nord']
+    3. Wrong implementation - not use cfg['in']['time_ranges_north']! todo: Rotate compass using cfg['in']['time_ranges_north']
     :param config: returns cfg if new_arg=='<cfg_from_args>' but it will be None if argument
-     argv[1:] == '-h' or '-v' passed to this code
+    argv[1:] == '-h' or '-v' passed to this code
     argv[1] is cfgFile. It was used with cfg files:
 
 
     """
     global cfg
-    cfg = main_init(config, cs_store_name, __file__=None)
-    cfg = main_init_input_file(cfg, cs_store_name, in_file_field='path')
+    if config.input.path is None and config.input.paths is None:
+        raise ValueError("Input `path` or `paths` must be provided.")
+    cfg = cfg_d.main_init(config, cs_store_name, __file__=None)
+    cfg["input"]["paths"] = (
+        [Path(config.input["path"])]
+        if config.input["paths"] is None
+        else [Path(p) for p in config.input["paths"]]
+    )
+    # If input is text then switch to hdf5 file/table
+    if (
+        (not cfg["input"]["tables"])
+        and cfg["input"]["paths"][0].suffix != ".h5"
+        and "*" not in cfg["input"]["paths"][0].name
+    ):
+        _ = cfg["input"]["paths"][0].stem
+        model = _.rstrip("0123456789")
+        number = int(_[len(model) :])
+        model = model.lstrip("@").rstrip("_")
+        # pcid = pcid_from_parts()
+        # to_pcid_from_name(cfg["input"]["paths"][0].stem)
+        pid = to_pcid_from_name(f"{model}_{number:0>2}")
+        cfg["input"]["tables"] = [pcid_to_raw_name(pid)]
+        cfg["input"]["path"] = cfg["out"]["raw_db_path"]  # todo: find it if not specified
+
+    cfg = cfg_d.main_init_input_file(cfg, cs_store_name, msg_action="Loading data from", in_file_field="path")
     print()
     lf.info(
-        "{:s}({:s}) for channels: {} started. ",
-        this_prog_basename(__file__), ', '.join(cfg['in']['tables']), cfg['in']['channels']
+        "Begin {:s}({:s}) for channels: {}.",
+        this_prog_basename(__file__),
+        ", ".join(cfg["in"]["tables"]),
+        cfg["in"]["channels"],
     )
-    fig_filt = None
-    fig = None
+    # cfg["in"]["path"] = set_full_paths_and_h5_out_fields(cfg["out"], **cfg["in"])
+
     if not cfg['in']['path'].is_absolute():
         cfg['in']['path'] = cfg['in']['path_cruise'] / str(cfg['out']['path'])
 
+    fig_filt, fig = None, None
     fig_save_dir_path = cfg['in']['path'].parent
     (fig_save_dir_path / 'images-channels_calibration').mkdir(exist_ok=True)
+
     tbl_prev, pid_prev = None, None
     coefs = {}
     cfg['in']['is_counts'] = True
     cfg['out']['aggregate_period'] = None
 
-    for d, cfg1, tbl, col_out, pid, i_tbl_part in gen_subconfigs(
-            cfg,
-            fun_gen=probes_gen,
-            **cfg['in']
-    ):
-        if i_tbl_part:
-            probe_continues = True
-        else:
-            probe_continues = (tbl == tbl_prev and pid == pid_prev)
-            tbl_prev = tbl
-            pid_prev = pid
-
-        n_parts = round(len(cfg1['in']['time_range']) / 2)
-        if n_parts > 1:
-            if i_tbl_part == 0:
-                d_list_save = []
-            d_list_save.append(d)
-            if (i_tbl_part + 1) < n_parts:
-                continue
-            else:
-                d = dd.concat(d_list_save)
+    for df_raw, pcid, tbl in gen_raw_without_splits(cfg):
 
         # replacing changed table name back (that was prepared by gen_subconfigs() to output processed data we don't)
-        tbl = tbl.replace('i', 'incl')
-        d = filter_local(d, cfg['filter'], ignore_absent={'h_minus_1', 'g_minus_1'})
-
-        a = d.compute()
+        a = df_raw.compute() if not isinstance(df_raw, pd.DataFrame) else df_raw
+        a = filter_local(a, cfg["filter"], ignore_absent={"h_minus_1", "g_minus_1"})
+        #
         if a.empty:
             lf.error('No data for {}!!! Skipping it...', tbl)
             continue
@@ -755,11 +828,11 @@ def main(config: ConfigType) -> None:
                 vec3d, index, fig_filt, fig_save_prefix=fig_filt_save_prefix, window_title=f'channel {channel}',
                 # we almost not filter spikes in magnetometer by this method:
                 **(cfg['filter'][col_str]
-                   # if col_str == 'A' else {
-                   #  **cfg['filter'], **{c: {**cfg['filter'][c], 'offsets': [7, 4]} for c in ['x', 'y', 'z']}  # 10, 5
-                   #  }
-                   )
+                # if col_str == 'A' else {
+                #  **cfg['filter'], **{c: {**cfg['filter'][c], 'offsets': [7, 4]} for c in ['x', 'y', 'z']}  # 10, 5
+                #  }
                 )
+            )
             # # Remove unit sphere outliers relative to standard coefficients
             # if True:
             #     A, b = [default_coef[f'//coef//{coef_str}//{ac}'] for ac in 'AC']
@@ -814,7 +887,7 @@ def main(config: ConfigType) -> None:
 
             # Overlay remained points on raw data (of last drawn coordinate) to get into what data is good/bad
             fig_filt.axes[0].plot(index_avg, vec3d_avg[2, :], label='distributed 3D avg,\nnear to sphere',
-                                  marker='.', color='k', linewidth=0.5, markersize=2, linestyle='dashed')
+                marker='.', color='k', linewidth=0.5, markersize=2, linestyle='dashed')
             # fig_filt.axes[0].scatterplot(n_in_cell, alpha=0.5)
             fig_filt.axes[0].legend(prop={'size': 10}, loc='upper right')
             try:
@@ -832,13 +905,13 @@ def main(config: ConfigType) -> None:
             lf.info('Calibration coefficients calculated: \nA = \n{:s}\nb = \n{:s}', A_str, b_str)
             coefs[tbl][channel] = {'A': A, 'b': b}
 
-        # Zeroing Nord direction (should be done after zero calibration?)
-        time_range_nord = cfg['in']['time_range_nord']
-        if isinstance(time_range_nord, Mapping):
-            time_range_nord = time_range_nord.get(pid)
-        if time_range_nord:
+        # Zeroing North direction (should be done after zero calibration?)
+        time_ranges_north = cfg['in']['time_ranges_north']
+        if not time_ranges_north and cfg['in_many']['time_ranges_north']:
+            time_ranges_north = cfg['in_many']['time_ranges_north'].get(pcid)
+        if time_ranges_north:
             coefs[tbl]['M']['azimuth_shift_deg'] = zeroing_azimuth(
-                cfg['in']['db'], tbl, time_range_nord, calc_vel_flat_coef(coefs[tbl]), cfg['in']
+                cfg['in']['db'], tbl, time_ranges_north, calc_vel_flat_coef(coefs[tbl]), cfg['in']
                 )
         else:
             lf.info('not zeroing North')
@@ -869,7 +942,7 @@ def main(config: ConfigType) -> None:
             #             except Exception as e:
             #                 pass
             dict_matrices = dict_matrices_for_h5(coef, tbl, cfg['in']['channels'])
-            h5copy_coef(None, db_path, tbl, dict_matrices=dict_matrices)
+            h5copy_coef(None, db_path, tbl, dict_matrices=dict_matrices, dates=True)
             # todo: add text info what source data (path), was used to calibrate which channels, date of calibration
     print('Ok>', end=' ')
 

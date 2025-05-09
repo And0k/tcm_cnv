@@ -61,22 +61,22 @@ class ConfigInCsv:
     Constructor arguments:
     :param path: path to source file(s) to parse. Use patterns in Unix shell style
     :param b_search_in_subdirs: search in subdirectories, used if mask or only dir in path (not full path)
-    :param exclude_dirs_endswith_list: exclude dirs which ends with this srings. This and next option especially useful when search recursively in many dirs
-    :param exclude_files_endswith_list: exclude files which ends with this srings
-    :param b_incremental_update: exclude processing of files with same name and which time change is not bigger than recorded in database (only prints ">" if detected). If finds updated version of same file then deletes all data which corresponds old file and after it brfore procesing of next files
+    :param exclude_dirs_endswith_list: exclude dirs which ends with this strings. This and next option especially useful when search recursively in many dirs
+    :param exclude_files_endswith_list: exclude files which ends with this strings
+    :param b_incremental_update: exclude processing of files with same name and which time change is not bigger than recorded in database (only prints ">" if detected). If finds updated version of same file then deletes all data which corresponds old file and after it before processing of next files
     :param dt_from_utc_seconds: add this correction to loading datetime data. Can use other suffixes instead of "seconds"
     :param dt_from_utc_hours: add this correction to loading datetime data. Can use other suffixes instead of "hours"
     :param fs_float: sampling frequency, uses this value to calculate intermediate time values between time changed values (if same time is assigned to consecutive data)
     :param fs_old_method_float: sampling frequency, same as ``fs_float``, but courses the program to use other method. If smaller than mean data frequency then part of data can be deleted!(?)
     :param header: comma separated list matched to input data columns to name variables. Can contain type suffix i.e.
      (float) - which is default, (text) - also to convert by specific converter, or (time) - for ISO format only
-    :param cols_load_list: comma separated list of names from header to be saved in hdf5 store. Do not use "/" char, or type suffixes like in ``header`` for them. Defaut - all columns
+    :param cols_load_list: comma separated list of names from header to be saved in hdf5 store. Do not use "/" char, or type suffixes like in ``header`` for them. Default - all columns
     :param cols_not_save_list: comma separated list of names from header to not be saved in hdf5 store
     :param skiprows_integer: skip rows from top. Use 1 to skip one line of header
     :param on_bad_lines: {{'error', 'warn', 'skip'}}, default 'error'. May be better to set "comment" argument to tune format?
     :param delimiter_chars: parameter of pandas.read_csv()
     :param max_text_width: maximum length of text fields (specified by "(text)" in header) for dtype in numpy loadtxt
-    :param chunksize_percent_float: percent of 1st file length to set up hdf5 store tabe chunk size
+    :param chunksize_percent_float: percent of 1st file length to set up hdf5 store table chunk size
     :param blocksize_int: bytes, chunk size for loading and processing csv
     :param corr_time_mode: if there is time that is not increased then modify time values trying to affect small number of values. This is different from sorting rows which is performed at last step after the checking table in database
     :param fun_date_from_filename: function(file_stem: str, century: Optional[str]=None) -> Any[compartible to input of pandas.to_datetime()]: to get date from filename to time column in it.
@@ -115,7 +115,7 @@ class ConfigInHdf5_Simple:
     :param tables_log: table name in hdf5 store to read data intervals. If not specified then will be "{}/logFiles" where {} will be replaced by current data table name
     :param dt_from_utc_hours: add this correction to loading datetime data. Can use other suffixes instead of "hours",
             default='0'
-    :param b_incremental_update: exclude processing of files with same name and which time change is not bigger than recorded in database (only prints ">" if detected). If finds updated version of same file then deletes all data which corresponds old file and after it brfore procesing of next files.
+    :param b_incremental_update: exclude processing of files with same name and which time change is not bigger than recorded in database (only prints ">" if detected). If finds updated version of same file then deletes all data which corresponds old file and after it before processing of next files.
             default='True'
     """
     db_path: Optional[str] = None  # if None load from
@@ -129,7 +129,7 @@ class ConfigInHdf5_Simple:
 class ConfigInHdf5(ConfigInHdf5_Simple):
     """
     Same as ConfigInHdf5_Simple + specific (CTD and navigation) data properties:
-    :param table_nav: table name in hdf5 store to add data from it to log table when in "find runs" mode. Use empty strng to not add
+    :param table_nav: table name in hdf5 store to add data from it to log table when in "find runs" mode. Use empty string to not add
             default='navigation'
     :param b_temp_on_its90: When calc CTD parameters treat Temp have red on ITS-90 scale. (i.e. same as "temp90"),
             default='True'
@@ -178,7 +178,7 @@ class ConfigOut(ConfigOutSimple):
     :param b_insert_separator: insert NaNs row in table after each file data end
     """
     table: str = 'navigation'
-    tables_log: List[str] = field(default_factory=list)  # overwrited parent
+    tables_log: List[str] = field(default_factory=list)  # overwritten parent
     b_insert_separator: bool = True
 
 
@@ -236,7 +236,7 @@ class ConfigFilterNav:
 class ConfigProgram:
     """
 
-    "program": program behaviour:
+    "program": program behavior:
 
     :param return_: one_of('<cfg_from_args>', '<gen_names_and_log>', '<end>')
         <cfg_from_args>: returns cfg based on input args only and exit,
@@ -502,10 +502,10 @@ def hydra_cfg_store(
     - keys: config group names
     - values: list of str, - group option names used for:
         - Yaml config files stems
-        - Dataclasses to use, - finds names constructed nealy like `Config{capwords(name)}` - must exist in
-          `module`.
+        - Dataclasses to use, - finds names constructed nearly like `Config{capwords(name)}` - must exist in
+        `module`.
         - setting 1st values item as default option for a group, name them 'base_{group_name}' where
-          group_name is current cs_store_group_options key.
+        group_name is current cs_store_group_options key.
     :param module: module where to search Dataclasses names, default: current module
     :return: (cs, Config)
     cs: ConfigStore
@@ -574,7 +574,11 @@ def main_init_input_file(cfg_t, cs_store_name, in_file_field='db_path', **kwargs
         n_paths = len(cfg_in['paths']) if cfg_in.get('paths') else None
         # with omegaconf.open_dict(cfg_in):
         if n_paths:
-            lf.info(f'Loading data from configured {n_paths} paths')
+            lf.info(
+                f"Loading data from configured {n_paths} paths"
+                if n_paths > 1 else
+                f"Loading data from {cfg_in['paths'][0]}"
+            )
         else:
             cfg_in['paths'], cfg_in['nfiles'], cfg_in['path'] = init_file_names(
                 **{**cfg_in, 'path': cfg_in[in_file_field]},
@@ -585,7 +589,7 @@ def main_init_input_file(cfg_t, cs_store_name, in_file_field='db_path', **kwargs
         cfg_t['in'] = cfg_in
         return cfg_t
     except FileNotFoundError as e:
-        print('Initialisation error:', standard_error_info(e), 'Calling arguments:', sys.argv)
+        print('Initialization error:', standard_error_info(e), 'Calling arguments:', sys.argv)
         raise
 
     cfg_t['in'] = cfg_in
@@ -615,7 +619,7 @@ def main_init(cfg: Mapping[str, Any], cs_store_name, __file__=None, ) -> Mapping
     try:
         print(OmegaConf.to_yaml({
             k0: ({k1: v1 for k1, v1 in v0.items() if v1}
-                 if hasattr(v0, 'items') else v0) for k0, v0 in cfg.items()
+                if hasattr(v0, 'items') else v0) for k0, v0 in cfg.items()
             }))
     except MissingMandatoryValue as e:
         lf.error(standard_error_info(e))
@@ -724,7 +728,7 @@ def main_call(
             #     f.flush()
             if config_path:
                 cmd_line_list_upd += [f'hydra.searchpath=["{config_path.as_posix().strip(chr(34))}"]']
-                # (strip user added quotation marks to ensure only one keeped)
+                # (strip user added quotation marks to ensure only one keep)
 
     # todo: check colorlog is installed before this:
     hydra_dir = (config_path / "log") if config_path else 'outputs'
@@ -776,14 +780,51 @@ def main_call(
                     # config.update(overrides)  # , force_add=True)
                     conf = OmegaConf.unsafe_merge(config, overrides)
                 # cfg = OmegaConf.create(overrides)
-                return (fun or my_hydra_module.main)(conf)
-
+                try:
+                    return (fun or my_hydra_module.main)(conf)
+                except Exception as e: # Exit at 1st err even if `multirun` opt
+                    # Set debug point here for postmortem debug
+                    lf.exception("Error. Exiting the entire process")
+                    sys.exit(1)  # non-zero status indicates failure.
 
             out = main_fun()
         else:
             out = fun()
-    except HydraException:
+    except HydraException as e:
         lf.exception('Check calling arguments!')
+        val0 = None
+        print('Command line arguments:')
+        for arg in sys.argv:
+            print(arg)
+            if config_path and arg.startswith("+defaults@_global"):
+                # We will try to load 1st config to check
+                key, vals = arg.split('=', 1)
+                val0 = vals.split(",", 1)[0]
+                if e.args[0].startswith("In 'defaults/"):
+
+                    yaml_with_err_name = e.args[0].split("'", 2)[1].split("/", 1)[1]
+                    if yaml_with_err_name in vals.split(","):
+                        print(
+                            "Trying erroneous config to check",
+                            "(1st)" if yaml_with_err_name[0] == val0 else ""
+                        )
+                        val0 = yaml_with_err_name
+                else:
+                    print('Trying load 1st config to check')
+                # argv_no_yaml = sys.argv.copy()
+                # argv_no_yaml.remove(arg)
+
+        if val0:
+            cfg_path0 = (config_path / 'defaults' / val0).with_suffix(".yaml")
+            try:
+                cfg_check = OmegaConf.load(cfg_path0)
+            except FileNotFoundError:
+                print(f"Sorry, config {cfg_path0} not found. Can not check")
+            else:
+                conf = to_omegaconf_merge_compatible(cfg_check, my_hydra_module.ConfigType)
+                from pprint import pprint
+                print("Try prune", yaml_with_err_name or "", "config to this:")
+                pprint(conf)
         return
     sys.argv = sys_argv_save
     return out

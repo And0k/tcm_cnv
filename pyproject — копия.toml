@@ -80,7 +80,6 @@ tqdm = "*"
 urllib3 = "*"
 xarray = "*"
 webdriver-manager = "*"
-pixi-kernel = "*"
 
 [tool.pixi.pypi-dependencies]
 absioras-tsm = { path = ".", editable = true }
@@ -101,6 +100,3 @@ start = "python tsm/incl_h5clc_hy.py"
 [build-system]
 build-backend = "hatchling.build"
 requires = ["hatchling"]
-
-[tool.hatch.build.targets.wheel]
-packages = ["./tcm"]

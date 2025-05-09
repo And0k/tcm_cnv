@@ -20,7 +20,7 @@ def mad(data, axis=None):
 
 # from scipy.signal import find_peaks_cwt
 # -----------------------------------------------------------------
-@njit
+
 def rep2mean(y, bOk=None, x=None):
     """
     Replaces bad indexes in y using numpy.interp()
@@ -36,9 +36,9 @@ def rep2mean(y, bOk=None, x=None):
         b = bOk
     try:
         if x is None:
-            x_bad = np.arange(len(y))  # , dtype=np.float_ not implemented in numba
-            x_ok = np.flatnonzero(b.astype(np.float_))
-            y_ok = np.extract(b.astype(np.float_), y)  # y[bOk]
+            x_bad = np.arange(len(y)).astype(np.float64)  # , dtype=np.float64 not implemented in numba
+            x_ok = np.flatnonzero(b.astype(np.float64))
+            y_ok = np.extract(b.astype(np.float64), y)  # y[bOk]
             return np.interp(x_bad, x_ok, y_ok)
         else:
             bad = np.logical_not(b)
@@ -61,6 +61,44 @@ def rep2mean(y, bOk=None, x=None):
 #    x[~bOk]= np.interp(np.arange(len(x)), np.flatnonzero(bOk), x[bOk], np.nan,np.nan)
 
 @njit
+def rep2mean_jit(y, bOk=None, x=None):
+    """
+    Replaces bad indexes in y using numpy.interp()
+    :param y:
+    :param bOk: logical not of bad indexes
+    :param x: same length as y or None
+    :return:
+    """
+    if bOk is None:
+        b = np.logical_not(
+            np.isnan(y)
+        )  # numba KeyError: Failed in nopython mode pipeline (step: ensure IR is legal
+        # prior to lowering) "more than one definition for 'bOk'"
+    else:
+        b = bOk
+    try:
+        if x is None:
+            x_bad = np.arange(len(y)).astype(np.float64)  # , dtype=np.float64 not implemented in numba
+            x_ok = np.flatnonzero(b.astype(np.float64))
+            y_ok = np.extract(b.astype(np.float64), y)  # y[bOk]
+            return np.interp(x_bad, x_ok, y_ok)
+        else:
+            bad = np.logical_not(b)
+            y[bad] = np.interp(x[bad], x[b], y[b])
+            return y
+    except Exception:  # ValueError as e:  # array of sample points is empty - replaced for numba
+        # l.exception('rep2mean error')
+        b = np.isfinite(y)
+        if bOk is not None:
+            b = np.logical_and(b, bOk)
+        if b.sum() == 0:
+            print("rep2mean can not replace NaNs")
+            return y + np.nan  # (np.nan if bOk is None else
+        else:  # may be 1 good point? - return constant
+            print("rep2mean: strange condition on Exception!")
+            return np.where(bOk if bOk is not None else b, y[b], np.nan)
+
+
 def b1spike(a, max_spike=0):
     """
     Single spike detection
@@ -76,6 +114,27 @@ def b1spike(a, max_spike=0):
 
     return b_single_spike_1(diff_x < -max_spike, diff_x > max_spike)
     # to do: try bOk[-1] = True; bOk = np.logical_or(bOk, np.roll(bOk, 1))
+
+@njit
+def b1spike_jit(a, max_spike=0):
+    """
+    Single spike detection
+    Note: change of a at edge bigger than max_spike is treated as spike too
+    :param a:
+    :param max_spike:
+    :return: bool array of where is spike in a
+    """
+    diff_x = np.diff(a)
+    b_single_spike_1 = lambda bad_u, bad_d: np.logical_or(
+        np.logical_and(np.append(bad_d, True), np.append(True, bad_u)),  # spike to down
+        np.logical_and(np.append(bad_u, True), np.append(True, bad_d)),
+    )  # spike up
+
+    return b_single_spike_1(diff_x < -max_spike, diff_x > max_spike)
+    # to do: try bOk[-1] = True; bOk = np.logical_or(bOk, np.roll(bOk, 1))
+
+
+
 
 @njit
 def b1spike_up(a, max_spike):
@@ -136,7 +195,7 @@ def i_move2good(ind, bad, side='left'):
 def contiguous_regions(b_ok):
     """
     Finds contiguous True regions of the boolean array "b_ok"
-    :param b_ok: 
+    :param b_ok:
     :return: 2D array where the first column is the start index of the region and the
     second column is the end index: [[start[0], end[0]] ... [start[-1], end[-1]]].
     If last element of b_ok is True then end[-1] is equal to len(b_ok)
@@ -414,7 +473,27 @@ def nondecreasing_b(t, longest_increasing_i):
         bok[start:stop] = True
     return bok
 
-@njit
+
+def update_trend_between(t, t_trend, b_keep):
+    """
+    Replaces t with trend of ``t_trend`` where b_keep is False
+    todo: remove duplicated code because this is a reimplemented repeated2increased(t, freq, b_keep):
+    :param t: original time array
+    :param t_trend: uniform incremented sequence like np.arange(tSt, tEn_calc, dt0, np.int64)
+    :param b_keep: elements to keep like np.ediff1d(t, to_begin=1) > 1 (boolean mask of increasing elements)
+    :return: _description_
+    Note: The algorithm can make some decreased elements (by value < dt0)!
+    """
+    # to begin incremented sequence everywhere at steps of real data w'll remove from t_trend this array:
+    t_rem = np.zeros(b_keep.size, dtype=np.int64)
+    t_rem[b_keep] = np.ediff1d(t_trend[b_keep], to_begin=t_trend[0])
+    t_rem = np.cumsum(t_rem)
+
+    # pprint(np.vstack(( bOk, t_add, np.ediff1d(t[iSt:iEn] + t_add, to_begin=0) )))
+    t += (t_trend - t_rem)
+
+
+# @njit: py12 err
 def repeated2increased(t: np.ndarray, freq: float, b_increased: Optional[np.ndarray] = None) -> np.ndarray:
     """
     Increases time resolution of only repeated or b_increased elements using constant frequency
@@ -424,16 +503,14 @@ def repeated2increased(t: np.ndarray, freq: float, b_increased: Optional[np.ndar
     :param b_increased: numpy.bool array, mask of the elements not requiring a change (adding time) if None then
     calculated using ``append(diff(t) != 0, True)`` - else provide result of this operation if you already have it
     :return: numpy.int64 ndarray
+    Globals used: dt64_1s = np.int64(1e9)
     """
-    # uses global dt64_1s = np.int64(1e9)
-
-
     # Trend addition corresponded to freq
 
     # njit-compatible and slightly less precise version of
     # np.linspace(0, len(t) * dt64_1s / freq, len(t), endpoint=False, ...):
     step = dt64_1s / freq
-    t_add = np.arange(0, stop=len(t) * step - 1, step=step, dtype=np.int64)
+    t_add = np.arange(0, stop=len(t) * step - 1, step=step, dtype=np.int64)  # -1 to never get len(t) size
     # indexes of changes + edges
     b_increased_provided = b_increased is not None
     if b_increased_provided:
@@ -459,9 +536,10 @@ def repeated2increased(t: np.ndarray, freq: float, b_increased: Optional[np.ndar
         if __debug__:
             # with objmode():
             #     l.debug(%gHz)
-            print('Increasing', round(100*(len(t) - n_inc_all)/len(t), 2),
-                  '% repeated elements for better time resolution using frequency f =', freq, 'Hz'
-                  )
+            print(
+                'Increasing', round(100*(len(t) - n_inc_all)/len(t), 2),
+                '% repeated elements for better time resolution using frequency f =', freq, 'Hz'
+            )
         # decrease trend for bad intervals
         n_rep = np.diff(i_inc_e)  # number of repeated elements + 1 (i.e. lengths of intervals with repeated values)
         steps_calc = np.diff(t[i_inc]) / n_rep[:-1]
@@ -488,13 +566,15 @@ def repeated2increased(t: np.ndarray, freq: float, b_increased: Optional[np.ndar
         t_sub[i_inc] = np.ediff1d(t_add[i_inc], to_begin=0)
         t_add -= np.cumsum(t_sub)
     else:
-        print('All elements (', len(t),
-              ') are the same! => Increasing them using constant frequency f =', freq, 'Hz')  # l.debug(%gHz)
+        print(
+            "All elements (", len(t), ") are the same! => Increasing them using constant frequency f =",
+            freq, "Hz",
+        )  # l.debug(%gHz)
     return t + t_add
 
 
 
-@njit
+# @njit: py12 err
 def rep2mean_with_const_freq_ends(y, b_ok, freq):
     b_bad = ~b_ok
     x = np.flatnonzero(b_bad)
@@ -503,17 +583,93 @@ def rep2mean_with_const_freq_ends(y, b_ok, freq):
     # interp keeps same values here:
     b_edges = (x < xp[0]) | (x > xp[-1])
     if b_edges.any():
-        b_bad[:] = True  # reusing variable. Meaning is inversed
+        b_bad[:] = True  # reusing variable. Its meaning is inversed
         b_bad[x[b_edges]] = False
         y = repeated2increased(y, freq, b_bad)
     return y
+
+
+def make_linear_with_shifts(
+        t: np.ndarray, freq: float,
+        linearize_accuracy_s: Optional[float] = None, b_increased: Optional[np.ndarray] = None
+) -> np.ndarray:
+    """
+    Corrects ``t`` values (implicitly) by make them linear with constant frequency and then shift to
+    original changing tim values where difference to obtained linear sequence is bigger than ``accuracy``
+    Note: can produce inversions!
+    Note: can be very slow!
+    :param t: numpy.int64 view of np.dtype('datetime64[ns]'), time to correct
+    :param freq:
+    :param linearize_accuracy_s: seconds, allowed output difference to ``t`` at increasing elements
+    :param b_increased: numpy.bool array, mask of the elements not requiring a change (adding time) if None then
+    calculated using ``append(diff(t) != 0, True)`` - else provide result of this operation if you already have it
+    :return: numpy.int64 ndarray
+    Globals used: dt64_1s = np.int64(1e9)
+    """
+    step = dt64_1s / freq
+
+    # Indexes of changes
+    if b_increased is not None:
+        i_inc = np.flatnonzero(b_increased, to_begin=0)
+    else:
+        i_inc = np.flatnonzero(np.ediff1d(t, to_begin=0) > 0)
+        n_bad = (np.ediff1d(t[i_inc]) < 0).sum()
+        if n_bad:  # spikes deletion
+            i_inc = longest_increasing_subsequence_i(i_inc)
+            print('Deleted possible minimum (', n_bad, ') time inversions!')
+    i0inc = i_inc[0]
+    # Ideal sequence
+    tim_st = t[i0inc] - step * i0inc  # to last element we add 1 to always include it:
+    tim = np.arange(tim_st, tim_st + t.size * (step - 1) + 1, step=step, dtype=np.int64)
+    # Get close to real sequence
+    if linearize_accuracy_s:
+        tim_add = np.zeros_like(tim)
+        errs = t[i_inc] - tim[i_inc]
+        big = linearize_accuracy_s * dt64_1s
+        b_big_errs = abs(errs) > big
+        j = b_big_errs.size - 1
+        # remove errors that leads to big value of current last element errs[j]
+        while b_big_errs[j]:
+            i = np.flatnonzero(errs[:j] > errs[j] - big)
+            if i.any():
+                i = i[-1]
+                errs[i:(j + 1)] -= errs[j]
+                j = i - 1
+                continue
+            break  # go to check negative big errors
+        else:
+            # If was no big errors, we assume any previous big errors must be just noise
+            return tim
+
+        # Check if some superfluous data inserted (so real frequency > freq)
+        b_big_errs = errs < -big
+        n_bad = b_big_errs.sum()
+        if n_bad:
+            # removing other (negative) big errors
+            print(
+                'Detected (', n_bad, ') case(s) of', -errs[b_big_errs]/dt64_1s,
+                's of bad data inserted, decreasing time there!'
+            )
+            while b_big_errs[j]:
+                i = np.flatnonzero((errs[:j] > errs[j] - big) & (errs[:j] < big - errs[j]))
+                if i.any():
+                    i = i[-1]
+                    errs[i:(j + 1)] -= errs[j]
+                    j = i - 1
+                    continue
+                break
+        tim_add[i_inc] = np.ediff1d(errs, to_begin=errs[0])
+        tim += np.cumsum(tim_add)
+
+    return tim
 
 
 #@njit
 def make_linear(tim: np.int64, freq: float, dt_big_hole: Optional[timedelta] = None) -> np.ndarray:
     """
     Corrects tim values (implicitly) by make them linear increasing but excluding big holes
-    Note: can shift bigger than dt_big_hole, warning will be dispalyed!
+    Note: Not works (big errors) for changing frequency (if no gaps between frequency changes)!
+    Note: can shift bigger than dt_big_hole, warning will be displayed!
     :param: tim - time with some deviated frequency
     :param: freq - frequency [Hz] for output
     :param: dt_big_hole - min time interval that will be kept, that is time precision. Default: min(2s, 2s/freq)
@@ -523,9 +679,9 @@ def make_linear(tim: np.int64, freq: float, dt_big_hole: Optional[timedelta] = N
     Prints:
     - '`' when after filling interval with constant frequency last element shifted less than hole*2,
     - '.' for big errors detected.
-
     """
     # uses global dt64_1s = np.int64(1e9)
+
     dt0 = np.int64(dt64_1s / freq)  # int64, delta time of 1 count
     # Convert/set time values in int64 units
     if dt_big_hole is None:
@@ -534,7 +690,10 @@ def make_linear(tim: np.int64, freq: float, dt_big_hole: Optional[timedelta] = N
         dt_big_hole = np.int64(dt_big_hole.total_seconds()) * dt64_1s
 
     if __debug__:
-        print('Linearise time using reference frequency', freq, '(between holes >', round(dt_big_hole/dt64_1s, 2), 's)')
+        print(
+            "Linearize time using reference frequency", freq,
+            "(between holes >", round(dt_big_hole / dt64_1s, 2), "s)",
+        )
 
     # find big holes and add at start and end
     d = np.ediff1d(tim, to_begin=dt_big_hole + 1, to_end=dt_big_hole + 1)  # how value changed
@@ -557,14 +716,14 @@ def make_linear(tim: np.int64, freq: float, dt_big_hole: Optional[timedelta] = N
     #@njit  # Untyped global name 'njit': cannot determine Numba type of <class 'function'>
     def i_j_yi_yj_yec_yee(i, j, y, dt0=dt0):
         """
-        Some values for processing each hole in cycle of for_tim(): i,j,y[i],y[j-1],aproximated_y[j-1] using dt, y[j-1] - aproximated_y[j-1]
+        Return values for processing each hole in cycle of for_tim()
         :param i: current index
         :param j: last index + 1 (i.e. start of next interval), useful as it will be used for end of slice
         :param y: time
         :param dt0: int64, delta time of 1 count
         :return: (i, j, y[i], y[j], yend_clc, yend_err) where:
-            yend_clc: calculated last time
-            yend_err: difference between calculated and given last time = (yj - yend_clc)
+        - yend_clc: calculated last time i.e. approximated y[j-1]
+        - yend_err: difference between calculated and given last time = (yj - yend_clc) i.e. y[j-1] - approximated y[j-1]
         """
         yi = y[i]        # cur  y
         yj = y[j - 1]    # last y
@@ -572,7 +731,7 @@ def make_linear(tim: np.int64, freq: float, dt_big_hole: Optional[timedelta] = N
         j = np.int64(j)  # and to prevent possible similar errors when will be operations with outputs
         yend_clc = yi + (j - 1 - i) * dt0  # time expected in last point
         yend_err = yj - yend_clc  # error in time
-        # max limit for np.arange, so make it a little bigger than end of result array:
+        # max limit for ``numpy.arange`` to construct approximated array need to be a little bigger:
         yend_clc += np.int64(dt0 / 2)
         return (i, j, yi, yj, yend_clc, yend_err)
 
@@ -591,7 +750,7 @@ def make_linear(tim: np.int64, freq: float, dt_big_hole: Optional[timedelta] = N
         :prints: '`'/'.' when correcting small/big nonlinearity in interval
         """
         dt0new_prev = 0
-        
+
         #nonlocal dt0  # to not search the local namespace first numba not implements
         for iSt, iEn, tSt, tEn, tEn_calc, tEn_err in zip(*i_j_yi_yj_yec_yee(i_st_h[:-1], i_st_h[1:], t)):
             tEn_err_abs = abs(tEn_err)
@@ -607,25 +766,16 @@ def make_linear(tim: np.int64, freq: float, dt_big_hole: Optional[timedelta] = N
                 # ValueError: could not broadcast input array from shape (1048) into shape (1044)
             else:  # big correction errors because of not uniformly distributed data inside interval
                 if tEn_err > 0:
-                    # Some data lost inside [iSt,iEn] -> do reimplemented repeated2increased(t[iSt:iEn], freq, bOk)
-
+                    # Some data lost inside [iSt,iEn]
                     if __debug__:
                         print('.', end='')
-                    # todo: remove duplicated code
-                    # add increasing trend (equal to period dt0/counts) where time is not change
-                    # Note: The algorithm can make some decreased (by value < dt0) elements!
-                    dt_cur = np.ediff1d(t[iSt:iEn], to_begin=1)
-                    bOk = (dt_cur > 0)
-                    t_add = np.arange(tSt, tEn_calc, dt0, np.int64)  # uniform incremented sequence
-                    # to begin incremented sequence everywhere at steps of real data w'll remove from t_add this array:
-                    t_rem = np.zeros(bOk.size, dtype=np.int64)
-                    t_rem[bOk] = np.ediff1d(t_add[bOk], to_begin=t_add[0])
-                    t_rem = np.cumsum(t_rem)
-                    t_add -= t_rem
-                    # pprint(np.vstack(( bOk, t_add, np.ediff1d(t[iSt:iEn] + t_add, to_begin=0) )))
-                    t[iSt:iEn] += t_add
+                    update_trend_between(
+                        t[iSt:iEn],
+                        t_trend=np.arange(tSt, tEn_calc, dt0, np.int64),
+                        b_keep=np.ediff1d(t[iSt:iEn], to_begin=1) > 0
+                    )
 
-                    # # Must not too many recursive: this hang mycomp!
+                    # # Must not too many recursive: this hang my comp!
                     # t_try = np.arange(tSt, tEn_calc, dt0, np.int64)
                     # t_err = t[iSt:iEn] - t_try
                     # # break current interval: retain max|last data hole and repeat
@@ -640,7 +790,7 @@ def make_linear(tim: np.int64, freq: float, dt_big_hole: Optional[timedelta] = N
                 else:
                     # Increasing frequency for this interval (better freq. estimation for interval).
                     # But may be repeated data exist? - Check manually!
-                    
+
                     # First and last changed values in current interval to calc updated freq:
                     dt_cur = np.ediff1d(t[iSt:iEn], to_end=0)
                     b_inc = dt_cur > 0
@@ -648,7 +798,7 @@ def make_linear(tim: np.int64, freq: float, dt_big_hole: Optional[timedelta] = N
                         b_exclude = False
                     else:
                         iSt_ch = np.argmax(dt_cur > 0)   # np.int64(np.searchsorted(dt_cur > 0, 0.5))
-                        iEn_ch = len(dt_cur) - np.argmax(np.flip(dt_cur > 0, 0) > 0)   # np.int64(np.searchsorted(np.flip(dt_cur > 0, 0), 0.5)) # finds on right side!
+                        iEn_ch = len(dt_cur) - np.argmax(np.flip(dt_cur > 0, 0) > 0)  # last change
                         b_exclude = iEn_ch > iSt_ch  # can not use changed values if changed only one or less
                     if b_exclude:  # Excluding repeated values at edges
                         dt0new = (t[iEn_ch] - t[iSt_ch]) / (iEn_ch - iSt_ch)
@@ -657,7 +807,7 @@ def make_linear(tim: np.int64, freq: float, dt_big_hole: Optional[timedelta] = N
                     else:
                         dt0new = (tEn - tSt) / (iEn - 1 - iSt)
                         tEn_calc = tEn
-                    if dt0new_prev != dt0new:
+                    if dt0new_prev != dt0new:  # Show new frequency for iSt - iEn rows that we increased
                         print(
                             f'ref.freq' if dt0new_prev == 0 else '', f'> {dt64_1s / dt0new:g}Hz for',
                             iSt, '-', iEn, 'rows', end=', '
@@ -665,7 +815,9 @@ def make_linear(tim: np.int64, freq: float, dt_big_hole: Optional[timedelta] = N
                         dt0new_prev = dt0new
                     else:
                         print(f'for', iSt, '-', iEn, 'rows', end=', ')
-                    t[iSt:iEn] = np.arange(tSt, tEn_calc + np.int64(dt0new / 2), dt0new, np.int64)  #
+                    t[iSt:iEn] = np.arange(tSt, tEn_calc + np.int64(dt0new / 2), dt0new, np.int64)
+
+                #
                 # iBad = np.flatnonzero(abs(tim_err) > dt_big_hole)
 
                 # tim[iSt:iEn] = tim_try
@@ -852,7 +1004,7 @@ def inearestsorted_around(array: np.ndarray, values) -> np.ndarray:
     Returned values useful as indexes for linear interpolation of data associated with values.
     :param array:  numpy array where to search
     :param values: numpy array to which values need to find nearest
-    :return: found indexes of length <= len(values)
+    :return: found indexes of length <= len(values) as repeated values will be removed
     """
     if not array.size:
         return []
@@ -887,10 +1039,10 @@ def search_sorted_closest(sorted_array, value):
 #
 
 
-@njit()
+# @njit()  # py12 error
 def find_sampling_frequency(tim: np.ndarray,
                             precision: float = 0,
-                            b_show: bool = True) -> Tuple[np.float_, int, int, np.ndarray]:
+                            b_show: bool = True) -> Tuple[np.float64, int, int, np.ndarray]:
     """
     Function tries to find true frequency inside packets.
     Finds highest frequency of irregular array _tim_ with specified precision.
@@ -937,7 +1089,7 @@ def find_sampling_frequency(tim: np.ndarray,
         # ignore all this:
         # - joined different data in backward order
         # - data with different frequencies
-        bad = b1spike(tim)
+        bad = b1spike_jit(tim)
         dt = np.ediff1d(tim[~bad].view(np.int64), to_end=1)
         bad = dt < 0
         bAnyDecreased = bad.any()
@@ -945,13 +1097,13 @@ def find_sampling_frequency(tim: np.ndarray,
             dt = dt[~bad]
             n_dec = bad.sum()
             print(n_dec, 'time inversions that are not single spikes!')
-            
+
         b_ok = dt > 0  # filtered increased positions
-        i_inc = np.flatnonzero(b_ok)  
+        i_inc = np.flatnonzero(b_ok)
     else:
         i_inc = i_inc_out
-    
-    
+
+
     # Find freq
 
     n_inc = b_ok.sum()

@@ -4,24 +4,31 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from ruamel.yaml import YAML
+from typing import List
+
 from h5inclinometer_coef import h5copy_coef
 
 yaml = YAML()
 yaml.indent(mapping=2, sequence=4, offset=2)
 
 import numpy as np
-from numpy.polynomial.polynomial import polyval2d
+# from numpy.polynomial.polynomial import polyval2d
 
-def poly_str2list(poly_str):
+def poly_str2list(poly_str) -> List[float]:
+    """
+    Converts a polynomial string like 'A + B * u - C * t - D * u**2 + E * u * t + F * t**2' to a list of polynomial coefficients like [A, B, C, D, E, F]
+    :param poly_str: The polynomial string containing coefficients and terms represented by letters
+    :return: A list of polynomial coefficients parsed from the input string
+    """
     str_splitted = poly_str.split(' ')
-    coefs = [float(str_splitted[0])]
+    coefs = [float(str_splitted[0])]  # A
     v = None
     for s in str_splitted[1:]:
         if s in ('+', '-'):
             v = s
             continue
         elif v is not None:
-            coefs.append(float(''.join([v, s])))
+            coefs.append(float(''.join([v, s])))  # B, C, D, E, F
         v = None
     return coefs
 

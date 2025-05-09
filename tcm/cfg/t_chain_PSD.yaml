@@ -1,0 +1,17 @@
+# output configuration after loading csv:
+in:
+  db_path: 'C:\Work\_\t-chain\240625isolines(t)@TCm1,2.h5'
+  tables: ['isolines_t.*']
+  overlap: 0.5
+  chunksize: 1000000         # 'chunksize_percent': 10,  # we'll repace this with burst size if it suit
+  # min_date: 2019-07-21T20:00:00Z
+  # max_date: 2019-08-18T01:45:00Z
+  fs: 0.016666666666666666  # 60s
+out:
+  db_path: 'C:\Work\_\t-chain\240625isolines(t)_PSD@TCm1,2.h5'
+  table: 'psd'
+  split_period: '24h'         # pandas offset string (2h, h, T, S, ms, U...) ['D' ]
+
+program:
+  log: 'log/t_chain_PSD.log'  # str(scripts_path /
+  verbose: 'DEBUG'

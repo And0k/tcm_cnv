@@ -117,9 +117,9 @@ for probes in 'inclinometers'.split():  # 'inclinometers wavegauges', 'inclinome
     else:
         # cfg_d.main_call(['--info', 'defaults'], fun=incl_h5clc_hy.main)
         coefs_path = Path(
-            # r'd:\Work\_Python3\And0K\h5toGrid\inclinometer\tests\data\inclinometer\incl#b.h5'
+            # r'C:\Work\Python\AB_SIO_RAS\h5toGrid\inclinometer\tests\data\inclinometer\incl#b.h5'
             # r'd:\WorkData\~configuration~\inclinometer\190710incl_no_pid&string_date.h5'
-            r'd:\WorkData\~configuration~\inclinometer\190710incl.h5'
+            r'C:\Work\Python\AB_SIO_RAS\tcm\tcm\cfg\coef\190710incl.h5'
             # r'd:\WorkData\_experiment\inclinometer\230428_stand,tank,pres@ip1-6\_raw\230428tank.raw.h5'
         ).as_posix()
         for aggr in aggregate_period_s[probes]:

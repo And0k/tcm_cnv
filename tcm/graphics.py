@@ -24,9 +24,8 @@ if True:  # __debug__:
 
     matplotlib.rcParams['axes.linewidth'] = 1.5
     matplotlib.rcParams['figure.figsize'] = (16, 7)
-    try:
-        matplotlib.use(
-            'Qt5Agg')  # must be before importing plt (rases error after although documentation sed no effect)
+    try:  # must be before importing plt (raises error after although documentation sed no effect)
+        matplotlib.use('Qt5Agg')
     except ImportError:
         pass
     from matplotlib import pyplot as plt
@@ -212,7 +211,7 @@ def plot_prepare_input(ax,
     plt_select.finish = False
     plt_select.x_range_arr[:] = 0
     toggle_selector.RS = matplotlib.widgets.RectangleSelector(  # drawtype is 'box' or 'line' or 'none'
-        ax, callback, drawtype='box', useblit=True,
+        ax, callback, useblit=True,  # , drawtype='box'
         button=[1, 3],  # don't use middle button
         minspanx=5, minspany=5, spancoords='pixels', interactive=True)
     plt.connect('key_press_event', toggle_selector)

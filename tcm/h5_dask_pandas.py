@@ -7,6 +7,7 @@
 
 from glob import escape as glob_escape
 import logging
+from datetime import timedelta
 from pathlib import Path
 import re
 from typing import Any, Dict, Iterable, Iterator, Mapping, MutableMapping, Optional, Sequence, Tuple, Union
@@ -48,6 +49,7 @@ def h5_load_range_by_coord(
     :param chunksize,
     :param sorted_index: bool (optional), default True
     :param columns: passed without change to dask.read_hdf()
+    :param kwargs: not used
     """
 
     db_path_esc = glob_escape(db_path) if isinstance(db_path, Path) else db_path  # need for dask, not compatible with pandas if path contains "["
@@ -106,6 +108,7 @@ def h5_load_range_by_coord(
 
         # because of no 'sorted_index' we need:
         ddpart = ddpart.reset_index().set_index(ddpart.index.name or 'index', sorted=sorted_index)  # 'Time'
+
     return ddpart
 
 
@@ -135,9 +138,11 @@ def i_bursts_starts_dd(tim, dt_between_blocks: Optional[np.timedelta64] = None):
     dtime = np.diff(tim.base)
     if dt_between_blocks is None:
         # auto find it: greater interval than min of two first + constant.
-        # Some intervals may be zero (in case of bad time resolution) so adding constant enshures that intervals between blocks we'll find is bigger than constant)
-        dt_between_blocks = (dtime[0] if dtime[0] < dtime[1] else dtime[1]) + np.timedelta64(1,
-                                                                                             's')  # pd.Timedelta(seconds=1)
+        # Some intervals may be zero (in case of bad time resolution) so adding constant ensures that
+        # intervals between blocks we'll find is bigger than constant)
+        dt_between_blocks = (dtime[0] if dtime[0] < dtime[1] else dtime[1]) + np.timedelta64(
+            1, "s"
+        )
 
     # indexes of burst starts
     i_burst = np.append(0, np.flatnonzero(dtime > dt_between_blocks) + 1)
@@ -156,9 +161,9 @@ def i_bursts_starts_dd(tim, dt_between_blocks: Optional[np.timedelta64] = None):
 
 
 # @+node:korzh.20180520212556.1: *4* i_bursts_starts
-def i_bursts_starts(tim, dt_between_blocks: Optional[np.timedelta64] = None) -> Tuple[np.array, int, np.timedelta64]:
+def i_bursts_starts(tim, dt_between_blocks: Optional[np.timedelta64 | timedelta] = None) -> Tuple[np.array, int, np.timedelta64]:
     """
-    Starts of bursts in datafreame's index and mean burst size by calculating difference between each index value
+    Starts of bursts in dataframe's index and mean burst size by calculating difference between each index value
     :param: tim, pd.datetimeIndex
     :param: dt_between_blocks, pd.Timedelta or None or np.inf - minimum time between blocks.
             Must be greater than delta time within block
@@ -191,16 +196,26 @@ def i_bursts_starts(tim, dt_between_blocks: Optional[np.timedelta64] = None) -> 
     # Checking time is increasing
 
     if np.any(dtime <= dt_zero):
-        lf.warning('Not increased time detected ({:d}+{:d}, first at {:d})!',
-                  np.sum(dtime < dt_zero), np.sum(dtime == dt_zero), np.flatnonzero(dtime <= dt_zero)[0])
+        lf.warning(
+            "Not increased time detected ({:d}+{:d}, first at {:d})!",
+            np.sum(dtime < dt_zero),
+            np.sum(dtime == dt_zero),
+            np.flatnonzero(dtime <= dt_zero)[0],
+        )
     # Checking dt_between_blocks
     if dt_between_blocks is None:
-        # Auto find it: greater interval than min of two first + constant. Constant = 1s i.e. possible worst time
-        # resolution. If bad resolution then 1st or 2nd interval can be zero and without constant we will search everything
+        # Auto find it: greater interval than min of two first + constant. Constant = 1s i.e. possible worst
+        # time resolution. If bad resolution then 1st or 2nd interval can be zero and without constant we will
+        # search everything
         dt_between_blocks = dtime[:2].min() + np.timedelta64(1, 's')
     elif isinstance(dt_between_blocks, pd.Timedelta):
         dt_between_blocks = dt_between_blocks.to_timedelta64()
-    elif dt_between_blocks is np.inf:
+    elif isinstance(dt_between_blocks, timedelta):
+        dt_between_blocks = np.timedelta64(int(dt_between_blocks.total_seconds()), 's')
+        max_delta_ns = np.timedelta64((1 << 63) - 1, 'ns')
+        if dt_between_blocks > max_delta_ns.astype('m8[s]'):  # dt_between_blocks is infinite
+            return np.int32([0]), len(tim), max_hole
+    elif dt_between_blocks is np.inf:  # dt_between_blocks is infinite
         return np.int32([0]), len(tim), max_hole
 
     # Indexes of burst starts
@@ -208,7 +223,8 @@ def i_bursts_starts(tim, dt_between_blocks: Optional[np.timedelta64] = None) -> 
 
     # Calculate mean_block_size
     if i_burst.size:
-        if i_burst.size > 1:  # amount of data is sufficient to not include edge (likely part of burst) in statistics
+        if i_burst.size > 1:
+            # amount of data is sufficient to not include edge (likely part of burst) in statistics
             mean_burst_size = np.mean(np.diff(i_burst))
         elif len(i_burst) == 1:  # select biggest of two burst parts we only have
             i_burst_st = i_burst[0] + 1
@@ -253,7 +269,7 @@ def filterGlobal_minmax(a, tim=None, cfg_filter=None, b_ok=True, not_warn_if_no_
     """
     Filter min/max limits
     :param a:           numpy record array or Dataframe
-    :param tim:         time array (convrtable to pandas Datimeinex) or None then use a.index instead
+    :param tim:         time array (convertible to pandas Datimeindex) or None then use a.index instead
     :param cfg_filter:  dict with keys max_'field', min_'field', where 'field' must be
      in _a_ or 'date' (case insensitive)
     :param b_ok: initial mask - True means not filtered yet <=> da.ones(len(tim), dtype=bool, chunks = tim.values.chunks) if isinstance(a, dd.DataFrame) else np.ones_like(tim, dtype=bool)  # True #
@@ -262,7 +278,7 @@ def filterGlobal_minmax(a, tim=None, cfg_filter=None, b_ok=True, not_warn_if_no_
 
     def filt_max_or_min(array, lim, v):
         """
-        Emplicitly logical adds new check to b_ok
+        Implicitly adds new check to b_ok
         :param array: numpy array or pandas series to filter
         :param lim:
         :param v:
@@ -367,8 +383,16 @@ def filter_global_minmax(a: Union[pd.DataFrame, dd.DataFrame],
                     # cf[lim_key] = pd.Timestamp(val, tz='UTC')
                     val = f"'{add_tz_if_need(val, a[col])}'"
             except KeyError:
-                lf.warning('filter warning: no column "{}"!'.format(key))
-                continue
+                if key[0] == '`':
+                    key_orig = key.lower().strip('`')
+                    try:
+                        col = f"`{cols[key_orig.lower()]}`"
+                    except KeyError:
+                        lf.warning('filter warning: no column "{}"!'.format(key))
+                        continue
+                else:
+                    lf.warning('filter warning: no column "{}"!'.format(key))
+                    continue
 
         # Add expression to query string
         qstrings.append(f"{col}{'>' if lim == 'min' else '<'}{val}")
@@ -422,9 +446,7 @@ def filter_local(d: Union[pd.DataFrame, dd.DataFrame, Mapping[str, pd.Series], M
     return d
 
 
-def filter_local_arr(d: Mapping[str, Sequence],
-                 cfg_filter: Mapping[str, Any]
-                 ) -> Mapping[str, np.ndarray]:
+def filter_local_arr(d: Mapping[str, Sequence], cfg_filter: Mapping[str, Any]) -> Mapping[str, np.ndarray]:
     """
     Same as filter_local but for dict of arrays
     Filtering values without changing output size: set to NaN if exceed limits
@@ -587,6 +609,7 @@ def dd_to_csv(
         text_columns=None,
         suffix='',
         single_file_name=True,
+        b_overwrite=True,
         progress=None, client=None,
         b_continue=False
         ):
@@ -599,12 +622,14 @@ def dd_to_csv(
     :param text_date_format: If callable then create "Date" column by calling it (dd.index), retain index only
     if "Time" in text_columns. If string use it as format for index (Time) column
     :param text_columns: optional
-    :param suffix: str, will be added to filename with forbidden characters removed/replaced
+    :param suffix: str, will be added to output file name with forbidden characters removed/replaced
     :param single_file_name:
-    - True or str: save all to one file of this name if str or to autogenerated name if True
+    - True or Path/str: save all to one file of this name if str or to autogenerated name if True
     - False: generate name for each `d` partition individually and save each to separate file
+    # :param b_overwrite: if False and not `b_continue` then return None if out path or 1st chunk is file, log info of skipping the overwrite
     :param progress: progress bar object, used with client
     :param client: dask.client, used with progress
+    :return path: Path if not text_path is None else None
     """
     if text_path is None:
         return
@@ -617,30 +642,45 @@ def dd_to_csv(
         dir_create_if_need(text_path)
 
         def comb_path(dir_or_prefix, s):
-            return str(dir_or_prefix / s)
+            return dir_or_prefix / s
     except:
         lf.exception('Dir not created!')
 
         def comb_path(dir_or_prefix, s):
-            return f'{dir_or_prefix}{s}'
+            return Path(f'{dir_or_prefix}{s}')
 
     def name_that_replaces_asterisk(i_partition):
         return f'{d.divisions[i_partition]:%y%m%d_%H%M}'
     # too long variant: '{:%y%m%d_%H%M}-{:%H%M}'.format(*d.partitions[i_partition].index.compute()[[0,-1]])
 
     suffix_mod = re.sub(r'[\\/*?:"<>\.]', '', suffix.replace('|', ',').replace('{}', 'all'))
-    filename = Path(single_file_name if isinstance(single_file_name, str) else (
+    path = Path(single_file_name) if isinstance(single_file_name, str) else (
+        single_file_name if isinstance(single_file_name, Path) else
         comb_path(
-            text_path,
-            f"{name_that_replaces_asterisk(0) if single_file_name else '*'}{suffix_mod}{ext}")
-    ))
+                text_path,
+                f"{name_that_replaces_asterisk(0) if single_file_name else '*'}{suffix_mod}{ext}"
+        )
+    )
+
+
+    if not b_overwrite:
+        if (not b_continue) and path.is_file():
+            lf.info("skipping existed {}", Path(*path.parts[-2:]))
+            return
+        elif not single_file_name:
+            path0 = path.parent / path.name.replace("*", name_that_replaces_asterisk(0))
+            lf.info(
+                "skipping existed {}{}",
+                Path(*path0.parts[-2:]),
+                f" and next {d.npartitions} parts" if d.npartitions > 1 else "",
+            )
+            return
+
     lf.info(
         "Saving{} *{:s}: {}",
         " (continue)" if b_continue else "",
         ext,
-        Path(*filename.parts[-2:]) if b_continue else
-        "1 file" if single_file_name else
-        f"{d.npartitions} files",
+        Path(*path.parts[-2:]) if b_continue or single_file_name else f"{d.npartitions} files"
     )
 
     d_out = d.round({'Vdir': 4, 'inclination': 4, 'Pressure': 3})
@@ -673,7 +713,7 @@ def dd_to_csv(
     if b_continue and single_file_name:
         # Append
         d_out = d_out.compute()  # using pandas because can not append using dask
-        with Path(filename).open(mode='a', newline='') as hfile:
+        with path.open(mode='a', newline='') as hfile:
             d_out.to_csv(
                 path_or_buf=hfile,
                 header=False,
@@ -684,15 +724,14 @@ def dd_to_csv(
             pbar = ProgressBar(dt=10)
             pbar.register()
 
-        # with dask.config.set(scheduler='processes'):  # need because saving to csv mainly under GIL
         to_csv = d_out.to_csv(
-            filename=filename,
+            filename=path,
             single_file=bool(single_file_name),
             name_function=None if single_file_name else name_that_replaces_asterisk,  # 'epoch' not works
             **args_to_csv,
             compute=False,
-            compute_kwargs={'scheduler': 'processes'},
-            chunksize=200000  # -1 not works: auto distribute between workers: prevent write by one row (very long)
+            compute_kwargs={'scheduler': 'processes'},  # need because saving to csv mainly under GIL
+            chunksize=200000  # -1 not works: auto distribute between workers: prevent write by one row (slow)
         )
         # disabling the chain assignment pandas option made my ETL job go from running out of memory after
         # 90 minutes to taking 17 minutes! I think we can close this issue since its related to pandas - not helps:
@@ -707,4 +746,4 @@ def dd_to_csv(
             progress(futures)
             # to_csv.result()
             client.gather(futures)
-    return filename
+    return path

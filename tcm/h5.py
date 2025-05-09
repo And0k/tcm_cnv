@@ -37,8 +37,6 @@ from tables import NaturalNameWarning
 from tables.exceptions import HDF5ExtError, ClosedFileError, NodeError
 from tables.scripts.ptrepack import main as ptrepack
 
-if __debug__:
-    from matplotlib import pyplot as plt
 warnings.catch_warnings()
 warnings.simplefilter("ignore", category=NaturalNameWarning)
 # warnings.filterwarnings('ignore', category=tables.NaturalNameWarning)
@@ -60,6 +58,12 @@ pd.set_option("io.hdf.default_format", "table")
 # pd.pandas.set_option('display.max_columns', None)  # for better debug display
 lf = LoggingStyleAdapter(logging.getLogger(__name__))
 
+
+if __debug__:
+    try:
+        from matplotlib import pyplot as plt
+    except ImportError:
+        lf.warning("matplotlib not installed, but may be needed for display data")
 
 def main():
     """
@@ -100,16 +104,16 @@ def main():
                     args.chunkDays = 1
                 if str_where:  # s=str_where[0]
                     Term = []
-                    bWate = False
+                    b_wait = False
                     for s in str_where:
-                        if bWate:
+                        if b_wait:
                             if s[-1] == '"':
-                                bWate = False
+                                b_wait = False
                                 Term[-1] += f" {s[:-1]}"
                             else:
                                 Term[-1] += f" {s}"
                         elif s[0] == '"':
-                            bWate = True
+                            b_wait = True
                             Term.append(s[1:])
                         else:
                             Term.append(s)
@@ -161,6 +165,8 @@ if __name__ == "__main__":
 
 
 def unzip_if_need(lst_of_lsts: Iterable[Union[Iterable[str], str]]) -> Iterator[str]:
+    if isinstance(lst_of_lsts, set):
+        lst_of_lsts = sorted(lst_of_lsts)
     for lsts in lst_of_lsts:
         if isinstance(lsts, str):
             yield lsts
@@ -174,6 +180,8 @@ def unzip_if_need_enumerated(lst_of_lsts: Iterable[Union[Iterable[str], str]]) -
     :param lst_of_lsts:
     :return:
     """
+    if isinstance(lst_of_lsts, set):
+        lst_of_lsts = sorted(lst_of_lsts)
     for lsts in lst_of_lsts:
         if isinstance(lsts, str):
             yield (0, lsts)
@@ -254,133 +262,6 @@ def find_tables(store: pd.HDFStore, pattern_tables: str, parent_name=None) -> Li
     return tables
 
 
-def sort_pack(
-    path: str,
-    out_name: str,
-    table_node: str,
-    arguments: Optional[Sequence[str]] = None,
-    addargs: Optional[Sequence[str]] = None,
-    b_remove: Optional[bool] = False,
-    col_sort: Optional[str] = "index",
-):
-    """
-    Compress and save table (with sorting by index) from hdf5 file at `path` to hdf5 with `out_name` using
-    ``ptprepack`` utility. Output hdf5 file can contain other tables.
-    :param path: - hdf5 source full file name
-    :param out_name: base file name + ext of cumulative hdf5 store only. Name should be different to that in
-    source path
-    :param table_node: node name in hdf5 source file
-    :param arguments: list, 'fast' or None. None is equal to ['--chunkshape=auto',
-        '--complevel=9', '--complib=zlib',f'--sortby={col_sort}', '--overwrite-nodes']
-    :param addargs: list, extend arguments with more parameters
-    :param b_remove: hdf5 source file will be deleted after operation!
-    :param col_sort:
-    :return: full path of cumulative hdf5 store
-    Note: ``ptprepack`` not closes hdf5 source if not finds data!
-    """
-
-    h5dir, h5source = os_path.split(path)
-    h5out_path = os_path.join(h5dir, out_name)
-    if not table_node:
-        return h5out_path
-    print(f"sort&pack({table_node}) to {out_name}")
-    path_prev = os_getcwd()
-    argv_prev = sys.argv.copy()
-    os_chdir(h5dir)  # os.getcwd()
-    try:  # Extend selected default set of arguments
-        if arguments == "fast":  # bRemove= False, bFast= False,
-            arguments = ["--chunkshape=auto", "--overwrite-nodes", "--dont-regenerate-old-indexes"]
-            if addargs:
-                arguments.extend(addargs)
-        else:
-            if arguments is None:
-                arguments = [
-                    "--checkCSI",
-                    "--chunkshape=auto",
-                    "--propindexes",
-                    "--complevel=9",
-                    "--complib=zlib",
-                    f"--sortby={col_sort}",
-                    "--overwrite-nodes",
-                ]
-            if addargs:
-                arguments.extend(addargs)
-        # arguments + [sourcefile:sourcegroup, destfile:destgroup]
-        sys.argv[1:] = arguments + [f"{h5}:/{table_node}" for h5 in (h5source, out_name)]
-        # --complib=blosc --checkCSI=True
-
-        ptrepack()
-        # then copy children  # '--non-recursive' requires sys.argv[1:] = arguments + [f'{h5source}:/{table_node}/table', f'{out_name}:/{table_node}/table'] i.e. can not copy indexes
-        # with pd.HDFStore(h5out_path, 'a') as store_out, pd.HDFStore(path, 'r') as store_in:
-        #     parent_group_in = store_in.get_storer(f'/{table_node}').group
-        #     parent_group_out = store_out.get_storer(f'/{table_node}').group
-        #     parent_group_in._f_copy_children(parent_group_out, overwrite=True)
-        # nodes = parent_group.__members__
-        # childs = [f'/{table_node}/{g}' for g in nodes if (g != 'table') and (g != '_i_table')]
-        # if childs:
-        #     lf.info('found {} children of {}. Copying...', len(childs), table_node)
-        #     for i, tbl in enumerate(childs):
-        #         store_in._handle.move_node(tbl,
-        #                                              newparent=f'/{self.temp_group}',
-        #                                              createparents=True,
-        #                                              overwrite=True)
-
-    except Exception as e:
-        tbl_cur = "ptrepack failed!"
-        try:
-            if f"--sortby={col_sort}" in arguments:
-                # check that requirement of fool index is recursively satisfied
-                with pd.HDFStore(path) as store:
-                    print("Trying again:\n\t1. Creating index for all childs not having one...")
-                    nodes = store.get_node(table_node).__members__
-                    for n in nodes:
-                        tbl_cur = table_node if n == "table" else f"{table_node}/{n}"
-                        try:
-                            store_tbl = store.get_storer(tbl_cur)
-                        except AttributeError:
-                            raise HDF5ExtError(f"Table {tbl_cur} error!")
-                        if "index" not in store_tbl.group.table.colindexes:
-                            print(tbl_cur, end=" - was no indexes, ")
-                            try:
-                                store.create_table_index(tbl_cur, columns=["index"], kind="full")
-                                print("\n")
-                            except Exception as ee:  # store.get_storer(tbl_cur).group AttributeError: 'UnImplemented' object has no attribute 'description'
-                                print(
-                                    "Error:",
-                                    standard_error_info(ee),
-                                    f'- creating index on table "{tbl_cur}" is not success.',
-                                )
-                            store.flush()
-                        else:
-                            print(
-                                tbl_cur,
-                                store.get_storer(tbl_cur).group.table.colindexes,
-                                end=" - was index. ",
-                            )
-                    # store.get_storer('df').table.reindex_dirty() ?
-                print("\n\t2. Restart...")
-                ptrepack()
-                print("\n\t- Ok")
-        except HDF5ExtError:
-            raise
-        except Exception as ee:  # store.get_storer(tbl_cur).group AttributeError: 'UnImplemented' object has no attribute 'description'
-            print("Error:", standard_error_info(ee), f"- no success.")
-            # try without --propindexes yet?
-            raise e
-        except:
-            print("some error")
-    finally:
-        os_chdir(path_prev)
-        sys.argv = argv_prev
-
-    if b_remove:
-        try:
-            os_remove(path)
-        except:
-            print(f'can\'t remove temporary file "{path}"')
-    return h5out_path
-
-
 query_range_pattern_default = "index>='{}' & index<='{}'"
 
 
@@ -399,17 +280,19 @@ def sel_index_and_istart(
     :param query_range_lims: values to print in query_range_pattern
     :param query_range_pattern:
     :param to_edge: timedelta
-    :return: (empty columns dataframe with index[query_range], coordinate index of query_range[0] in table)
-    Tell me, if you know, how to do this with only one query, please
+    :return: (empty columns dataframe with index[range_query], coordinate index of range_query[0] in table)
     """
     if query_range_lims is None:  # select all
         df0 = store.select(tbl_name, columns=[])
         i_start = 0
-    else:  # select reduced range
+    else:
+        # Select reduced range and its starting db-index counter number (coordinate)
+        # (Tell me, if you know, how to do this with only one query, please)
         if to_edge:
             query_range_lims = [pd.Timestamp(lim) for lim in query_range_lims]
             query_range_lims[0] -= to_edge
-            query_range_lims[-1] += to_edge
+            if len(query_range_lims) > 1:
+                query_range_lims[-1] += to_edge
         qstr = query_range_pattern.format(*query_range_lims)
         lf.info(f"query:\n{qstr}... ")
         df0 = store.select(tbl_name, where=qstr, columns=[])
@@ -442,9 +325,9 @@ def sel_interpolate(
     # if not drop duplicates loc[t] will return many (all) rows having same index t, so we do it:
     new_index = df.index.union(t).drop_duplicates()
 
-    # pd.Index(timzone_view(time_points, dt_from_utc=df.index.tzinfo._utcoffset))
+    # pd.Index(timezone_view(time_points, dt_from_utc=df.index.tzinfo._utcoffset))
     # except TypeError as e:  # if Cannot join tz-naive with tz-aware DatetimeIndex
-    #     new_index = timzone_view(df.index, dt_from_utc=0) | pd.Index(timzone_view(time_points, dt_from_utc=0))
+    #     new_index = timezone_view(df.index, dt_from_utc=0) | pd.Index(timezone_view(time_points, dt_from_utc=0))
 
     df_interp_s = df.reindex(new_index).interpolate(
         method=method,
@@ -458,7 +341,8 @@ def coords(
     tbl_name: str,
     q_time: Optional[Sequence[Any]] = None,
     query_range_lims: Optional[Sequence[Any]] = None,
-    query_range_pattern: str = query_range_pattern_default,
+    query_range_pattern: Optional[str] = None,
+    to_edge=None
 ) -> Tuple[Union[pd.Index, None], int, Union[List[int], np.ndarray]]:
     """
     Get table's index for ``q_time`` edges / ``query_range_lims`` and coordinates indexes of ``q_time`` in
@@ -469,6 +353,7 @@ def coords(
     :param q_time: optional, points. If strings - converts them to 'M8[ns]'.
     :param query_range_lims: optional, needed interval. If None, then use 1st and last of q_time.
     :param query_range_pattern:
+    :param to_edge: if not None, then extend query_range_lims at both sides. Example: pd.Timedelta(minutes=10)
     :return (df0range.index, i0range, i_queried):
     - df0range.index: index[query_range_lims[0]:(query_range_lims[-1] + to_edge)];
     - i0range: starting index of returned df0range.index in store table;
@@ -485,20 +370,24 @@ def coords(
                 q_time = np.array(q_time, "M8[ns]")
             # needed interval from q_time edges: should be min and max of q_time
             query_range_lims = q_time[:: (q_time_len - 1)] if (q_time_len := len(q_time)) > 1 else q_time
-
+    b_have_max_lim = len(query_range_lims)%2 == 0
     df0range, i0range = sel_index_and_istart(
         store,
         tbl_name,
         query_range_lims,
-        query_range_pattern,
-        to_edge=pd.Timedelta(minutes=10),
+        query_range_pattern or (query_range_pattern_default if b_have_max_lim else "index>='{}'"),
+        to_edge=to_edge,
         # msg_add='with padding to edges'
     )
     if q_time is None:
         return df0range.index, 0, [0, df0range.index.size]
 
     i_queried = inearestsorted(df0range.index.values, np.array(q_time, df0range.index.dtype.str))
-    return df0range.index, i0range, i_queried + i0range
+    return (
+        df0range.index,
+        i0range,
+        (i_queried if b_have_max_lim else np.append(i_queried, df0range.index.size - 1)) + i0range
+    )
 
 
 def load_points(
@@ -618,7 +507,7 @@ def load_ranges(
 ) -> pd.DataFrame:
     """
     Load data
-    :param t_intervals: even sequence of datetimes or strings convertible to index type values. Each pair
+    :param t_intervals: an even sequence of datetimes or strings convertible to index type values. Each pair
     defines edges of data that will be concatenated. 1st and last must be min and max values in sequence.
     :param table:
     :return:
@@ -788,7 +677,7 @@ def remove_tables(db: pd.HDFStore, tables: Iterable[str], tables_log: Iterable[s
             else:
                 db.open(mode="r+")
             remove(db, tbl)
-    db.flush()
+    db.flush(fsync=True)
     return db
 
 
@@ -836,7 +725,7 @@ class ReplaceTableKeepingChilds:
                         else:
                             raise
 
-                self.cfg_out["db"].flush()  # .flush(fsync=True
+                self.cfg_out["db"].flush(fsync=True)
 
         except AttributeError:
             pass  # print(tbl_parent + ' has no childs')
@@ -868,7 +757,7 @@ class ReplaceTableKeepingChilds:
             self.cfg_out["db"].create_table_index(self.tbl_parent, columns=["index"], kind="full")
 
         # write childs back
-        self.cfg_out["db"].flush()
+        self.cfg_out["db"].flush(fsync=True)
         if exc_type is None:
             for tbl in self.childs:
                 self.cfg_out["db"]._handle.move_node(
@@ -930,9 +819,10 @@ def remove_duplicates_by_loading(cfg, cfg_table_keys: Iterable[Union[Iterable[st
     :param cfg_table_keys: list, in which 'tables_log' means that cfg['tables_log'] is a log table. Alternatively group tables in subsequences such that log tables names is after data table in each subsequence (cfg[cfg_table_keys[group]])
     :return dup_tbl_set: tables that still have duplicates
     """
-    cfg["db"].flush()  # not works (loading will give only part of data), but this works:
-    cfg["db"].close()
-    cfg["db"].open("r+")
+    cfg["db"].flush(fsync=True)
+    # not worked without fsync=True (loading will give only part of data), but this worked:
+    # cfg["db"].close()
+    # cfg["db"].open("r+")
 
     # load data frames from store to memory removing duplicates
     dfs = {}
@@ -986,7 +876,7 @@ def remove_duplicates_by_loading(cfg, cfg_table_keys: Iterable[Union[Iterable[st
 
 def create_indexes(cfg_out, cfg_table_keys):
     """
-    Create full indexes. That is mandatory before using ptprepack in move_tables() below
+    Create full indexes. That is mandatory before using pandas `ptrepack` in our `move_tables()`
     :param cfg_out: must hav fields
     - 'db': handle of opened HDF5Store
     - fields specified in :param cfg_table_keys where values are table names that need index. Special field name:
@@ -1001,7 +891,7 @@ def create_indexes(cfg_out, cfg_table_keys):
             if not tbl:
                 continue
             try:
-                if i_in_group == 0 or cfgListName != "tables_log":  # not nested (i.e. log) table
+                if i_in_group == 0 or cfgListName != "tables_log":  # not nested (log) table
                     navp_all_index, level2_index = multiindex_timeindex(cfg_out["db"][tbl].index)
                 else:
                     level2_index = None
@@ -1015,6 +905,180 @@ def create_indexes(cfg_out, cfg_table_keys):
             #     print('can not create index for table "{}"'.format(tbl))
 
 
+def close(cfg_out: Mapping[str, Any]) -> None:
+    """
+    Closes cfg_out['db'] store, removes duplicates (if needed) and creates indexes
+    :param cfg_out: dict, with optional fields:
+    - b_remove_duplicates: True - to remove duplicates
+    - tables_written: cfg_out fields where stored table names (to create indexes), default ('tables', 'tables_log').
+    These fields must be in cfg_out.
+    :return: None
+    """
+    try:
+        print("")
+        cfg_table_keys = ["tables_written"] if ("tables_written" in cfg_out) else ("tables", "tables_log")
+        if cfg_out["b_remove_duplicates"]:
+            tbl_dups = remove_duplicates_by_loading(cfg_out, cfg_table_keys=cfg_table_keys)
+            # or remove_duplicates() but it can take very long time
+        create_indexes(cfg_out, cfg_table_keys)
+    except Exception as e:
+        lf.exception("\nError of adding data to temporary store: ")
+
+        import traceback
+        import code
+        from sys import exc_info as sys_exc_info
+
+        tb = sys_exc_info()[2]  # type, value,
+        traceback.print_exc()
+        last_frame = lambda tb=tb: last_frame(tb.tb_next) if tb.tb_next else tb
+        frame = last_frame().tb_frame
+        ns = dict(frame.f_globals)
+        ns.update(frame.f_locals)
+        code.interact(local=ns)
+    finally:
+        try:
+            if cfg_out["db"] is None:
+                return
+            cfg_out["db"].close()
+        except HDF5ExtError:
+            lf.exception(f"Error closing: {cfg_out['db']}")
+        if cfg_out["db"].is_open:
+            print("Wait store closing...")
+            sleep(2)
+            if cfg_out["db"].is_open:
+                cfg_out["db_is_bad"] = True  # failed closing
+
+        cfg_out["db"] = None
+        return
+
+
+def sort_pack(
+    path: str,
+    out_name: str,
+    table_node: str,
+    arguments: Optional[Sequence[str]] = None,
+    addargs: Optional[Sequence[str]] = None,
+    b_remove: Optional[bool] = False,
+    col_sort: Optional[str] = "index",
+):
+    """
+    Compress and save table (with sorting by index) from hdf5 file at `path` to hdf5 with `out_name` using
+    ``ptrepack`` utility. Output hdf5 file can contain other tables.
+    :param path: - hdf5 source full file name
+    :param out_name: base file name + ext of cumulative hdf5 store only. Name should be different to that in
+    source path
+    :param table_node: node name in hdf5 source file
+    :param arguments: list, 'fast' or None. None is equal to ['--chunkshape=auto',
+        '--complevel=9', '--complib=zlib',f'--sortby={col_sort}', '--overwrite-nodes']
+    :param addargs: list, extend arguments with more parameters
+    :param b_remove: hdf5 source file will be deleted after operation!
+    :param col_sort:
+    :return: full path of cumulative hdf5 store
+    Note: ``ptrepack`` not closes hdf5 source if not finds data!
+    """
+
+    h5dir, h5source = os_path.split(path)
+    h5out_path = os_path.join(h5dir, out_name)
+    if not table_node:
+        return h5out_path
+    print(f"sort&pack({table_node}) to {out_name}")
+    path_prev = os_getcwd()
+    argv_prev = sys.argv.copy()
+    os_chdir(h5dir)  # os.getcwd()
+    try:  # Extend selected default set of arguments
+        if arguments == "fast":  # bRemove= False, bFast= False,
+            arguments = ["--chunkshape=auto", "--overwrite-nodes", "--dont-regenerate-old-indexes"]
+            if addargs:
+                arguments.extend(addargs)
+        else:
+            if arguments is None:
+                arguments = [
+                    "--checkCSI",
+                    "--chunkshape=auto",
+                    "--propindexes",
+                    "--complevel=9",
+                    "--complib=zlib",
+                    f"--sortby={col_sort}",
+                    "--overwrite-nodes",
+                ]
+            if addargs:
+                arguments.extend(addargs)
+        # arguments + [sourcefile:sourcegroup, destfile:destgroup]
+        sys.argv[1:] = arguments + [f"{h5}:/{table_node}" for h5 in (h5source, out_name)]
+        # --complib=blosc --checkCSI=True
+
+        ptrepack()
+        # then copy children  # '--non-recursive' requires sys.argv[1:] = arguments + [f'{h5source}:/{table_node}/table', f'{out_name}:/{table_node}/table'] i.e. can not copy indexes
+        # with pd.HDFStore(h5out_path, 'a') as store_out, pd.HDFStore(path, 'r') as store_in:
+        #     parent_group_in = store_in.get_storer(f'/{table_node}').group
+        #     parent_group_out = store_out.get_storer(f'/{table_node}').group
+        #     parent_group_in._f_copy_children(parent_group_out, overwrite=True)
+        # nodes = parent_group.__members__
+        # childs = [f'/{table_node}/{g}' for g in nodes if (g != 'table') and (g != '_i_table')]
+        # if childs:
+        #     lf.info('found {} children of {}. Copying...', len(childs), table_node)
+        #     for i, tbl in enumerate(childs):
+        #         store_in._handle.move_node(tbl,
+        #                                              newparent=f'/{self.temp_group}',
+        #                                              createparents=True,
+        #                                              overwrite=True)
+
+    except Exception as e:
+        tbl_cur = "ptrepack failed!"
+        try:
+            if f"--sortby={col_sort}" in arguments:
+                # check that requirement of fool index is recursively satisfied
+                with pd.HDFStore(path) as store:
+                    print("Trying again:\n\t1. Creating index for all childs not having one...")
+                    nodes = store.get_node(table_node).__members__
+                    for n in nodes:
+                        tbl_cur = table_node if n == "table" else f"{table_node}/{n}"
+                        try:
+                            store_tbl = store.get_storer(tbl_cur)
+                        except AttributeError:
+                            raise HDF5ExtError(f"Table {tbl_cur} error!")
+                        if "index" not in store_tbl.group.table.colindexes:
+                            print(tbl_cur, end=" - was no indexes, ")
+                            try:
+                                store.create_table_index(tbl_cur, columns=["index"], kind="full")
+                                print("\n")
+                            except Exception as ee:  # store.get_storer(tbl_cur).group AttributeError: 'UnImplemented' object has no attribute 'description'
+                                print(
+                                    "Error:",
+                                    standard_error_info(ee),
+                                    f'- creating index on table "{tbl_cur}" is not success.',
+                                )
+                            store.flush(fsync=True)
+                        else:
+                            print(
+                                tbl_cur,
+                                store.get_storer(tbl_cur).group.table.colindexes,
+                                end=" - was index. ",
+                            )
+                    # store.get_storer('df').table.reindex_dirty() ?
+                print("\n\t2. Restart...")
+                ptrepack()
+                print("\n\t- Ok")
+        except HDF5ExtError:
+            raise
+        except Exception as ee:  # store.get_storer(tbl_cur).group AttributeError: 'UnImplemented' object has no attribute 'description'
+            print("Error:", standard_error_info(ee), f"- no success.")
+            # try without --propindexes yet?
+            raise e
+        except:
+            print("some error")
+    finally:
+        os_chdir(path_prev)
+        sys.argv = argv_prev
+
+    if b_remove:
+        try:
+            os_remove(path)
+        except:
+            print(f'can\'t remove temporary file "{path}"')
+    return h5out_path
+
+
 def move_tables(
     cfg_out, tbl_names: Union[Sequence[str], Sequence[Sequence[str]], None] = None, **kwargs
 ) -> Dict[str, str]:
@@ -1022,20 +1086,20 @@ def move_tables(
     Copy pytables tables `tbl_names` from one store to another using `ptrepack` utility. If fail to store
     in specified location then creates new store and tries to save there.
     :param cfg_out: dict - must have fields:
-      - temp_db_path: source of not sorted tables, if None tries to use `cfg_out['db'].filename` if ends with
-        '_not_sorted.h5'
-      - db_path: pathlib.Path, full path name (extension ".h5" will be added if absent) of hdf store to put
-      - tables, tables_log: Sequence[str], if tbl_names not specified
-      - b_del_temp_db: bool, remove source store after move tables. If False (default) then deletes nothing
-      - addargs: ptprepack params, they will be added to the defaults specified in sort_pack()
+    - temp_db_path: source of not sorted tables, if None tries to use `cfg_out['db'].filename` if ends with
+    '_not_sorted.h5'
+    - db_path: pathlib.Path, full path name (extension ".h5" will be added if absent) of hdf store to put
+    - tables, tables_log: Sequence[str], if tbl_names not specified
+    - b_del_temp_db: bool, remove source store after move tables. If False (default) then deletes nothing
+    - addargs: ptrepack params, they will be added to the defaults specified in sort_pack()
     :param tbl_names: list of strings or list of lists (or tuples) of strings. List of lists is useful to keep
-     order of operation: put nested tables last.
-    :param kwargs: ptprepack params
-    Note: ``ptprepack`` not closes hdf5 source if it not finds data!
+    order of operation: put nested tables last.
+    :param kwargs: ptrepack params
+    Note: ``ptrepack`` not closes hdf5 source if it not finds data!
     Note: Not need specify childs (tables_log) if '--non-recursive' not in kwargs
         Strings are names of hdf5 tables to copy
     :return: Empty dict if all success else if we have errors - Dict [tbl: HDF5store file name] of locations
-     of last tried savings for each table
+    of last tried savings for each table
     """
     failed_storages = {}
     if tbl_names is None:  # copy all cfg_out tables
@@ -1542,7 +1606,7 @@ def del_obsolete(
 # Functions to iterate rows of db log instead of files in dir
 
 
-def query_time_range(min_time=None, max_time=None, **kwargs) -> str:
+def time_range_query(min_time=None, max_time=None, **kwargs) -> str:
     """
     Query Time for pandas.Dataframe
     :param min_time:
@@ -1550,20 +1614,20 @@ def query_time_range(min_time=None, max_time=None, **kwargs) -> str:
     :return:
     """
     if min_time:
-        query_range = f"index>='{min_time}' & index<='{max_time}'" if max_time else f"index>='{min_time}'"
+        range_query = f"index>='{min_time}' & index<='{max_time}'" if max_time else f"index>='{min_time}'"
     elif max_time:
-        query_range = f"index<='{max_time}'"
+        range_query = f"index<='{max_time}'"
     else:
-        query_range = None
-    return query_range
+        range_query = None
+    return range_query
 
 
 def log_rows_gen(
     db_path: Union[str, Path, None] = None,
     table_log: str = "log",
-    min_time=None,
-    max_time=None,
-    query_range=None,
+    min_time: Optional[datetime] = None,
+    max_time: Optional[datetime] = None,
+    range_query: Optional[Sequence[datetime]] = None,
     db: Optional[pd.HDFStore] = None,
     **kwargs,
 ) -> Iterator[Dict[str, Any]]:
@@ -1572,19 +1636,20 @@ def log_rows_gen(
     :param db_path: name of hdf5 pandas store where is log table, used only for message if it is set and db is set
     :param db: handle of already open pandas hdf5 store
     :param table_log: name of log table - table with columns for intervals:
-      - index - starts, pd.DatetimeIndex
-      - DateEnd - ends, pd.Datetime
-    :param min_time, max_time: datetime, optional, allows limit the range of table_log rows, not used if query_range is set
-    :param query_range: query str to limit the range of table_log rows to load
+    - `index` - starts, pd.DatetimeIndex
+    - `DateEnd` - ends, pd.Datetime
+    :param min_time:
+    :param max_time: allows limit the range of table_log rows, not used if range_query is set
+    :param range_query: query str to limit the range of table_log rows to load
         Example table_log name: cfg_in['table_log'] ='/CTD_SST_48M/logRuns'
     :param kwargs: not used
     Yields dicts where keys: col names, values: current row values of tbl_intervals = cfg_in['table_log']
     """
-    if query_range is None:
-        query_range = query_time_range(min_time, max_time)
+    if range_query is None:
+        range_query = time_range_query(min_time, max_time)
     with nullcontext(db) if db else pd.HDFStore(db_path, mode="r") as db:
         print(f'loading from "{db_path if db_path else db.filename}": ', end="")
-        for n, rp in enumerate(db.select(table_log, where=query_range).itertuples()):
+        for n, rp in enumerate(db.select(table_log, where=range_query).itertuples()):
             r = dict(zip(rp._fields, rp))
             yield r  # r.Index, r.DateEnd
 
@@ -1630,53 +1695,6 @@ def merge_two_runs(df_log: pd.DataFrame, irow_to: int, irow_from: Optional[int] 
     print("ok, 10 nearest rows became:", df_log.iloc[(irow_from - 5) : (irow_to + 5), :])
 
 
-def close(cfg_out: Mapping[str, Any]) -> None:
-    """
-    Closes cfg_out['db'] store, removes duplicates (if needed) and creates indexes
-    :param cfg_out: dict, with optional fields:
-    - b_remove_duplicates: True - to remove duplicates
-    - tables_written: cfg_out fields where stored table names (to create indexes), default ('tables', 'tables_log').
-    These fields must be in cfg_out.
-    :return: None
-    """
-    try:
-        print("")
-        cfg_table_keys = ["tables_written"] if ("tables_written" in cfg_out) else ("tables", "tables_log")
-        if cfg_out["b_remove_duplicates"]:
-            tbl_dups = remove_duplicates_by_loading(cfg_out, cfg_table_keys=cfg_table_keys)
-            # or remove_duplicates() but it can take very long time
-        create_indexes(cfg_out, cfg_table_keys)
-    except Exception as e:
-        lf.exception("\nError of adding data to temporary store: ")
-
-        import traceback
-        import code
-        from sys import exc_info as sys_exc_info
-
-        tb = sys_exc_info()[2]  # type, value,
-        traceback.print_exc()
-        last_frame = lambda tb=tb: last_frame(tb.tb_next) if tb.tb_next else tb
-        frame = last_frame().tb_frame
-        ns = dict(frame.f_globals)
-        ns.update(frame.f_locals)
-        code.interact(local=ns)
-    finally:
-        try:
-            if cfg_out["db"] is None:
-                return
-            cfg_out["db"].close()
-        except HDF5ExtError:
-            lf.exception(f"Error closing: {cfg_out['db']}")
-        if cfg_out["db"].is_open:
-            print("Wait store closing...")
-            sleep(2)
-            if cfg_out["db"].is_open:
-                cfg_out["db_is_bad"] = True  # failed closing
-
-        cfg_out["db"] = None
-        return
-
-
 def names_gen(cfg_in, cfg_out: Mapping[str, Any], check_have_new_data=True, **kwargs) -> Iterator[Path]:
     """
     Yields Paths from cfg_in['paths'] items
@@ -1694,7 +1712,8 @@ def names_gen(cfg_in, cfg_out: Mapping[str, Any], check_have_new_data=True, **kw
     for name_full in cfg_in["paths"]:
         pname = Path(name_full)
 
-        cfg_out["log"]["fileName"] = f"{pname.parent.name}/{pname.stem}"[-cfg_out["logfield_fileName_len"] :]
+        cfg_out["log"]["fileName"] = f"{pname.parent.name}/{pname.stem}"[
+            -cfg_out.get("logfield_fileName_len", 255):]
         cfg_out["log"]["fileChangeTime"] = datetime.fromtimestamp(pname.stat().st_mtime)
 
         try:
@@ -1728,6 +1747,7 @@ def out_init(
     b_remove_duplicates=False,
     b_reuse_temporary_tables=False,
     nfiles=1,
+    **kwargs
 ) -> None:
     """
     Init output DB (hdf5 data store) information in `cfg_out` if it is not exist_
@@ -1739,6 +1759,7 @@ def out_init(
     :param raw_dir_words: (optional) - see getDirBaseOut()
     :param nfiles: (optional)
     :param b_incremental_update: (optional) to copy it to cfg_out
+    :param kwargs: not used
 
     Sets or updates fields of `cfg_out`:
     % paths %
@@ -1877,7 +1898,7 @@ def copy_to_temp_db(
                         tbl_cur = tbl if n == "table" else f"{tbl}/{n}"
                         lf.info(tbl_cur, end=", ")
                         db_in.create_table_index(tbl_cur, columns=["index"], kind="full")
-                        # db_in.flush()
+                        # db_in.flush(fsync=True)
                     lf.error("Trying again")
                     db_in.close()
                     sort_pack(db_path, temp_db_name, tbl)
@@ -1918,7 +1939,7 @@ def temp_open(
     (do not reloads existed data).
     2. Opens a temporary HDF5 store and copies data from an existing target store for further processing.
     This allows you first efficiently load data without indexing and sorting and then do it once
-    copying data back to original HDF5 store using `ptprepack` pandas utility.
+    copying data back to original HDF5 store using `ptrepack` pandas utility.
 
     :param db_path: Path to the original HDF5 store. If None, the function may return early.
     :param temp_db_path: Path to the temporary HDF5 store.
@@ -1995,7 +2016,7 @@ def temp_open(
             for attempt in range(2):
                 try:
                     db = pd.HDFStore(temp_db_path)
-                    # db.flush()
+                    # db.flush(fsync=True)
                     break
                 except IOError as e:
                     print(e)
@@ -2146,82 +2167,86 @@ def dispenser_and_names_gen(
 qstr_range_pattern = "index>='{}' & index<='{}'"
 
 
-def q_interval2coord(
-        db_path,
-        table,
-        t_interval: Optional[Sequence[Union[str, pd.Timestamp]]] = None,
-        time_range: Optional[Sequence[Union[str, pd.Timestamp]]] = None) -> pd.Index:
-    """
-    Edge coordinates of index range query
-    As it is nearly a part of h5.h5select() may be depreciated? See Note
-    :param: db_path, str
-    :param: table, str
-    :param: t_interval: array or list with strings convertable to pandas.Timestamp
-    :param: time_range: same as t_interval (but must be flat numpy array)
-    :return: ``qstr_range_pattern`` edge coordinates
-    Note: can use instead:
-    >>> from to_pandas_hdf5.h5 import load_points
-    ... with pd.HDFStore(db_path, mode='r') as store:
-    ...     df, bbad = load_points(store,table,columns=None,query_range_lims=time_range)
+# def q_interval2coord(
+#         db_path,
+#         table,
+#         t_interval: Optional[Sequence[Union[str, pd.Timestamp]]] = None,
+#         time_range: Optional[Sequence[Union[str, pd.Timestamp]]] = None) -> pd.Index:
+#     """
+#     Edge coordinates of index range query
+#     As it is nearly a part of h5.h5select() may be depreciated? See Note
+#     :param: db_path, str
+#     :param: table, str
+#     :param: t_interval: array or list with strings convertable to pandas.Timestamp
+#     :param: time_range: same as t_interval (but must be flat numpy array)
+#     :return: ``qstr_range_pattern`` edge coordinates
+#     Note: can use instead:
+#     >>> from to_pandas_hdf5.h5 import load_points
+#     ... with pd.HDFStore(db_path, mode='r') as store:
+#     ...     df, bbad = load_points(store,table,columns=None,query_range_lims=time_range)
 
-    """
+#     """
 
-    if not t_interval:
-        t_interval = time_range
-    if not (isinstance(t_interval, list) and isinstance(t_interval[0], str)):
-        t_interval = np.array(t_interval).ravel()
+#     if not t_interval:
+#         t_interval = time_range
+#     if not (isinstance(t_interval, list) and isinstance(t_interval[0], str)):
+#         t_interval = np.array(t_interval).ravel()
 
-    qstr = qstr_range_pattern.format(*t_interval)
-    with pd.HDFStore(db_path, mode='r') as store:
-        lf.debug("loading range from {:s}/{:s}: {:s} ", db_path, table, qstr)
-        try:
-            ind_all = store.select_as_coordinates(table, qstr)
-        except Exception as e:
-            lf.debug("- not loaded: {:s}", e)
-            raise
-        if len(ind_all):
-            ind = ind_all[[0, -1]]  # .values
-        else:
-            ind = []
-        lf.debug('- gets {}', ind)
-    return ind
+#     qstr = qstr_range_pattern.format(*t_interval)
+#     with pd.HDFStore(db_path, mode='r') as store:
+#         lf.debug("loading range from {:s}/{:s}: {:s} ", db_path, table, qstr)
+#         try:
+#             ind_all = store.select_as_coordinates(table, qstr)
+#         except Exception as e:
+#             lf.debug("- not loaded: {:s}", e)
+#             raise
+#         if len(ind_all):
+#             ind = ind_all[[0, -1]]  # .values
+#         else:
+#             ind = []
+#         lf.debug('- gets {}', ind)
+#     return ind
 
 
-def q_intervals_indexes_gen(
-        db_path,
-        table: str,
-        t_prev_interval_start: pd.Timestamp,
-        t_intervals_start: Iterable[pd.Timestamp],
-        i_range: Optional[Sequence[Union[str, pd.Timestamp]]] = None) -> Iterator[pd.Index]:
-    """
-    Yields start and end coordinates (0 based indexes) of hdf5 store table index which values are next nearest to intervals start input
-    :param db_path
-    :param table, str (see q_interval2coord)
-    :param t_prev_interval_start: first index value
-    :param t_intervals_start:
-    :param i_range: Sequence, 1st and last element will limit the range of returned result
-    :return: Iterator[pd.Index] of lower and upper int limits (adjacent intervals)
-    """
+# def q_intervals_indexes_gen(
+#         db_path,
+#         table: str,
+#         t_prev_interval_start: pd.Timestamp,
+#         t_intervals_start: Iterable[pd.Timestamp],
+#         i_range: Optional[Sequence[Union[str, pd.Timestamp]]] = None) -> Iterator[pd.Index]:
+#     """
+#     Yields (`start`, `end`) coordinate pares (0 based indexes) of hdf5 store table index, whith `start` found
+#     as next nearest to each `t_intervals_start` element
+#     :param db_path
+#     :param table, str (see q_interval2coord)
+#     :param t_prev_interval_start: first index value
+#     :param t_intervals_start:
+#     :param i_range: Sequence, 1st and last element will limit the range of returned result
+#     :return: Iterator[pd.Index] of lower and upper int limits (adjacent intervals)
+#     """
 
-    for t_interval_start in t_intervals_start:
-        # load_interval
-        start_end = q_interval2coord(db_path, table, [t_prev_interval_start.isoformat(), t_interval_start.isoformat()])
-        if len(start_end):
-            if i_range is not None:  # skip intervals that not in index range
-                start_end = minInterval([start_end], [i_range], start_end[-1])[0]
-                if not len(start_end):
-                    if 0 < i_range[-1] < start_end[0]:
-                        raise Ex_nothing_done
-                    continue
-            yield start_end
-        else:  # no data
-            print('-', end='')
-        t_prev_interval_start = t_interval_start
+#     for t_interval_start in t_intervals_start:
+#         # load_interval
+#         start_end = q_interval2coord(
+#             db_path, table, [t_prev_interval_start.isoformat(), t_interval_start.isoformat()]
+#         )
+#         if len(start_end):
+#             if i_range is not None:  # skip intervals that not in index range
+#                 start_end = minInterval([start_end], [i_range], start_end[-1])[0]
+#                 if not len(start_end):
+#                     if 0 < i_range[-1] < start_end[0]:
+#                         raise Ex_nothing_done
+#                     continue
+#             yield start_end
+#         else:  # no data
+#             print('-', end='')
+#         t_prev_interval_start = t_interval_start
 
 
 def q_ranges_gen(cfg_in: Mapping[str, Any], df_intervals: pd.DataFrame):
     """
-    Loading intervals using ranges dataframe (defined by Index and DateEnd column - like in h5toGrid hdf5 log tables)
+    Loading intervals using ranges dataframe (defined by Index and DateEnd column - like in h5toGrid hdf5 log
+    tables)
     :param df_intervals: dataframe, with:
         index - pd.DatetimeIndex for starts of intervals
         DateEnd - pd.Datetime col for ends of intervals
@@ -2453,19 +2478,20 @@ def add_log(
     - b_log_ready: If False or not present, updates log['Date0'] and log['DateEnd'] using df or tim.
     - db: Handle to the opened HDF5 store.
     - table_log: Optional string specifying the path of the log table. If no then we will try to get it from
-      'tables_log, 'table' or 'tables' as order of precedence.
+    'tables_log, 'table' or 'tables' as order of precedence.
     - tables_log: Optional list of strings where the first element is the path of the log table, that is only
-      used.
+    used.
     - table: Optional string used to construct the path of the log table by adding '/log'.
     - tables: Optional list of strings used to construct the path of the log table by adding '/log' to the
-      first element
+    first element
     - logfield_fileName_len: Optional, specifies the fixed length of the string format for the 'fileName'
-      column in the HDF5 table.
+    column in the HDF5 table.
     :param df: DataFrame used to get log['Date0'] and log['DateEnd'] as start and end dates if
-        cfg_out['b_log_ready'] is not set.
-    :param log: Mutable mapping or DataFrame to be updated with log information. If None, an empty mapping is used.
+    cfg_out['b_log_ready'] is not set.
+    :param log: Mutable mapping or DataFrame to be updated with log information. If None, an empty mapping is
+    used.
     :param tim: Timestamp used to set 'Date0' and 'DateEnd' if they are not provided or if
-        cfg_out['b_log_ready'] is not set.
+    cfg_out['b_log_ready'] is not set.
     :param log_dt_from_utc: timedelta used to convert timestamps to a different timezone view.
     :return: table log name.
     Updates The log is updated with 'Date0' and 'DateEnd' if necessary and then passed to append_log().
@@ -2474,7 +2500,7 @@ def add_log(
         IndexError: If there is no data in df to compute time limits.
         Exception: If there are other issues with creating or updating the log DataFrame.
 
-    This function ensures that the log table is updated with the correct 'Date0' and 'DateEnd' values based on the provided data and configuration. It handles the creation of the log DataFrame if it is not already in the correct format and appends it to the specified log table in the HDF5 store.
+    This function ensures that the log table is updated with the correct 'Date0', 'DateEnd' values based on the provided data and configuration, sets "DateProc" current date for all rows. It handles the creation of the log DataFrame if it is not already in the correct format and appends it to the specified log table in the HDF5 store.
     """
     if cfg_out.get("b_log_ready") and (isinstance(log, Mapping) and not log):
         return
@@ -2497,11 +2523,17 @@ def add_log(
         except IndexError:
             lf.debug("no data")
             return
+        # todo: correct if log is DataFrame (will be possible SettingWithCopyWarning)
         log["Date0"], log["DateEnd"] = timezone_view(t_lims, log_dt_from_utc)
-    log["DateProc"] = datetime.now()
 
-    # dfLog = pd.DataFrame.from_dict(log, np.dtype(np.unicode_, cfg_out['logfield_fileName_len']))
-    if not isinstance(log, pd.DataFrame):
+    if isinstance(log, pd.DataFrame):
+        if "DateProc" in log.columns:
+            log.loc[log["DateProc"].isna(), "DateProc"] = datetime.now()
+        else:
+            log.loc[:, "DateProc"] = datetime.now()
+    else:
+        # dfLog = pd.DataFrame.from_dict(log, np.dtype(np.unicode_, cfg_out['logfield_fileName_len']))
+        log["DateProc"] = datetime.now()
         try:
             log = pd.DataFrame(log).set_index("Date0")
         except ValueError as e:  # , Exception
@@ -2717,7 +2749,8 @@ def append_to(
     msg: Optional[str] = None,
 ):
     """
-    Append data to opened cfg_out['db'] by append() without modifying cfg_out['tables_written'] instead returning it
+    Append data to opened cfg_out['db'] by append() without modifying cfg_out['tables_written']
+    :return: modified (as in `append()` function of this module) copy of cfg_out['tables_written']
     """
     if cfg_out["db"] is None:
         return set()
@@ -2832,15 +2865,16 @@ def keep_recorded_file(cur: Mapping[str, Any], existing: pd.DataFrame, keep_newe
     processing if it is, by default, not newer than its existing metadata log record or no existing record.
     :param cur: dict or DataFrame (1st row will be used), current log record
     :param existing: existing log records
-    :param skip_older: if False then skip only if current file time is same as recorded. Useful if file time
-    is random
+    :param keep_newer_records: if False then skip only if current file time is same as recorded. False Useful
+    if file time is random
     :return: True if we need to skip
     """
     if existing.empty:
         return False
     try:
         if isinstance(cur, pd.DataFrame):
-            cur = (lambda row: {**row.to_dict(), "index": row.name})(cur.iloc[0])
+            row = cur.iloc[0]
+            cur = {**row.to_dict(), "index": row.name}
         b_skip = (
             (cur["fileName"] == existing["fileName"]) &
             ( (cur["fileChangeTime"] <= existing["fileChangeTime"]) if keep_newer_records else
@@ -2862,11 +2896,43 @@ def read_db_log(db, table_log):
         )
 
 
+def update_log_record_with_dates(log, df):
+    start_date, end_date = (
+        df.divisions[:: len(df.divisions) - 1]
+        if is_dask_dataframe(df)
+        else df.index[[0, -1]].to_list()
+    )
+    if isinstance(log, pd.DataFrame):
+        if "DateProc" not in log.columns:
+            log["DateProc"] = datetime.now()
+        if log.shape[0] == 1:
+
+            # If log index is not datetime, then replace it to current data.index[0]
+            if not pd.api.types.is_datetime64_any_dtype(log.index):
+                log.set_index([start_date])
+
+            # Add row or replace values
+            log.loc[start_date, ["DateEnd", "DateProc"]] = [end_date, datetime.now()]
+        elif any(log.index == start_date):
+            # If log.index contains data.index[0] then do not add row
+
+            # if log.DateEnd not contains end_date then replace its last DateEnd
+            if not any(log.DateEnd == end_date):
+                log.loc[log.index[-1], ["DateEnd", "DateProc"]] = [
+                    end_date, datetime.now()]
+        else:
+            log.loc[start_date, ["DateEnd", "DateProc"]] = [end_date, datetime.now()]
+    else:
+        log["index"] = start_date
+        log["DateEnd"] = end_date
+        log["DateProc"] = datetime.now()
+
+
 def older_gen(
-        db: pd.HDFStore, table: str, max_time: Tuple[str, pd.Timestamp], chunk_size: int = 500000,
+        db: pd.HDFStore, table: str, max_time: str|pd.Timestamp, chunk_size: int = 500000,
         skip_duplicates: bool = False) -> Iterator[pd.DataFrame]:
     """
-    Yield rows from a specified table in an HDF5 database that have an index older than a specified start
+    Yield df from a specified table in an HDF5 database that have rows index older than a specified start
     time.
     :param db: The HDF5 database from which to read.
     :param table: The name of the table within the database to query.
@@ -2886,7 +2952,10 @@ def older_gen(
     # We will copy data excluding `max_time` if new data starting with `max_time` expected
     b_stop_before_max_time = bool(max_time)
     if max_time:
-        sel_args['where'] = f"index<'{max_time}'"
+        sel_args["where"] = f"index<'{max_time}'"
+        # if isinstance(max_time, pd.Timestamp):
+        #     sel_args["where"] = ["index < '{:%Y-%m-%dT%H:%M:%S}'".format(
+        #         max_time.tz_localize(tz=None))]
 
     if skip_duplicates:
         # Find the last coordinate of the specified index, taking into account possible duplicates
@@ -2895,8 +2964,12 @@ def older_gen(
             total_rows = db.get_storer(table).nrows
             # Select only the last row by providing start=total_rows-1 and stop=total_rows
             last_row = db.select(**sel_args, start=total_rows-1)  # , stop=total_rows anyway
-            # Get the index of the last row
-            max_time = last_row.index[0]
+            if not isinstance(last_row.index, pd.DatetimeIndex):
+                err_msg = f"{Path(db.filename).name}/{table} index is not a DatetimeIndex!"
+                lf.error(err_msg)
+                raise ValueError(err_msg)
+            # Get the index of output df last row (1st of found indexes to skip duplicates)
+            max_time = last_row.index[0].tz_localize(tz=None)
         exact_match_coords = db.select_as_coordinates(table, where=f"index='{max_time}'")
 
         len_match = len(exact_match_coords)
@@ -2925,18 +2998,27 @@ def older_gen(
         old_data_iter = db.select(**sel_args, chunksize=chunk_size)
         for chunk in old_data_iter:
             yield chunk
+    except ValueError:
+        if not isinstance(db[table].index, pd.DatetimeIndex):
+            err_msg = f"{Path(db.filename).name}/{table} index is not a DatetimeIndex!"
+            lf.exception(err_msg)
+            raise ValueError(err_msg)
 
 
-def after_cycle_fun_default(db, table, table_log, logs_all: List[Tuple[pd.DataFrame, Mapping]], **kwargs
-                            ) -> List[str]:
+def after_cycle_fun_default(
+        db, table, table_log, logs_all: List[Tuple[pd.DataFrame, Mapping]], **kwargs
+    ) -> List[str]:
     """
-    Default `after_cycle_fun()` for `append_through_temp_db_gen()`
+    Default `after_cycle_fun()` for `append_through_temp_db_gen()`. Saves log record to DB calling `add_log()`
     :param db_path: path of target DB
+    :param table_log: log table name, can be name pattern depending on "table" if it is in the `kwargs`
+    :param logs_all: log data records to save. If not DataFrame, must be dict with "index" field
     :param **kwargs: optional parameters for `move_tables()`:
     - "temp_db_path"
     - "recreate_index_tables_set"
     - "b_del_temp_db"
     - "addargs"
+    :return tables: table log names list saved [table_log]
     """
     cfg_out_db = {'db': db, 'table_log': table_log, 'b_log_ready': True, **kwargs}
     b_have_df = isinstance(logs_all[0], pd.DataFrame)  # `append_through_temp_db_gen` inserts log_record[0]
@@ -2965,62 +3047,70 @@ def append_through_temp_db_gen(
     in_cycle_fun: Callable[[pd.HDFStore, str, Any], None] = (
         lambda db, table, data, **kwargs:
         data.to_hdf(
-        db,
-        key=table,
-        append=True,
-        data_columns=True,
-        format="table",
-        index=False,
-        dropna=True,
-    ) # db.append(table, data, data_columns=True)
+            db,
+            key=table,
+            append=True,
+            data_columns=True,
+            format="table",
+            index=False,
+            dropna=True,
+        )  # db.append(table, data, data_columns=True)
     ),
     after_cycle_fun: Callable[
         [pd.HDFStore, str, str, Sequence[Any], int], Tuple[str]
     ] = after_cycle_fun_default,
     skip_fun: Callable[[Any, pd.DataFrame], bool] = keep_recorded_file,
     table_from_meta: Optional[Callable[[Any], Tuple[str, str]]] = None,
-    meta_to_record: Optional[Callable[[Any], Mapping[str, Any]]] = None,
+    record_from_meta: Optional[Callable[[Any], Mapping[str, Any]]] = None,
     table: Optional[str] = None,
     table_log: str = "{}/logFiles",
     chunksize: int = 500000,
 ) -> Iterator[Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], str]]:
     """
-    The generator yields data and metadata while simultaneously appending them to a temporary HDF5 store. It starts by transferring existing relevant data from a source database to the temporary store to prevent duplication. As it consumes new data from the data_gen generator, it uses supplied metadata to discern and skip over data that is not current. The function dynamically updates the target table for each new data chunk based on this metadata. After processing table, it appends accumulated log records extracted from metadata to the corresponding table log in the temporary store.
+    The generator yields data and metadata while simultaneously appending them to a temporary HDF5 store.
+    It starts by transferring existing relevant data from a source database to the temporary store to prevent duplication. As it consumes new data chunk from the `data_gen` generator, it uses supplied metadata to discern and skip over data that was already saved. For this `data.index` must be of datetime type and `skip_fun` provided.
+    After updateing the target table, function appends accumulated log records extracted from metadata and `data.index` to the corresponding table log in the temporary store.
 
-    :param data_gen: A generator function that yields 2 outputs: `data` in 1st and `metadata` in last element.
+    :param data_gen: A generator function that yields `(data, metadata)`:
         `data` can be pandas or dask dataframe or list with dataframe in 1st element. This dataframe used here
-        to update `record` with 1st and last index values.
-        `data_gen` takes a single argument: `skip_for_meta` - function we constuct here from functions
-        `skip_fun`, `meta_to_record` and `table_from_meta`. `data_gen` should evaluate`skip_for_meta(meta)` to
-        determine whether to get chunk of data for current `metadata` from `db` or by continue processing
-        current data. When skipping, `data_gen` should yeild `data=None` with `metadata`. `metadata` is not
-        used here but re-yielded (beeng appended with `record` and `table`). Contraly, `meta` here is an
-        argument with which `meta_to_record` and `table_from_meta` will be called inside `skip_for_meta`.
+        to update `log_record` with 1st and last index values.
+        `data_gen` takes a single argument: `skip_for_meta` - function we constuct here from other arguments:
+        `skip_fun`, `record_from_meta` and `table_from_meta`. `data_gen` should evaluate`skip_for_meta(meta)`:
+        - if it returns True then you should skip current cicle of getting data and on 1st cycle of new table
+            name yield:
+            - `(None, metadata)` to indicate us to load all data from db without limiting its last time, or
+            - `(data, metadata)` to indicate us to load data from db till `data.index[0]` time.
+            For loaded data from `db` we call `in_cycle_fun` and yield it. For second variant we will
+            call `in_cycle_fun` for `data` and yield it too.
+        - if it returns False on 1st cycle of new table then existed data will be skipped and we will call
+        `in_cycle_fun` for your (new) `data` and yield it.
+        Note: `metadata` is not used here but re-yielded (beeng appended with `record` and `table`). Contraly,
+        `meta` here is an argument of `record_from_meta` (and my be `table_from_meta`) you provide, which will
+        be called inside `skip_for_meta`.
     :param db: An open HDFStore object for the source database. If None, `db_path` must be provided.
     :param db_path: The file path to the source HDF5 file. Used to open the store if `db` is not provided.
     :param temp_db: An open HDFStore object for the destination temporary database. If None, `temp_db_path`
         must be used.
     :param temp_db_path: The file path to the destination temporary HDF5 file. Used to open the store if
         `temp_db` is not provided or else db_path with appending f"{db_path.stem}_not_sorted.h5" name.
-    :param in_cycle_fun: A function called for each chunk of data. It should take
-        a `temp_db` HDFStore, a `table` name, a data chunk, and perform an action such as appending the data
-        chunk to the table.
+    :param in_cycle_fun: A function called for each chunk of data. It should take a `temp_db` HDFStore,
+        a `table` name, a `data` chunk, and perform an action such as appending the data chunk to the table.
     :param after_cycle_fun: A function called after all data chunks have been processed. It should take
         `temp_db`, `table`, `table_log`, a list of accumulated log records (list containinb `existing` log
-        DataFrame and appended dicts from `meta_to_record()` outputs), and perform an action such as appending
-        records to the log table in `temp_db` and return list of table names. These returned tables will be
-        moved back to `db` in addition to `table` after processing of all tables and closing `db`.
-        Child tables may be not needed to return if I made that they are move automatically (todo: check)
-    :param meta_to_record: A function that returns a log record `log_record` from current `meta`
+        DataFrame and appended dicts from `record_from_meta()` outputs), and perform an action such as
+        appending records to the log table in `temp_db` and return list of table names. These returned tables
+        will be moved back to `db` in addition to `table` after processing of all tables and closing `db`.
+        Child tables may be not needed to return if I've made that they are moved automatically (todo: check)
+    :param record_from_meta: A function that returns a log record `log_record` from current `meta`
         (`skip_for_meta` argument). This record must have fields requred by `skip_fun` to compare to existed
         log. `log_record` can be Mapping or DataFrame, here it will be updated with "index" and "DateEnd"
         fields from 1st and last `data` rows of `data_gen` output and will be saved to hdf5 log by `add_log`
     :param skip_fun: A function(`cur`, `existing`) that evaluates a chunk of current log record `cur` against
         the `existing` log records that will be loaded from `table_log` of source `db`. It determines whether
-        the corresponding data chunk should be skipped (returns True, or False otherwise).
-    :param table_from_meta: An optional function that, given `meta`, returns a tuple of table and table log
-        names. So it dynamically determines the `table` and `table_log` for each chunk of metadata processed
-        by `data_gen`.
+        the corresponding data chunk should be skipped (returns True, or False otherwise). If keep default
+        then meta should have "fileName" and "fileChangeTime" fields (see `keep_recorded_file()`).
+    :param table_from_meta: An optional function(`meta`) which returns `table` name (dynamically determines
+        it for each chunk of metadata processed by `data_gen`)
     :param table: The name of the table in the source `db` that will be copied and appended in target
         `temp_db`. Required if `table_from_meta` is not provided.
     :param table_log: Required, the name of the logging table in the `db`. Used to get existing log and to
@@ -3032,30 +3122,33 @@ def append_through_temp_db_gen(
     Yields (data, (metadata, log_record, table)):
     - metadata: from data_gen(). For copied old data it will be the same as for 1st new data
     - log_record: all log records corresponded to copied old data part in 1st chunk and empty list for its
-    next chunks, `meta_to_record(meta)` outputs for new data
+    next chunks, `record_from_meta(meta)` outputs for new data
     - table: table name where data has been copied / appended
     """
-
-    if db is None and db_path is None:
-        yield from data_gen(skip_for_meta=None)
+    if db is None and db_path is None:  # Not docomented option!
+        lf.warning("No db or db_path set! Trying yield from data_gen without setting log record")
+        for i_gen, (data, metadata) in enumerate(data_gen(skip_for_meta=None)):
+            log_cur = {}  # record_from_meta(meta)
+            yield data, (metadata, log_cur, table)
+        # yield from data_gen(skip_for_meta=None)  # old
         return
 
-    tbl_written = []
+    tbl_written = set()
     with nullcontext(db) if db is not None or not db_path.is_file() else pd.HDFStore(db_path, mode="r") as db:
         # Initialize the data generator with the skip function
         if table_from_meta:
             # This variables will be captured by the nested function
-            existing_log = None  # argument for `skip_fun`
+            existing_log = pd.DataFrame()  # argument for `skip_fun`
             table_prev = None  # current table tracker
             table_log_pattern = table_log
             b_new_table = True
             # info from current meta to append to hdf5 log:
             # - index: data start time to trim existed log and data,
             # "fileName", "fileChangeTime" fields to use in `skip_fun`
-            log_cur = None
+            log_cur = {}
 
             def get_existing_log_and_update_nonlocals(meta):
-                """Callback to update 'existing_log' and 'b_new_table' in outer context."""
+                """Callback to update `existing_log`, `table`, `table_log`, `b_new_table` in outer context."""
                 nonlocal existing_log, table_prev, table, table_log, b_new_table
                 table = table_from_meta(meta)
                 b_new_table = table_prev != table or existing_log is None
@@ -3071,7 +3164,7 @@ def append_through_temp_db_gen(
                 `get_existing_log_and_update_nonlocals()` in outer context
                 """
                 nonlocal log_cur
-                log_cur = meta_to_record(meta)
+                log_cur = record_from_meta(meta)
                 return skip_fun(
                     cur=log_cur, existing=get_existing_log_and_update_nonlocals(meta)
                 )
@@ -3081,7 +3174,7 @@ def append_through_temp_db_gen(
             def get_existing_along_skip(meta):
                 nonlocal log_cur, b_new_table, table_prev
 
-                log_cur = meta_to_record(meta)
+                log_cur = record_from_meta(meta)
                 b_skip = skip_fun(cur=log_cur, existing=existing_log)
 
                 # Set `b_new_table` to False after second chunk of new data
@@ -3104,54 +3197,22 @@ def append_through_temp_db_gen(
 
             for i_gen, (data, metadata) in enumerate(appending_generator):
 
-                # When a new table changed (if `table_from_meta` is provided, a new `table`, `table_log` and
+                # When table changed (if `table_from_meta` is provided, a new `table`, `table_log` and
                 # `existing_log` can be obtained in the callback in `get_existing_along_skip()`)
                 if b_new_table:
-
-                    # Append all metadata log records for the previous table if they exists
-                    if logs_all:
-                        tbl_written.append(table)
-                        tbl_written += after_cycle_fun(temp_db, table, table_log, logs_all)
 
                     # Initialise the log records for new table
                     logs_all = []
                     if data is None:
-                        # if skipped, loading old data will be used for all `existing_log` records
+                        # if new data skipped, loading old data will be used for all `existing_log` records
                         log_old = existing_log
                         start_date = None  # not limit old data last time
                     else:
-                        # log record of new data
-                        data_frame = data[0] if isinstance(data, list) else data
-                        start_date, end_date = (
-                            data_frame.divisions[:: len(data_frame.divisions) - 1]
-                            if is_dask_dataframe(data_frame)
-                            else data_frame.index[[0, -1]].to_list()
-                        )
-                        if isinstance(log_cur, pd.DataFrame):
-                            if "DateProc" not in log_cur.columns:
-                                log_cur["DateProc"] = datetime.now()
-                            if log_cur.shape[0] == 1:
+                        # append log record about new data
+                        update_log_record_with_dates(log_cur, df=data[0] if isinstance(data, list) else data)
 
-                                # If log index is not datetime, then replace it to current data.index[0]
-                                if not pd.api.types.is_datetime64_any_dtype(log_cur.index):
-                                    log_cur.set_index([start_date])
-
-                                # Add row or replace values
-                                log_cur.loc[start_date, ["DateEnd", "DateProc"]] = [end_date, datetime.now()]
-                            elif any(log_cur.index == start_date):
-                                # If log_cur.index contains data.index[0] then do not add row
-
-                                # if log_cur.DateEnd not contains end_date then replace its last DateEnd
-                                if not any(log_cur.DateEnd == end_date):
-                                    log_cur.loc[log_cur.index[-1], ["DateEnd", "DateProc"]] = [
-                                        end_date, datetime.now()]
-                            else:
-                                log_cur.loc[start_date, ["DateEnd", "DateProc"]] = [end_date, datetime.now()]
-                        else:
-                            log_cur["index"] = start_date
-                            log_cur["DateEnd"] = end_date
-                            log_cur["DateProc"] = datetime.now()
-
+                        # limit old data last time
+                        start_date = log_cur["index"]
                         # Part of log records of existed data we want to keep and yield first
                         log_old = existing_log[existing_log.index <= start_date]
 
@@ -3168,14 +3229,15 @@ def append_through_temp_db_gen(
                             log_old = log_old[~b_time_repeats]
 
                         # Copy relevant data from the original db to the temp_db (by default) and yield it
-                        for data_old in older_gen(
-                            db, table, start_date, chunksize, b_time_repeats_any
-                        ):
+                        for data_old in older_gen(db, table, start_date, chunksize, b_time_repeats_any):
                             in_cycle_fun(temp_db, table, data_old)
                             yield data_old, (metadata, log_old, table)
                             # Collect the old logs, empty their further output (yielded all in 1st chunk)
                             if not logs_all:
                                 logs_all, log_old = [log_old], log_old.iloc[:0]
+                elif data is not None:
+                    # append log record about new data
+                    update_log_record_with_dates(log_cur, df=data[0] if isinstance(data, list) else data)
 
                 # Append the current data chunk to the temp_db
                 if data is not None:
@@ -3185,11 +3247,14 @@ def append_through_temp_db_gen(
                     # Collect log records for the current table
                     logs_all.append(log_cur)
 
-            # After processing all data, append metadata for the last table
-            if logs_all:
-                tbl_written.append(table)
-                tbl_written += after_cycle_fun(temp_db, table, table_log, logs_all)
+                # Append metadata log records for table and collect written tables (they can change each iter)
+                if logs_all:
+                    tbl_written.add(table)
+                    tbl_written.update(after_cycle_fun(temp_db, table, table_log, logs_all))
 
+            # Make ready for ptrepack (our wrapping would do the same adding indexes but on error with msg)
+            for tbl in tbl_written:
+                temp_db.create_table_index(tbl, columns=["index"], kind="full")  # ,optlevel=9
             temp_db.flush(fsync=True)  # Ensure all data is written to disk
 
     # Replace all data in DB tables with data written to temporary DB tables
@@ -3200,5 +3265,5 @@ def append_through_temp_db_gen(
                 tbl_names=tbl_written
             )
             return failed_storages
-        except Ex_nothing_done as e:
+        except Ex_nothing_done:
             lf.warning("Tables {} of combined data not moved", tbl_written)

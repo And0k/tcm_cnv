@@ -1086,7 +1086,7 @@ def time_corr(
                 b_same_prev &= ~b_ok_in
 
             msg = ', '.join(
-                f'{fault} time ({n} times)' for (n, fault) in ((n_same, 'non-increased'), (n_bad_in, 'NaN')) if n > 0
+                f'{fault} time ({n} times)' for (n, fault) in ((n_same, 'non-increased'), (n_bad_in, 'nan')) if n > 0
                 )
             if msg:
                 lf.warning('{:s} is detected! ↦ interp ', msg)

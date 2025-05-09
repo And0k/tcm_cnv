@@ -15,11 +15,7 @@ from numba import jit
 from pandas.tseries.frequencies import to_offset
 # from  pandas.tseries.offsets import DateOffset
 from dateutil.tz import tzoffset
-if __debug__:
-    # datetime converter for a matplotlib plotting method
-    from pandas.plotting import register_matplotlib_converters
 
-    register_matplotlib_converters()
 # from future.moves.itertools import zip_longest
 # from builtins import input
 # from debug import __debug___print
@@ -29,6 +25,15 @@ from .filters import l
 from .utils2init import LoggingStyleAdapter
 
 lf = LoggingStyleAdapter(logging.getLogger(__name__))
+if __debug__:
+    # datetime converter for a matplotlib plotting method
+    try:
+        import matplotlib
+        from pandas.plotting import register_matplotlib_converters
+    except ImportError:
+        lf.warning("matplotlib not installed, but may be needed for display/save data images")
+    else:
+        register_matplotlib_converters()
 
 dt64_1s = np.int64(1e9)
 
@@ -148,8 +153,11 @@ def pd_period_to_timedelta(period: str) -> pd.Timedelta:
         number_and_units = (1, number_and_units[1])
     else:
         number_and_units = (int(number_and_units[0]), number_and_units[1])
-    return pd.Timedelta(*number_and_units)
-
+    try:
+        return pd.Timedelta(*number_and_units)
+    except Exception as e:  # pandas._libs.tslibs.np_datetime.OutOfBoundsTimedelta: Cannot cast 365100 from D to 'ns' without overflow.
+        out_frac = pd.Timedelta(number_and_units[0]/1000, number_and_units[1], resolution='ms')
+        return out_frac * 1000
 
 def intervals_from_period(
     datetime_range: Optional[np.ndarray] = None,
@@ -160,7 +168,7 @@ def intervals_from_period(
 ) -> Tuple[pd.Timestamp, pd.DatetimeIndex]:
     """
     Divide datetime_range on intervals of period, normalizes starts[1:] if period>1D and returns them in tuple's 2nd element
-    :param period: pandas offset string 'D' (Y, D, 5D, H, ...) if None such field must be in cfg_in
+    :param period: pandas offset string 'D' (D, 5D, h, ...) if None such field must be in cfg_in
     :param datetime_range: list of 2 elements, use something like np.array(['0', '9999'], 'datetime64[s]') for all data.
     If not provided 'min_date' and 'max_date' will be used
     :param min_date, max_date: used if datetime_range is None. If neither provided then use range from 2000/01/01 to now
@@ -300,7 +308,7 @@ def matlab2datetime64ns(matlab_datenum: np.ndarray) -> np.ndarray:
     return ((matlab_datenum + origin_day) * day_ns).astype('datetime64[ns]')  # - LOCAL_ZONE_m8
 
 
-# assert matlab2datetime64ns.nopython_signatures # this was compiled in nopython mode
+# assert matlab2datetime64ns.nopython_signatures  # this was compiled in nopython mode
 
 def date_from_filename(file_stem: str, century: str = '20'):
     """

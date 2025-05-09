@@ -8,10 +8,10 @@ from tcm import cfg_dataclasses as cfg_d
 import tcm.incl_h5clc_hy as testing_module
 
 text_path = Path(
-    r'd:\Work\_Python3\And0K\tcm\tests\data\inclinometer\_raw\mag_components_calibration.zip\I*{id}.TXT'
+    r'C:\Work\Python\AB_SIO_RAS\tcm\tests\data\inclinometer\_raw\mag_components_calibration.zip\I*{id}.TXT'
 )
 # path_db = Path(
-#     r'D:\Work\_Python3\And0K\h5toGrid\inclinometer\tests\data\inclinometer\210519incl.h5'
+#     r'C:\Work\Python\AB_SIO_RAS\h5toGrid\inclinometer\tests\data\inclinometer\210519incl.h5'
 #     ).absolute()
 
 
@@ -33,20 +33,20 @@ text_path = Path(
 
 bins = [600]  # s
 coefs_path = Path(
-    r'd:\Work\_Python3\And0K\h5toGrid\inclinometer\tests\data\inclinometer\incl#b.h5'
+    r'C:\Work\Python\AB_SIO_RAS\h5toGrid\inclinometer\tests\data\inclinometer\incl#b.h5'
     # r'd:\WorkData\~configuration~\inclinometer\190710incl_no_pid&string_date.h5'
-    # r'd:\WorkData\~configuration~\inclinometer\190710incl.h5'
+    # r'C:\Work\Python\AB_SIO_RAS\tcm\tcm\cfg\coef\190710incl.h5'
     # r'd:\WorkData\_experiment\inclinometer\230428_stand,tank,pres@ip1-6\_raw\230428tank.raw.h5'
 ).as_posix()
 
 
-def test_call_example_loading_from_raw_db():
+def test_tcm_proc_loading_from_raw_db():
 
     sys_argv_save = sys.argv.copy()
     sys.argv = [__file__]  # config dir will be relative to this dir
     path_db_raw = Path(  # for 3rd variant
-        r"d:\Work\_Python3\And0K\tcm\tests\data\inclinometer\_raw\data.raw.h5"
-    )   # d:\Work\_Python3\And0K\tcm\tests\data\inclinometer\_raw\data.raw.h5
+        r"C:\Work\Python\AB_SIO_RAS\tcm\tests\data\inclinometer\_raw\data.raw.h5"
+    )   # C:\Work\Python\AB_SIO_RAS\tcm\tests\data\inclinometer\_raw\data.raw.h5
     out_dicts = cfg_d.main_call(
         [
             f'in.path="{path_db_raw}"',
@@ -65,7 +65,7 @@ def test_call_example_loading_from_raw_db():
 
 
 # @pytest.mark.parametrize('return_', ['<end>', '<cfg_before_cycle>'])
-def test_call_example_with_cmd_line_args(return_=None):
+def test_tcm_proc_with_cmd_line_args(return_=None):
     sys_argv_save = sys.argv.copy()
     sys.argv = [__file__]  # config dir will be relative to this dir
 
@@ -132,7 +132,7 @@ def test_call_example_with_cmd_line_args(return_=None):
             # hydra / sweeper / params =
             # hydra.job.chdir=true
             'program.return_="<cfg_input_files_to_json>"',  # "<cfg_input_files>"
-            "--config-path=d:/Work/_Python3/And0K/tcm/tests/data/inclinometer/_raw/cfg_proc"
+            "--config-path=C:/Work/Python/AB_SIO_RAS/tcm/tests/data/inclinometer/_raw/cfg_proc"
             # ../tests/data/inclinometer/_raw/hydra_cfg'  # works but it is relative to curdir,
             "--multirun",  # no effect
         ],
@@ -154,7 +154,7 @@ def test_call_example_with_cmd_line_args(return_=None):
 #     "<cfg_input_files_meta>",
 #     "<cfg_input_files_meta_to_yaml>"
 # ])
-def test_call_example_with_overriding_dict(return_=None):
+def test_tcm_proc_with_overriding_dict(return_=None):
     """Overwrites default config using dict in arguments and config file probes/inclinometers.yaml"""
     sys_argv_save = sys.argv.copy()
     sys.argv = [__file__]  # config dir will be relative to this dir
@@ -191,17 +191,17 @@ def test_call_example_with_overriding_dict(return_=None):
 
     sys.argv = sys_argv_save
 
-def test_call_example_with_overriding_file(return_=None):
+def test_tcm_proc_with_overriding_cfg_file(return_=None):
     sys_argv_save = sys.argv.copy()
     sys.argv = [__file__]  # config dir will be relative to this dir
     cfg_proc_path = Path(  # for 3rd variant
-        r"d:\Work\_Python3\And0K\tcm\tests\data\inclinometer\_raw\cfg_proc\defaults\b10_20240610_093018.yaml"
+        r"C:\Work\Python\AB_SIO_RAS\tcm\tests\data\inclinometer\_raw\cfg_proc\defaults\b10_20240610_093018.yaml"
     )
     cfg_proc_stems = ["b08_20240610_093018", cfg_proc_path.stem]
     # cfg_proc_path = r"d:\WorkData\_experiment\inclinometer\_type_b\231009_tank@iB18,25-30\_raw\cfg_proc"
     # not works with "quotes":
     # cfg_proc_path_relative = os.path.relpath(
-    # cfg_proc_path.parent, r"d:\Work\_Python3\And0K\tcm"
+    # cfg_proc_path.parent, r"C:\Work\Python\AB_SIO_RAS\tcm"
     # )
 
     out_dicts = cfg_d.main_call(
@@ -240,7 +240,7 @@ def test_call_example_with_overriding_file(return_=None):
 
 
 if __name__ == '__main__':
-    # test_call_example_loading_from_raw_db()
-    # test_call_example_with_cmd_line_args()
-    # test_call_example_with_overriding_dict()
-    test_call_example_with_overriding_file()
+    test_tcm_proc_loading_from_raw_db()
+    # test_tcm_proc_with_cmd_line_args()
+    # test_tcm_proc_with_overriding_dict()
+    # test_tcm_proc_with_overriding_cfg_file()
