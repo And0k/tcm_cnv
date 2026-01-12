@@ -2,8 +2,9 @@ import logging
 import re
 import sys
 from collections import defaultdict
+from datetime import datetime
 from functools import partial, update_wrapper
-from itertools import islice, dropwhile
+from itertools import islice
 from io import StringIO
 from pathlib import Path, PurePath
 import glob
@@ -26,7 +27,7 @@ from typing import (
     TextIO,
     Iterator,
 )
-from operator import gt, lt
+# from operator import gt, lt
 import numpy as np
 import pandas as pd
 # from pandas.tseries.frequencies import to_offset
@@ -36,7 +37,7 @@ import pandas as pd
 # import cfg_dataclasses as cfg_d
 # import incl_h5clc_hy
 from . import (csv_specific_proc, utils_time_corr)
-# from to_pandas_hdf5.csv2h5 import main as csv2h5
+# from hdf5_pandas.csv2h5 import main as csv2h5
 from .utils2init import (
     Ex_nothing_done, ExitStatus, LoggingStyleAdapter, set_field_if_no, dir_create_if_need,
     this_prog_basename, init_logging, open_csv_or_archive_of_them, standard_error_info,
@@ -290,8 +291,8 @@ def csv_process(
     #         continue
     #     b_ok[op(time_cor, pd.Timestamp(date_lim, tz=None if date_lim.tzinfo else 'UTC'))] = False
 
-    # Also mask by time_ranges if it was set
-    apply_time_ranges_mask(time_cor, time_ranges=cfg_in.get('time_ranges'), mask=b_ok)
+    # Filter by `time_ranges` (in contrast to utils_time_corr.time_corr min/max filtering allows many ranges)
+    b_ok = mask_time_ranges(time_cor, time_ranges=cfg_in.get("time_ranges"), mask=b_ok)
 
     t_prev = df.loc[df.index[-n_overlap:], 'Time']
     # Removing rows with bad time
@@ -310,7 +311,7 @@ def csv_process(
     return df_filt, t_prev
 
 
-def apply_time_ranges_mask(time, time_ranges, mask=None):
+def mask_time_ranges(time: pd.Series|pd.DatetimeIndex, time_ranges: Sequence[datetime], mask=None):
     """
     Update input ``mask`` by ``time_ranges`` or return time ranges mask
     """
@@ -319,17 +320,19 @@ def apply_time_ranges_mask(time, time_ranges, mask=None):
     elif len(time_ranges) % 2:
         time_ranges += [pd.NaT]
     b_ok_t = np.zeros(time.size, dtype=bool)
+
+    tz=(time.dt.tz if isinstance(time, pd.Series) else time.tzinfo) or None
     for t_st, t_en in zip(time_ranges[::2], time_ranges[1::2]):
-        t_st = pd.Timestamp(t_st, tz=(t_st.tzinfo or time.tzinfo) if time.tzinfo else None)
+        t_st = pd.Timestamp(t_st, tz=t_st.tzinfo or tz if tz else None)
         if pd.isna(t_en):
             b_ok_t[(t_st <= time)] = True
         else:
-            t_en = pd.Timestamp(t_en, tz=(t_en.tzinfo or time.tzinfo) if time.tzinfo else None)
+            t_en = pd.Timestamp(t_en, tz=t_en.tzinfo or tz if tz else None)
             b_ok_t[(t_st <= time) & (time <= t_en)] = True
     if mask is None:
         return b_ok_t
-    mask &= b_ok_t
-
+    b_ok_t &= mask
+    return b_ok_t
 
 def range_message(range_source, n_ok_time, n_all_rows):
     t = range_source() if isinstance(range_source, Callable) else range_source
@@ -373,7 +376,7 @@ def csv_read_gen(
 
     :yield: tuple (i1_path, i_chunk, path, df_filt) where
     - i1_path: 1-based counter of yielded data,
-    - i_chunk: 0-based counter of chunks,
+    - i1_chunk: 1-based counter of chunks,
     - path: file name,
     - df_filt: dataframe with time index and only columns listed in `cfg_in['dtype_out']`.names
     """
@@ -441,16 +444,18 @@ def csv_read_gen(
                     df = pd.concat([df_1st_row, df_last_rows.iloc[[-1]]])
                     df_filt, t_prev = csv_process(df, cfg_in, t_prev)
                     cfg_in['n_rows'] = float('nan')  # we don't know number of rows available
-                    yield i1_path, 0, path, df_filt  # i_chunk = 0 (we not use chunks)
+                    yield i1_path, 1, path, df_filt  # i1_chunk = 1 (caller expect 1st chunk)
                 else:
                     # Normal loading
 
-                    for i_chunk, df in enumerate(pd.read_csv(path, **read_csv_args, index_col=False)):
+                    for i1_chunk, df in enumerate(
+                        pd.read_csv(path, **read_csv_args, index_col=False), start=1
+                    ):
                         df_filt, t_prev = csv_process(df, cfg_in, t_prev)
                         cfg_in['n_rows'] += len(df)
                         if df_filt is None:
                             continue
-                        yield i1_path, i_chunk, path, df_filt
+                        yield i1_path, i1_chunk, path, df_filt
                 break
             except pd.errors.ParserError:  # for example NotImplementedError if bad file
                 if (read_csv_args['on_bad_lines'] not in ('warn', 'skip')
@@ -464,6 +469,37 @@ def csv_read_gen(
 
             # lf.exception('If file "{}" have no data try to delete it?', paths)
 
+format_parts_all = {  # columns formats in order to join (some may be skipped) for any input type
+    "yyyy(text),mm(text),dd(text),HH(text),MM(text),SS(text)": {
+        "regex": csv_specific_proc.century + rb"\d{2}(,\d{1,2}){5}",
+        "dtype": "|S4 |S2 |S2 |S2 |S2 |S2",
+    },
+    "Ax,Ay,Az,Mx,My,Mz": {
+        "regex": rb"(,\-?\d{1,6}){6}",
+        "dtype": "i2 i2 i2 i2 i2 i2",
+    },
+    "P_counts": {
+        "regex": rb"(,\-?\d{1,8})",
+        "dtype": "i4",
+    },
+    "Temp,Battery": {
+        "regex": rb",\d{1,2}(\.\d{1,2})?,\-?\d{1,3}(\.\d{1,2})?",
+        "dtype": "f8 f8",
+    },
+    "Battery,Temp": {
+        "regex": rb",\d{1,2}(\.\d{1,2})?,\-?\d{1,3}(\.\d{1,2})?",
+        "dtype": "f8 f8",
+    },
+}
+
+def format_parts_select(text_type):
+    b_default_type = text_type in ('i', '', 'b')
+    return ["yyyy(text),mm(text),dd(text),HH(text),MM(text),SS(text)"] + (
+        (["Ax,Ay,Az,Mx,My,Mz"] if text_type != "w" else []) + (
+            ["Temp,Battery"] if b_default_type else ["P_counts", "Battery,Temp"]  # if text_type == 'p'
+        )
+    )
+
 
 def config_text_regex(text_type) -> bytes:
     """
@@ -475,15 +511,18 @@ def config_text_regex(text_type) -> bytes:
     """
     if text_type is None:
         return None
-    b_default_type = text_type in ('i', '', 'b')
-    text_line_regex = b'^(?P<use>' + csv_specific_proc.century + br'\d{2}(,\d{1,2}){5}' + (  # date & time
-        br'(,\-?\d{1,6}){6},\d{1,2}(\.\d{1,2})?,\-?\d{1,3}(\.\d{1,2})?).*' if b_default_type else
-        br'(,\-?\d{1,6}){6}(,\-?\d{1,8}),\d{1,2}(\.\d{1,2})?,\-?\d{1,3}(\.\d{1,2})?).*'  # if text_type == 'p'
-        # Ax,y,z,Mx,y,z,ADC,T,Bat
-    )                                   # ,160,-2576,-13808,-111,62,547
-        # br'(,\-?\d{1,2}\.\d{2}){2}).*' if text_type == 'w'           # ,1849841,21.63,5.42
+    parts = format_parts_select(text_type)
+    return b"".join(
+        [b"^(?P<use>"] + [p["regex"] for k, p in format_parts_all.items() if k in parts] + [b").*"]
+    )
 
-    return text_line_regex
+    # b_default_type = text_type in ('i', '', 'b')
+    # csv_specific_proc.century + br'\d{2}(,\d{1,2}){5}' + (  # "(?P"+date+time
+    #     br'(,\-?\d{1,6}){6},\d{1,2}(\.\d{1,2})?,\-?\d{1,3}(\.\d{1,2})?' if b_default_type else
+    #     br'(,\-?\d{1,8})(,\-?\d{1,2}(\.\d{2})?){2}' if text_type == 'w' else  # ,1849841,21.63,5.42
+    #     br'(,\-?\d{1,6}){6}(,\-?\d{1,8}),\d{1,2}(\.\d{1,2})?,\-?\d{1,3}(\.\d{1,2})?'  # if text_type == 'p'
+    #     # Ax,y,z,Mx,y,z,ADC,T,Bat
+    # ) + b").*"
 
 
 def config_text_header_dtype(text_type) -> dict[str, Any]:
@@ -491,14 +530,22 @@ def config_text_header_dtype(text_type) -> dict[str, Any]:
         return {}
     if text_type not in ('i', 'p', 'b', 'd', 'w'):
         raise TypeError('Probe model not recognized!')
-    b_default_type = text_type in ('i', '', 'b')
-    cfg_for_type = {
-        "header": "yyyy(text),mm(text),dd(text),HH(text),MM(text),SS(text),Ax,Ay,Az,Mx,My,Mz"
-        + (",Battery,Temp" if b_default_type else ",P_counts,Temp,Battery"),
-        "dtype": "|S4 |S2 |S2 |S2 |S2 |S2 i2 i2 i2 i2 i2 i2 f8 f8".split()
-        + ([] if b_default_type else ["f8"]),
+    # b_default_type = text_type in ('i', '', 'b')
+    parts = format_parts_select(text_type)
+    return {
+        "header": ",".join(parts),
+        "dtype": [t for k, p in format_parts_all.items() if k in parts for t in p["dtype"].split()],
     }
-    return cfg_for_type
+
+    # cfg_for_type = {
+    #     "header": "yyyy(text),mm(text),dd(text),HH(text),MM(text),SS(text)" + (
+    #         ",Ax,Ay,Az,Mx,My,Mz"
+    #         + (",Battery,Temp" if b_default_type else ",P_counts,Temp,Battery")
+    #     ),
+    #     "dtype": "|S4 |S2 |S2 |S2 |S2 |S2 i2 i2 i2 i2 i2 i2 f8 f8".split()
+    #     + ([] if b_default_type else ["f8"]),
+    # }
+    # return cfg_for_type
 
 
 def config_text_header_dtype_regex(text_type) -> dict[str, Any]:
@@ -518,34 +565,47 @@ def config_text_header_dtype_regex(text_type) -> dict[str, Any]:
     }
 
 
-raw_pattern_default = '*{prefix:}{number:0>3}*.[tT][xX][tT]'
+raw_re_ptn_default = '*{prefix:}{number:0>{digits}}*.[tT][xX][tT]'
+
+
+def split_list(itr: Iterable, condition_func):
+    """
+    Most efficient version using conditional accumulation in single pass.
+    """
+    true_items, false_items = [], []
+    for f in itr:
+        (true_items if condition_func(f) else false_items).append(f)
+    return true_items, false_items
 
 
 def correct_files(
-    raw_parent, raw_subdir='',
-    raw_pattern=raw_pattern_default,
-    prefix='I*',  # 'INKL_'
+    raw_parent,
+    raw_subdir="",
+    raw_re_ptn=raw_re_ptn_default,
+    prefix="I*",  # 'INKL_'
+    mod_name=partial(csv_specific_proc.mod_name, add_prefix="@"),
     probes: Optional[Iterable[Any]] = None,
-    mod_name=partial(csv_specific_proc.mod_name, add_prefix='@'),
     fun_correct=None,
     sub_str_list: Optional[Union[Callable[[str], Union[str, bytes]], Sequence[Union[str, bytes]]]] = None,
-    **kwargs
+    **kwargs,
 ) -> Dict[Tuple[str, int], list[Path]]:
     """
     Find and correct with `fun_correct` raw files for specified probes. If file for probe is not a
     path/mask then search corrected file.
+    Note: devices must be able to detected from file names with `csv_specific_proc.parse_name()`
     :param raw_parent:
     :param raw_subdir: Optional subdir or zip/rar archive name (data will be unpacked) in "path_cruise/_raw".
     Symbols * and ? are not supported for directories (to load from many directories/archives) but `prefix`
     and `number` format strings are available instead.
-    :param raw_pattern: mask to find raw files: Python "format" command pattern to format with {prefix} and
-    {number} placeholders (where prefix is a ``prefix`` argument and number will be one of specified in
-    ``probes`` arg). To match files in archive the subdirectories can be prepended with "/" but files will be
-    unpacked with flattened path in created dir with name constructed from path in archive
+    :param raw_re: mask to create blob to find raw files with command:
+    `raw_re.format(prefix={prefix}, number={number}, model={model})`
+    Here prefix is a ``prefix`` argument and number will be one of specified in ``probes`` arg.
+    To match files in archive the subdirectories can be prepended with "/" but files will be
+    unpacked with flattened path in created dir with name constructed from path in archive.
     :param prefix: word, that should be in raw input file
     :param probes: iterable of probes identifiers. Can be
     - digit: if only one device type for each prober number (include device type in prefix).
-    - {model}{number}: {model} should not contain digits, do not repeat model in ``prefix``.
+    - {model}{number}: {model} should not contain digits, do not repeat 1st model letters which in ``prefix``.
     - None: to use numbers < 100 (we will format them as 2-digit words from '01' to '99')
     :param fun_correct: callable returning Path of corrected file with arguments (as in
     csv_specific_proc.correct_txt() except ``sub_str_list`` argument):
@@ -564,37 +624,44 @@ def correct_files(
       - number: int, probe number from input `probes` parameter
     - values: list of corrected files paths for probes
     """
+    # we will filter files stems by regex and use only suffix for glob
+    raw_ptn_re, raw_sfx = raw_re_ptn.split(".", -1)
+    raw_sfx = f".{raw_sfx}"
 
     # counter of processed files
     n_files_total = 0
     # collect files for each pid here
     probes_found = defaultdict(list)
 
-    if '{number' not in raw_pattern and '{id}' not in raw_pattern:
+    if '{number' not in raw_ptn_re and '{id}' not in raw_ptn_re:
         if not probes:
-            pattern_name_parts = csv_specific_proc.parse_name(raw_pattern.split('.', maxsplit=1)[0])
+            pattern_name_parts = csv_specific_proc.parse_name(raw_ptn_re)
             if pattern_name_parts is None:
                 probes = [None]
             else:
                 probes = [int(pattern_name_parts['number'])]
         else:
-            lf.warning(' '.join([
-                'No {number} or {id} part in in.raw_pattern configuration, so all matched files will be '
-                'assigned to ', f'each of specified {len(probes)} probes number' if len(probes) > 1
-                else f'specified probe "{probes[0]}"'
-            ]))
+            lf.warning(
+                " ".join([
+                    "No {number} or {id} part in raw regex pattern configuration, so all matched files will "
+                    "be assigned to",
+                    f"each of specified {len(probes)} probes number"
+                    if len(probes) > 1
+                    else f'specified probe "{probes[0]}"',
+                ])
+            )
 
-    def gen_pids(probes):
-        nonlocal raw_pattern
+    def gen_pids(probes, digits):
+        nonlocal raw_ptn_re
 
         def pid_pattern_from_number(number):
-            return f"[0bdp]{number:0>2}"  # 0 allows 3-digits numbers inputs
+            return f"[bdp]{number:0>{digits}}"  # 0 allows 3-digits numbers inputs
 
         all_models_search_pattern = "[ibdpw]"
         if probes is None:
             # Check all numbers in range 0-99
-            if 'number}' in raw_pattern:  # Ensure pattern is 2-digit to prevent ambiguity
-                raw_pattern = raw_pattern.replace("number}", "number:0>3}")
+            if 'number}' in raw_ptn_re:  # Ensure pattern is 2-digit to prevent ambiguity
+                raw_ptn_re = raw_ptn_re.replace("number}", "number:0>{digits}}")  # to iterate decreasing
             model = all_models_search_pattern
             for number in range(1, 100):
                 yield model, number, pid_pattern_from_number(number)
@@ -618,13 +685,15 @@ def correct_files(
     arc_suffix_ = [sfx for sfx in arc_supported_suffixes if sfx == arc_suffix_]
     arc_suffix_ = arc_suffix_[0] if arc_suffix_ else None
 
-    # Search files matched `subdir`/`pattern` matched current probe `pid` or its parts:
-    for digits in [3, 2]:
-        for model, number, pid in gen_pids(probes):
+    # Search files matched `subdir`/`ptn_re` matched current probe `pid` or its parts:
+    min_digits = 2
+    for digits in range(3, min_digits - 1, -1):
+        for model, number, pid in gen_pids(probes, digits):
             # Fill patten's placeholders `prefix`, `model`, `number`, `id`:
             # prefix_model = f"{prefix}{model}*"  #  if not prefix or prefix[-1] not in 'ibdpw' else '*'
             subdir = raw_subdir.format(prefix=prefix, model=model, number=number, id=pid)
-            pattern = raw_pattern.format(prefix=prefix, model=model, number=number, id=pid)
+            ptn_re = raw_ptn_re.format(prefix=prefix, model=model, number=number, id=pid, digits=digits)
+            ptn_re_with_sfx = f"{ptn_re}{raw_sfx}"
 
             # Search files for each probe sequentially (in dir specific to probe)
             for cur_dir in [raw_parent] if arc_suffix_ else (raw_parent.glob(subdir)):
@@ -638,52 +707,61 @@ def correct_files(
                 paths_not_corr = []
                 if arc_suffix:
                     # We will open archive and search inside later if no corrected files will be found in dir
-
                     # Corrected raw files output dir name if input is archive (for fun_correct())
                     _ = f"{str(cur_dir.stem).replace('/', '_')}@{arc_suffix[1:]}"
                     dir_cor_path = (raw_parent.parent if arc_suffix_ else raw_parent) / _
+                    ptn_re_in_arc_proc = (
+                        f"@{ptn_re_with_sfx}" if not ptn_re_with_sfx.startswith("@") else ptn_re_with_sfx
+                    )
 
-                    glob_processed_in_arc, pattern_to_get_corr_if_arc = \
-                        pattern, str(Path(glob.escape(dir_cor_path)) / pattern)
-                    if not glob_processed_in_arc[0] == '@':
-                        glob_processed_in_arc = f'@{glob_processed_in_arc}'
+                    pattern_to_get_corr_if_arc = str(Path(glob.escape(dir_cor_path)) / ptn_re_in_arc_proc)
+
+                    # glob_corrected = mod_name(  # for model and glob from ptn_re the parsing is required?
+                    #     pattern_to_get_corr_if_arc if arc_suffix else ptn_re, parse=False)[1].name  # parse=bool(pid)
+                    # glob_corrected = pattern_to_get_corr_if_arc
+                    # if not glob_corrected.startswith("@"):
+                    #     glob_corrected = f"@{glob_corrected}"
+                    # list(dir_cor_path.glob(glob_corrected))
+                    paths_cor = [
+                        f
+                        for f in dir_cor_path.glob(f"*{raw_sfx}")
+                        if f.stem.startswith("@")
+                        and (re.match(ptn_re, f.stem[1:]) or re.match(ptn_re, f.stem[1:].replace("_", "", 1)))
+                    ]
                 else:
                     # Search inside current probe raw subdir or use provided path to raw file
-                    if cur_dir.is_dir():
-                        paths_not_corr = list(
-                            file_in for file_in in cur_dir.glob(pattern) if not file_in.stem.startswith('@')
-                        )
-                        dir_cor_path = cur_dir
-                    else:
-                        dir_cor_path = raw_parent
-                        # else:
-                    #     parent_path = ''  # no more search raw files here for current pid
-                    glob_processed_in_arc = '@*'  # not compare name from archive
+                    paths_cor, paths_not_corr = split_list(  # f.is_dir()
+                        list(cur_dir.glob(f"*{raw_sfx}")) if cur_dir.is_dir() else cur_dir,
+                        lambda f: f.stem.startswith("@"),
+                    )
+                    paths_cor = [
+                        f
+                        for f in paths_cor
+                        if (re.match(ptn_re, f.stem[1:]) or re.match(ptn_re, f.stem[1:].replace("_", "", 1)))
+                    ]
+                    paths_not_corr = [f for f in paths_not_corr if re.match(ptn_re, f.stem)]
+                    dir_cor_path = cur_dir if cur_dir.is_dir() else raw_parent
+                    # else: parent_path = ''  # no more search raw files here for current pid
+                    ptn_re_in_arc_proc = '@.*'  # not compare name from archive
 
-                # If already have corrected files for pid with glob name = fun_correct_name(pattern) then use them
-                model, glob_corrected = mod_name(
-                    pattern_to_get_corr_if_arc if arc_suffix else pattern, parse=bool(pid))
-                paths = list((dir_cor_path if arc_suffix else cur_dir).glob(glob_corrected.name))
-                # or (raw_parent / cur_dir).glob(f"@{prefix_model}{number:0>2}.txt"  # f"{tbl}.txt"
-                if paths:
-                    lf.info('Corrected csv files found:\n{:s}', ',\n'.join(r.name for r in paths))
+                # If have corrected files for pid with glob name = fun_correct_name(ptn_re) then use them
+                if paths_cor:
+                    lf.info('Corrected csv files found:\n{:s}', ',\n'.join(r.name for r in paths_cor))
                     if paths_not_corr:
-                        # keep only that paths that has no corresponding corrected path
+                        # Keep only paths_cor that has no corresponding corrected path
                         _, paths_not_corr = paths_not_corr, []
                         for p in _:
-                            __, p_cor = mod_name(p, parse=False)
-                            if p_cor not in paths:
+                            p_cor = mod_name(p, parse=False)[-1]
+                            if p_cor not in paths_cor:  # PurePath in List(Path) works Ok
                                 paths_not_corr.append(p)
                         if paths_not_corr:
                             lf.info('Not corrected yet:\n{:s}', ',\n'.join(r.name for r in paths_not_corr))
+
                 n_files = 0  # files for pid found
-                for file_in in (
-                    (paths + paths_not_corr) or open_csv_or_archive_of_them(
-                        raw_parent / subdir, pattern=pattern
-                    )
+                for file_in in (paths_cor + paths_not_corr) or open_csv_or_archive_of_them(
+                    raw_parent / subdir, ptn_re=ptn_re_with_sfx
                 ):
-                    model, file = mod_name(file_in.name, parse=bool(pid))
-                    # (".name" is required for mod_name() if file_in is TextIOWrapper)
+                    model, file = mod_name(file_in.name, parse=bool(pid))  # ".name" to proc. TextIOWrapper
                     file = fun_correct(
                         file_in,
                         dir_out=dir_cor_path, binary_mode=False,
@@ -691,7 +769,7 @@ def correct_files(
                         sub_str_list=(
                             sub_str_list(model) if callable(sub_str_list) else
                             # If file_in is already converted file in archive just extracts to output dir:
-                            None if PurePath(file_in.name).match(glob_processed_in_arc) else
+                            None if re.match(ptn_re_in_arc_proc, file_in.name) else
                             sub_str_list
                         )
                     )
@@ -703,31 +781,39 @@ def correct_files(
                             raise FileExistsError(
                                 "\n".join(
                                     [
-                                        "Going to process same file again as another probe/data part! ",
-                                        "Maximum one file should be matched for each probe number: correct input file "
-                                        f'name pattern (current raw_pattern="{raw_pattern}") or rename files. ',
-                                        "Note: if You set path of input text file as dir, then default raw_pattern = "
-                                        f"{raw_pattern_default} will be used which is usually Ok"
-                                        if raw_pattern != raw_pattern_default
+                                        "Going to process same file again as another probe/data part! "
+                                        "Maximum one file should be matched for each probe number: correct "
+                                        "input file name regex pattern "
+                                        f'(current raw_re_ptn="{raw_re_ptn}") or rename files. ',
+                                        "Note: if You set path of input text file as dir, then default "
+                                        f"raw_re_ptn = {raw_re_ptn_default} will be used which is usually Ok"
+                                        if raw_re_ptn != raw_re_ptn_default
                                         else "",
-                                        f"Current files to probe (model, number) classification:"
-                                    ] +
-                                    [f'{c}: {", ".join([n.name for n in f])}' for c, f in probes_found.items()]
+                                        "Current files to probe (model, number) classification:",
+                                    ]
+                                    + [
+                                        f"{c}: {', '.join([n.name for n in f])}"
+                                        for c, f in probes_found.items()
+                                    ]
                                 )
                             )
                     else:
                         probes_found[(model, number)].append(file)
                 else:
                     if n_files == 0:
-                        (lf.debug if probes is None else lf.warning)('No {:s} files found', pattern)
+                        (lf.debug if probes is None else lf.warning)("No {:s} files found", ptn_re_with_sfx)
                         continue
                 n_files_total += n_files
-        if n_files_total or raw_pattern != raw_pattern_default:
+
+        # continue with decreased number of digits only if we not found with automatic ptn_re
+        if n_files_total or raw_re_ptn != raw_re_ptn_default:
             break
-        lf.warning(
-            'As no files found with default raw_pattern used, we try less digits in its {number} part...'
-        )
-        raw_pattern = raw_pattern_default.replace("0>3", "0>2")
+        if digits > min_digits:
+            lf.warning(
+                f"As no files found with default raw_re_ptn used, we try less digits ({digits-1}) in its "
+                "{{number}} part..."
+            )
+            # raw_re_ptn = raw_re_ptn_default.replace("0>3", "0>2")
 
 
     lf.info(*(
@@ -831,21 +917,21 @@ def search_correct_csv_files(
     #     raw_parent = next(
     #         dropwhile(lambda p: not p.suffix.lower() in (".zip", ".rar"), cfg_in["path"].parents)
     #     )
-    #     raw_pattern = raw_parent.name
+    #     raw_re_ptn = raw_parent.name
     #     raw_subdir = cfg_in["path"].relative_to(raw_parent).parent
     # except StopIteration:
 
     raw_parent = cfg_in['path'].parent
-    raw_pattern = cfg_in['path'].name
+    raw_re_ptn = cfg_in['path'].name
     if cfg_in['path'].is_dir() or (not cfg_in['path'].suffix or
-        sum(p.suffix.lower() in ('.zip', '.rar') or p.is_dir() for p in raw_parent.glob(raw_pattern))):
+        sum(p.suffix.lower() in ('.zip', '.rar') or p.is_dir() for p in raw_parent.glob(raw_re_ptn))):
         # raw_parent was found
-        raw_subdir = raw_pattern
-        raw_pattern = raw_pattern_default  # pattern work if need match cfg_in['probes']
+        raw_subdir = raw_re_ptn
+        raw_re_ptn = raw_re_ptn_default  # pattern work if need match cfg_in['probes']
     else:
         raw_subdir = raw_parent.name
         raw_parent = raw_parent.parent
-        # raw_pattern was found
+        # raw_re_ptn was found
 
     # type may be specified to get ``raw_corrected`` files
     cfg_text_type = cfg_in['text_type']
@@ -853,10 +939,12 @@ def search_correct_csv_files(
         cfg_in.update((  # keeping custom regex
             config_text_header_dtype_regex if cfg_in['text_line_regex'] is None else config_text_header_dtype
         )(cfg_text_type))
+    # Place corrected files with @-prefix and standard name of detected source PID (keeping user suffix) in
+    # source raw data directory along with input files (or in new `{archive_ext}!{archive_name}` for archives)
     raw_corrected = correct_files(
         raw_parent=raw_parent,
         raw_subdir=raw_subdir,
-        raw_pattern=raw_pattern,
+        raw_re_ptn=raw_re_ptn,
         fun_correct=partial(
             csv_specific_proc.correct_txt,
             dir_out=None,  # dir for cleaned (intermediate) raw files, None => same as cfg['in']['dir']
@@ -873,12 +961,16 @@ def search_correct_csv_files(
     return raw_corrected
 
 
-def pcid_from_parts(type: str = "i", model: str = None, number: str|int = None):
+def pcid_from_parts(type: Optional[str] = None, model: str = None, number: str|int = None, **kwargs):
     """
     Get Probe output Column ID (pcid)
-    :param probe_type: probe type ('i' for inclinometers)
-    :return: pcid
+    :param type: probe type, default: 'i' (inclinometers) or "" if model is "w" (wavegauges)
+    :return: pcid string:
+    If type, then place "_" between type and model, except return "i{number}" if type=model="i"
     """
+    if type is None:  # model is text type
+        type = "" if model == "w" else "i"
+
     if type == "i":
         if model:
             if model == "i":
@@ -888,7 +980,7 @@ def pcid_from_parts(type: str = "i", model: str = None, number: str|int = None):
                 _ = "_"
         else:
             _ = ""
-    elif type == "" and model == "i":
+    elif type == "":
         _ = ""
     else:
         _ = "_"
@@ -918,7 +1010,7 @@ def load_from_csv_gen(
     ...
     :param cfg_in_probe: optional dict with fields named equal to probe(s) {pid}(s) to update cfg_in
     in the cycle of loading probe data with settings specified to current probe
-    :param skip_for_meta: optional function to skip specific files taking `load_from_csv_gen` 2nd output argument
+    :param skip_for_meta: optional function to skip specific files. Argument equals to 2nd output argument
     :param return_:
         - None: iterator will yield all data
         - edge_rows_only: yielded `df` will have only edge csv rows and other rows will not be read from csv
@@ -941,7 +1033,14 @@ def load_from_csv_gen(
             lf.info('{:d} raw files...', n_raw_cor_found)
             for i1_pid, ((text_type, number), paths_csv) in enumerate(raw_corrected.items(), start=1):
                 for path_csv in paths_csv:
-                    yield None, (i1_pid, pcid_from_parts(model=text_type, number=number), path_csv)
+                    yield (
+                        None,
+                        (
+                            i1_pid,
+                            pcid_from_parts(model=text_type, number=number),
+                            path_csv,
+                        ),
+                    )
             return
         edge_rows_only = 'meta' in return_
     else:
@@ -992,7 +1091,12 @@ def load_from_csv_gen(
 
     # Loading files of corrected format and processing their data
     cfg_text_type = None
-    lf.info('Loading {:d} raw files...', n_raw_cor_found)
+    lf.info(
+        "Loading {:d} raw file{:s}{}...",
+        n_raw_cor_found,
+        "" if n_raw_cor_found == 1 else "s",
+        " by chunks" if cfg_in.get("blocksize") else "",
+    )
     for i1_pid, ((text_type, number), paths_csv) in enumerate(raw_corrected.items(), start=1):
         pid = pcid_from_parts(model=text_type, number=number)  # probe_type = "i"
         if skip_for_meta:
@@ -1020,7 +1124,6 @@ def load_from_csv_gen(
             # todo: add specific_proc function to perform
             # shift only if data less than `date_min` and `cfg_in_cur["date_to_from"][3,5,7...]`
             # to `cfg_in_cur["date_to_from"][2,4,6...]`
-            #
             # if len(cfg_in_cur["date_to_from"]) > 2:
             #     # for t_to, t_from in (cfg_in_cur["date_to_from"][2:]):
 
@@ -1040,22 +1143,22 @@ def load_from_csv_gen(
                 {**cfg_in_cur, **config_text_header_dtype_regex(text_type)}
             )
 
-        # Load from all found paths in parts
+        # Load from all found paths_cor in parts
         n_paths = len(paths_csv)
-        for i1_path, i_chunk, path_csv, df in csv_read_gen(**cfg_in_cur, edge_rows_only=edge_rows_only):
+        for i1_path, i1_chunk, path_csv, df in csv_read_gen(**cfg_in_cur, edge_rows_only=edge_rows_only):
             if not edge_rows_only:
                 lf.warning(
-                    '{: >2}. csv {:s}{:s}{:s} loading...',
-                    i1_pid, path_csv.stem,
-                    f' {i1_path}/{n_paths}' if n_paths > 1 else '',
-                    f'.{i_chunk}' if i_chunk else ''
+                    "{: >2}.{:d} {:s} {:s}loading...",
+                    i1_pid,
+                    i1_chunk if cfg_in_cur.get("blocksize") else "",
+                    path_csv.name,
+                    f" {i1_path}/{n_paths} " if n_paths > 1 else "",
                 )
             if df is None:
-                if i_chunk == 0:
+                if i1_chunk == 1:
                     lf.warning('Not processed (empty) {}', path_csv.name)
                 continue
             yield df, (i1_pid, pid, path_csv)
-
 
 
 if __name__ == '__main__':
@@ -1063,21 +1166,21 @@ if __name__ == '__main__':
     def main():
         filenames_default = '*.txt'
         if len(sys.argv) > 1:
-            dir_in, raw_pattern_file = sys.argv[1].split('*', 1)
+            dir_in, raw_re_ptn_file = sys.argv[1].split('*', 1)
             dir_in = Path(dir_in)
-            raw_pattern_file = f'*{raw_pattern_file}' if raw_pattern_file else filenames_default
+            raw_re_ptn_file = f'*{raw_re_ptn_file}' if raw_re_ptn_file else filenames_default
             lf.info(
-                "Searching config file and input files in {:s} (default mask: {:s})", dir_in, raw_pattern_file
+                "Searching config file and input files in {:s} (default mask: {:s})", dir_in, raw_re_ptn_file
             )
         else:
             dir_in = Path.cwd().resolve()
-            raw_pattern_file = filenames_default
+            raw_re_ptn_file = filenames_default
             lf.info(
                 "No command line arguments given => searching for {:s} input files and config in current dir",
-                raw_pattern_file,
+                raw_re_ptn_file,
             )
 
-        cfg_in = {'path': Path(dir_in) / raw_pattern_file}
+        cfg_in = {'path': Path(dir_in) / raw_re_ptn_file}
         for i1_pid, pid, paths_csv, d in load_from_csv_gen(cfg_in):
             print(d.compute())
             # todo

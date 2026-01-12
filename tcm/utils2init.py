@@ -1800,23 +1800,26 @@ class FakeContextIfOpen:
 
 
 def open_csv_or_archive_of_them(filename: Union[PurePath, Iterable[Union[Path, str]]], binary_mode=False,
-                                pattern='', encoding=None) -> Iterator[Union[TextIO, BinaryIO]]:
+                                ptn_re='', encoding=None) -> Iterator[Union[TextIO, BinaryIO]]:
     """
     Opens and yields files from archive with name filename or from list of filenames in context manager (autoclosing).
     Note: Allows stop iteration over files in archive by assigning True to next() in consumer of generator
     Note: to can unrar the unrar.exe must be in path or set rarfile.UNRAR_TOOL
     :param filename: archive with '.rar'/'.zip' suffix or file name or Iterable of file names
-    :param pattern: Unix shell style file pattern in the archive - should include directories if need search inside (for example place "*" at beginning)
+    :param ptn_re: regex pattern to target file in the archive - should include directories if need search
+    inside (for example place ".*" at beginning (* can be also used at begin: will be eplaced to the correct
+    regex .*))
     :return:
     Note: RarFile anyway opens in binary mode
     """
     read_mode = 'rb' if binary_mode else 'r'
-
+    if ptn_re and ptn_re[0] == "*":
+        ptn_re = f".{ptn_re}"
 
     # not iterates inside many archives so if have iterator then just yield them opened
     if hasattr(filename, '__iter__') and not isinstance(filename, (str, bytes)):
         for text_file in filename:
-            if pattern and not fnmatch(text_file, pattern):
+            if ptn_re and not re.match(ptn_re, text_file):
                 continue
             with open(text_file, mode=read_mode, encoding=encoding) as f:
                 yield f
@@ -1831,14 +1834,14 @@ def open_csv_or_archive_of_them(filename: Union[PurePath, Iterable[Union[Path, s
             if arc_suffix in filename_str:
                 filename_str_no_ext, pattern_parent = filename_str.split(arc_suffix, maxsplit=1)
                 if pattern_parent:
-                    pattern = str(PurePath(pattern_parent[1:]) / pattern)
+                    ptn_re = str(PurePath(pattern_parent[1:]) / ptn_re)   # ? check and comment
                     filename_str = f'{filename_str_no_ext}{arc_suffix}'
                 arc_files = [Path(filename_str).resolve().absolute()]
                 break
             else:
-                if arc_suffix in (pattern_lower := pattern.lower()):
+                if arc_suffix in (pattern_lower := ptn_re.lower()):
                     pattern_arcs, pattern_lower = pattern_lower.split(arc_suffix, maxsplit=1)
-                    pattern = pattern[-len(pattern_lower.lstrip('/\\')):]  # recover text case for pattern
+                    ptn_re = ptn_re[-len(pattern_lower.lstrip('/\\')):]  # recover text case for pattern
                     arc_files = Path(filename_str).glob(f'{pattern_arcs}{arc_suffix}')
                     arc_files = list(arc_files)
                     if not arc_files:
@@ -1867,9 +1870,10 @@ def open_csv_or_archive_of_them(filename: Union[PurePath, Iterable[Union[Path, s
                 # decrease the operations number as we are working with big files
                 io.DEFAULT_BUFFER_SIZE = max(io.DEFAULT_BUFFER_SIZE, 8192 * 16)
                 import tempfile, psutil
-                rarfile.HACK_SIZE_LIMIT = max(20_000_000,
-                                              psutil.disk_usage(Path(tempfile.gettempdir()).drive).free - 1_000_000_000
-                                              )
+
+                rarfile.HACK_SIZE_LIMIT = max(
+                    20_000_000, psutil.disk_usage(Path(tempfile.gettempdir()).drive).free - 1_000_000_000
+                )
             except Exception as e:
                 l.warning('%s: can not update settings to increase peformance', standard_error_info(e))
             read_mode = 'r'  # RarFile need opening in mode 'r' (but it opens in binary_mode)
@@ -1878,10 +1882,10 @@ def open_csv_or_archive_of_them(filename: Union[PurePath, Iterable[Union[Path, s
                 with ArcFile(str(path_arc_file), mode='r') as arc_file:
                     for text_file in arc_file.infolist():
                         arc_filename_cor_enc = None
-                        if pattern and not fnmatch(text_file.filename, pattern):
+                        if ptn_re and not re.match(ptn_re, text_file.filename):
                             # account for possible bad russian encoding
                             arc_filename_cor_enc = text_file.filename.encode('cp437').decode('CP866')
-                            if fnmatch(arc_filename_cor_enc, pattern):
+                            if re.match(ptn_re, arc_filename_cor_enc):
                                 pass
                             else:
                                 continue
@@ -1897,7 +1901,7 @@ def open_csv_or_archive_of_them(filename: Union[PurePath, Iterable[Union[Path, s
                                 print(arc_file.getinfo(text_file))
                                 break
         else:
-            if pattern and not fnmatch(filename, pattern):
+            if ptn_re and not re.match(ptn_re, filename):
                 return
             with open(filename, mode=read_mode) as f:
                 yield f
