@@ -33,7 +33,7 @@ from .incl_h5clc_hy import incl_calc_velocity_nodask, filt_data_dd
 
 path_mne = Path(r"..\h5toGrid\third_party\mne").resolve()
 sys.path.append(str(path_mne.parent.parent))
-from third_party.mne.time_frequency import multitaper
+from mne.time_frequency import multitaper  # third_party
 # sep = ';' if sys.platform == 'win32' else ':'
 # os_environ['PATH'] += f'{sep}{path_mne}'
 # multitaper = import_file(path_mne / 'time_frequency', 'multitaper')
@@ -69,11 +69,10 @@ def my_argparser(varargs=None):
     p = my_argparser_common_part(varargs, version)
 
     # Fill configuration sections
-    # All argumets of type str (default for add_argument...), because of
+    # All arguments of type str (default for add_argument...), because of
     # custom postprocessing based of my_argparser names in ini2dict
 
-    s = p.add_argument_group('in',
-                             'Parameters of input files')
+    s = p.add_argument_group("in", "Parameters of input files")
     s.add('--db_path', default='*.h5',  # nargs=?,
                              help='path to pytables hdf5 store to load data. May use patterns in Unix shell style')
     s.add('--tables_list',   help='table names in hdf5 store to get data. Uses regexp')
@@ -82,8 +81,7 @@ def my_argparser(varargs=None):
     s.add('--max_date',      help='time range max to use')
     s.add('--fs_float',      help='sampling frequency of input data, Hz')
 
-    s = p.add_argument_group('filter',
-                             'Filter all data based on min/max of parameters')
+    s = p.add_argument_group("filter", "Filter all data based on min/max of parameters")
     s.add('--min_dict',
         help='List with items in  "key:value" format. Filter out (not load), data of ``key`` columns if it is below ``value``')
     s.add('--max_dict',
@@ -91,9 +89,7 @@ def my_argparser(varargs=None):
     s.add('--min_Pressure',      help='min value of Pressure range use. Note: to filer {parameter} NaNs - use some value in min_{parameter} or max_{parameter}. Example of filtering out only nans of Pressure using very big min_dict value: "--min_Pressure -1e15"', default='-1e15')
     s.add('--max_Pressure',      help='max value of Pressure range to use')
 
-
-    s = p.add_argument_group('out',
-                             'Parameters of output files')
+    s = p.add_argument_group("out", "Parameters of output files")
     s.add('--out.db_path', help='hdf5 store file path')
     s.add('--table', default='psd',
         help='table name in hdf5 store to write data. If not specified then will be generated on base of path of input files. Note: "*" is used to write blocks in autonumbered locations (see dask to_hdf())')
@@ -103,8 +99,7 @@ def my_argparser(varargs=None):
         default="100000D",  # slightly less than overflow for ns
     )  # Units 'M', 'Y', and 'y' are no longer supported,  Values h, T, S, L, U, and N are deprecated in favour of the values h, min, s, ms, us, and ns.
 
-    s = p.add_argument_group('proc',
-                             'Processing parameters')
+    s = p.add_argument_group("proc", "Processing parameters")
     s.add('--overlap_float',
         help='period overlap ratio [0, 1): 0 - no overlap. 0.5 for default dt_interval')
     s.add('--time_intervals_center_list',
@@ -122,8 +117,7 @@ def my_argparser(varargs=None):
     s.add('--max_incl_of_fit_deg_float',
         help=r'Overwrites last coefficient of trigonometric version of g: Vabs = g(Inclingation). It corresponds to point where g(x) = Vabs(inclination) became bend down. To prevent this g after this point is replaced with line, so after max_incl_of_fit_deg {\Delta}^{2}y ≥ 0 for x > max_incl_of_fit_deg')
 
-    s = p.add_argument_group(
-        'program', 'Program behavior')
+    s = p.add_argument_group("program", "Program behavior")
     s.add('--return', default='<end>', choices=['<return_cfg>', '<return_cfg_with_options>'],
         help='executes part of code and returns parameters after skipping of some code')
 
@@ -182,15 +176,15 @@ def _psd_from_mt_adaptive(
     Parameters
     ----------
     x_mt : array, shape=(n_signals, n_tapers, n_freqs)
-       The DFTs of the tapered sequences (only positive frequencies)
+        The DFTs of the tapered sequences (only positive frequencies)
     eigvals : array, length n_tapers
-       The eigenvalues of the DPSS tapers
+        The eigenvalues of the DPSS tapers
     freq_mask : array
         Frequency indices to keep
     max_iter : int
-       Maximum number of iterations for weight computation
+        Maximum number of iterations for weight computation
     return_weights : bool
-       Also return the weights
+        Also return the weights
 
     Returns
     -------
@@ -336,7 +330,7 @@ def h5q_starts2coord(
     :return: ``qstr_range_pattern`` edge coordinates
     See also: h5_dask_pandas.h5.q_interval2coord
     Note: can use instead:
-    >>> from to_pandas_hdf5.h5toh5 import h5.load_ranges
+    >>> from hdf5_pandas import h5
     ... with pd.HDFStore(db_path, mode='r') as store:
     ...     df, bbad = h5.load_ranges(store, table, columns=None, query_range_lims=time_range)
 
@@ -471,7 +465,7 @@ def h5_velocity_by_intervals_gen(
                     query_range_lims = pd.to_datetime(start_end)
                     qstr = query_range_pattern.format(*query_range_lims)
                     l.info('query:\n%s... ', qstr)
-                    df0 = store.select(tbl)
+                    df0 = store.select(tbl, where=qstr, columns=None)
                     yield df0, start_end
         else:
 
@@ -484,7 +478,7 @@ def h5_velocity_by_intervals_gen(
 
     # Cycle
     with pd.HDFStore(cfg['in']['db_path'], mode='r') as store:
-        for tbl in names_gen(cfg['in'], cfg_out):  # old: h5.names_gen?
+        for tbl in names_gen(cfg['in'], cfg_out):  # old: (tbl, coefs) in h5.names_gen: need coefs = todo?
             # Get data in ranges
             for df0, start_end in gen_loaded(tbl):
                 db_suffixes = cfg["in"]["db_path"].suffixes[:-1]
@@ -495,7 +489,6 @@ def h5_velocity_by_intervals_gen(
                     df = df0
                 else:  # loading source data and calculate velocity
                     df0 = filter_local(df0, cfg['filter'])
-                    # coefs = todo
                     df = incl_calc_velocity_nodask(df0, **coefs, cfg_filter=cfg['in'], cfg_proc=cfg['proc'])
 
                 data_name = f'{tbl}/PSD_{start_end[0]}{data_name_suffix}'
@@ -636,7 +629,7 @@ def psd_calc(df, fs, freqs, adaptive=None, b_plot=False, **kwargs):
 
     if False:
         ## high level mne functions recalcs windows each time
-        from third_party.mne.time_frequency import psd_array_multitaper
+        from mne.time_frequency import psd_array_multitaper  # third_party
         multitaper.warn = l.warning
         psdm_Ve, freq = psd_array_multitaper(
             df.u, sfreq=fs, adaptive=adaptive,
@@ -816,9 +809,7 @@ def main(new_arg=None, **kwargs):
     prm['adaptive'] = True  # pmtm spectrum param
 
     prm['fs'] = cfg['in']['fs']
-
     prm['low_bias'] = True
-
     if prm["fmin"] is None:
         prm["fmin"] = 1.1 / (
             (pd_period_to_timedelta(cfg_out['split_period']) if cfg_out['split_period'] else
@@ -826,7 +817,6 @@ def main(new_arg=None, **kwargs):
         )  # 0.0001
     if prm["fmax"] is None:
         prm["fmax"] = prm['fs'] / 2  # 4
-
     if cfg['proc']['dt_interval']:
         prm['bandwidth'] = 8 / cfg['proc']['dt_interval'].astype('timedelta64[s]').astype(
             'float')  # 8 * 2 * prm['fs']/34000  # 4 * 2 * 5/34000 ~= 4 * 2 * fs / N
@@ -844,9 +834,7 @@ def main(new_arg=None, **kwargs):
     cols = []
     for df, tbl_in, dataname in gen_data_in(cfg, cfg_out):
         tbl = tbl_in.replace('incl', '_i')
-        # _, (df, tbl, dataname) in h5.dispenser_and_names_gen(cfg['in'], cfg_out,
-        #  fun_gen=h5_velocity_by_intervals_gen):
-
+        # interpolate to regular grid
         df, bads = df_interp(df, fs = prm["fs"], cols=cols)
         del bads  # todo: use
         len_data_cur = df.shape[0]
@@ -935,8 +923,8 @@ def main(new_arg=None, **kwargs):
         out_row += 1
 
         # if cfg_out['save_proc_tables']:
-        #     # ds_psd.to_netcdf('d:\\WorkData\\BlackSea\\190210\\190210incl_proc-psd_test.nc', format='NETCDF4_CLASSIC')
-        #     #f.to_hdf('d:\\WorkData\\BlackSea\\190210\\190210incl_test.psd.h5', 'psd', format='fixed')
+        #     # ds_psd.to_netcdf('D:\\Cruises\\BlackSea\\190210\\190210incl_proc-psd_test.nc', format='NETCDF4_CLASSIC')
+        #     #f.to_hdf('D:\\Cruises\\BlackSea\\190210\\190210incl_test.psd.h5', 'psd', format='fixed')
         #     # tables_have_write.append(tbl)
         #     try:
         #         h5.append_to(df_psd, tbl, cfg_out, msg='save (temporary)', print_ok=None)
@@ -1096,7 +1084,7 @@ def psd_calc_other_methods(df, prm: Mapping[str, Any]):
 #    cfg = {  # output configuration after loading csv:
 #        'in': {
 #            'db_path': r'd:\WorkData\BalticSea\181116inclinometer_Schuka\181116incl.h5',
-#                # r'd:\WorkData\BlackSea\190210\inclinometer_ABSIORAS\190210incl.h5',
+#                # r'D:\Cruises\BlackSea\190210\inclinometer_ABSIORAS\190210incl.h5',
 #            #
 #            'tables': ['incl.*'],
 #            'split_period': '2H',  # pandas offset string (D, 5D, h, ...)

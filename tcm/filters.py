@@ -1,11 +1,8 @@
 import logging
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 from datetime import timedelta
 import numpy as np
-from numba import njit, objmode, typed
-
-if __debug__:
-    pass
+from numba import njit, objmode, typed, types
 
 # l = init_logging('', cfg['program']['log'], cfg['program']['verbose'])
 l = logging.getLogger(__name__)
@@ -203,102 +200,102 @@ def contiguous_regions(b_ok):
     d = np.ediff1d(np.int8(b_ok), to_begin=b_ok[0], to_end=b_ok[-1])  # b_ok.astype(int)
     return np.flatnonzero(d).reshape((-1, 2))
 
-@njit
-def find_smallest_elem_as_big_as(seq: np.ndarray, subseq: typed.List, elem) -> int:
-    """
-    Returns the index of the smallest element in subsequence as big as seq[elem].
 
-    seq[elem] must not be larger than every element in subsequence.
-    The elements in subseq are indices in seq.
-    Uses binary search.
-    """
+# 1st implementation until vscode debugpy updates lead to AssertionError. Switched to jit-falls back version
+# @njit
+# def find_smallest_elem_as_big_as(seq: np.ndarray, subseq: typed.List, i: int) -> int:
+#     """
+#     Returns the index of the smallest element in subsequence as big as seq[i].
 
-    low = 0
-    high = len(subseq) - 1
+#     seq[i] must not be larger than every element in subsequence.
+#     The elements in subseq are indices in seq.
+#     Uses binary search.
+#     """
 
-    while high > low:
-        mid = (high + low) // 2
-        # If the current element is not as big as elem, throw out the low half of sequence.
-        if seq[subseq[mid]] < seq[elem]:
-            low = mid + 1
-        else:  # If the current element is as big as elem, throw out everything bigger, but
-            # keep the current element.
-            high = mid
+#     low = 0
+#     high = len(subseq) - 1
 
-    return high
+#     while high > low:
+#         mid = (high + low) // 2
+#         # If the current element is not as big as elem, throw out the low half of sequence.
+#         if seq[subseq[mid]] < seq[i]:
+#             low = mid + 1
+#         else:  # If the current element is as big as elem, throw out everything bigger, but
+#             # keep the current element.
+#             high = mid
 
-@njit
-def longest_increasing_subsequence_i(seq: np.ndarray) -> List[Any]:
-    """
-    Finds the longest increasing subseq in sequence using dynamic
-    programming and binary search (per http://en.wikipedia.org/wiki/Longest_increasing_subsequence).
-    :param seq: sequence of supported type for numba
-    :return: subseq indexes of seq
+#     return high
+# @njit
+# def longest_increasing_subsequence_i(seq: np.ndarray) -> List[int]:
+#     """
+#     Finds the longest increasing subseq in sequence using dynamic
+#     programming and binary search (per http://en.wikipedia.org/wiki/Longest_increasing_subsequence).
+#     :param seq: sequence of supported type for numba
+#     :return: subseq indexes of seq
 
-    This is O(n log n) optimized_dynamic_programming_solution from
-    https://stackoverflow.com/questions/2631726/how-to-determine-the-longest-increasing-subsequence-using-dynamic-programming/36836767#36836767
-    """
-    result = typed.List()  # np.float64
-    l = len(seq)
-    # if ~l:  # empty sequence of same type as input:
-    #     return result  # NOT WORKS!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! HELP
+#     This is O(n log n) optimized_dynamic_programming_solution from
+#     https://stackoverflow.com/questions/2631726/how-to-determine-the-longest-increasing-subsequence-using-dynamic-programming/36836767#36836767
+#     """
+#     result = typed.List.empty_list(np.int32)
+#     n = len(seq)
+#     if n == 0:  # empty sequence
+#         return result  # how make same type as input?
+#         # For Numba to be able to compile a list, the list must have a known and precise type
+#     # Both of these lists hold the indices of elements in sequence and not the
+#     # elements themselves.
 
-    # Both of these lists hold the indices of elements in sequence and not the
-    # elements themselves.
+#     # Indices of elements in the LIS tails (will always be sorted)
+#     smallest_end_to_subseq_of_length = typed.List.empty_list(np.int32)
 
-    # This list will always be sorted.
-    smallest_end_to_subseq_of_length = typed.List()
+#     # Array to store previous index for each element
+#     # This array goes along with sequence (not smallest_end_to_subseq_of_length).
+#     # Following the corresponding element in this array repeatedly will generate
+#     # the desired subsequence.
+#     parent_arr = -np.ones(n, dtype=np.int_)
 
-    # This array goes along with sequence (not smallest_end_to_subseq_of_length).
-    # Following the corresponding element in this array repeatedly will generate
-    # the desired subsequence.
-    parent = typed.List([-1] * l)  #-np.ones(l, np.int32)  # [None] * l
+#     for i in range(n):
+#         # We're iterating through sequence in order, so if elem is bigger than the
+#         # end of longest current subsequence, we have a new longest increasing subsequence.
+#         if len(smallest_end_to_subseq_of_length) == 0 or seq[i] > seq[smallest_end_to_subseq_of_length[-1]]:
+#             # If we are adding the first element, it has no parent.  Otherwise, we
+#             # need to update the parent to be the previous biggest element.
+#             if len(smallest_end_to_subseq_of_length) > 0:
+#                 parent_arr[i] = smallest_end_to_subseq_of_length[-1]
+#             smallest_end_to_subseq_of_length.append(i)
+#         else:
+#             # If we can't make a longer subsequence, we might be able to make a
+#             # subsequence of equal size to one of our earlier subsequences with a
+#             # smaller ending number (which makes it easier to find a later number that
+#             # is increasing).
+#             # Thus, we look for the smallest element in
+#             # smallest_end_to_subsequence_of_length that is at least as big as elem
+#             # and replace it with elem.
+#             # This preserves correctness because if there is a subsequence of length n
+#             # that ends with a number smaller than elem, we could add elem on to the
+#             # end of that subsequence to get a subsequence of length n+1.
+#             location_to_replace = find_smallest_elem_as_big_as(seq, smallest_end_to_subseq_of_length, i)
+#             smallest_end_to_subseq_of_length[location_to_replace] = i
+#             # If we're replacing the first element, we don't need to update its parent
+#             # because a subsequence of length 1 has no parent.  Otherwise, its parent
+#             # is the subsequence one shorter, which we just added onto.
+#             if location_to_replace != 0:
+#                 parent_arr[i] = smallest_end_to_subseq_of_length[location_to_replace - 1]
 
-    for elem in range(l):
-        # We're iterating through sequence in order, so if elem is bigger than the
-        # end of longest current subsequence, we have a new longest increasing subsequence.
-        if (len(smallest_end_to_subseq_of_length) == 0 or
-                seq[elem] > seq[smallest_end_to_subseq_of_length[-1]]):
-            # If we are adding the first element, it has no parent.  Otherwise, we
-            # need to update the parent to be the previous biggest element.
-            if len(smallest_end_to_subseq_of_length) > 0:
-                parent[elem] = smallest_end_to_subseq_of_length[-1]
-            smallest_end_to_subseq_of_length.append(elem)
-        else:
-            # If we can't make a longer subsequence, we might be able to make a
-            # subsequence of equal size to one of our earlier subsequences with a
-            # smaller ending number (which makes it easier to find a later number that
-            # is increasing).
-            # Thus, we look for the smallest element in
-            # smallest_end_to_subsequence_of_length that is at least as big as elem
-            # and replace it with elem.
-            # This preserves correctness because if there is a subsequence of length n
-            # that ends with a number smaller than elem, we could add elem on to the
-            # end of that subsequence to get a subsequence of length n+1.
-            location_to_replace = find_smallest_elem_as_big_as(seq, smallest_end_to_subseq_of_length, elem)
-            smallest_end_to_subseq_of_length[location_to_replace] = elem
-            # If we're replacing the first element, we don't need to update its parent
-            # because a subsequence of length 1 has no parent.  Otherwise, its parent
-            # is the subsequence one shorter, which we just added onto.
-            if location_to_replace != 0:
-                parent[elem] = smallest_end_to_subseq_of_length[location_to_replace - 1]
+#     # Generate the longest increasing subsequence by backtracking through parent.
 
-    # Generate the longest increasing subsequence by backtracking through parent.
+#     icur_parent = smallest_end_to_subseq_of_length[-1]
 
-    icur_parent = smallest_end_to_subseq_of_length[-1]
+#     if False:  # if need its values
+#         while icur_parent != -1:  # is not None:
+#             result.append(seq[icur_parent])
+#             icur_parent = parent_arr[icur_parent]
+#     else:  # if need its indices
+#         while icur_parent != -1:
+#             result.append(icur_parent)
+#             icur_parent = parent_arr[icur_parent]
+#     result.reverse()
+#     return result
 
-
-    if False:  # if need its values
-        while icur_parent != -1:  # is not None:
-            result.append(seq[icur_parent])
-            icur_parent = parent[icur_parent]
-    else:  # if need its indices
-        while icur_parent != -1:
-            result.append(icur_parent)
-            icur_parent = parent[icur_parent]
-
-    result.reverse()
-    return result
 
 
 # # variant 2
@@ -472,6 +469,131 @@ def nondecreasing_b(t, longest_increasing_i):
     for start, stop in st_en_same:
         bok[start:stop] = True
     return bok
+
+
+
+
+# @njit
+# def l_i_s_i(seq: np.ndarray) -> List[int]:
+#     """
+#     longest_increasing_subsequence_i version
+#     Author: #LocalDeepSeek (corrected)
+
+#     :param seq:
+#     :return:
+#     """
+#     result = typed.List.empty_list(np.int32)
+#     n = len(seq)
+#     if n == 0:
+#         return result
+
+#     dp_indices = typed.List.empty_list(np.int32)  # List()  # Stores indices of elements in the LIS tails
+#     parent_arr = -np.ones(n, dtype=np.int_)  # Array to store previous index for each element
+
+#     for i in range(n):
+#         x = seq[i]
+#         len_dp = len(dp_indices)
+
+#         if len_dp == 0 or x > seq[dp_indices[-1]]:
+#             dp_indices.append(i)
+#             parent_arr[i] = -2
+#         else:
+#             left, right = 0, len_dp - 1
+#             pos = -1
+
+#             while left <= right:
+#                 mid = (left + right) // 2
+#                 if seq[dp_indices[mid]] >= x:
+#                     pos = mid
+#                     right = mid - 1
+#                 else:
+#                     left = mid + 1
+
+#             dp_indices[pos] = i
+#             parent_arr[i] = (-2 if pos == 0 else dp_indices[pos-1])
+
+#     # Backtrack to find the actual LIS indices
+#     cur_index = len(dp_indices) - 1
+
+#     while cur_index != -2:
+#         if not result or parent_arr[cur_index] == -2:
+#             break
+#         else:
+#             result.append(cur_index)
+#             cur_index = dp_indices[pos-1] if pos > 0 else -2
+
+#     return typed.List(result[::-1])
+
+
+def _lis_core(seq: np.ndarray) -> np.ndarray:
+    """Core algorithm for longest increasing subsequence (compatible with both JIT and Python execution)"""
+    n = len(seq)
+    if n == 0:
+        # Use array conversion for type-safe empty list in JIT
+        return np.empty(0, dtype=np.int64)
+
+    # Pre-allocate arrays (works in both modes)
+    tail_indices = np.empty(n, dtype=np.int64)
+    parent_arr = np.full(n, -1, dtype=np.int64)
+    length = 0  # Current LIS length
+
+    for i in range(n):
+        # Binary search to find insertion position
+        low, high = 0, length - 1
+        while high >= low:  # and high >= 0 Handle empty case
+            mid = (low + high) // 2
+            if seq[tail_indices[mid]] < seq[i]:
+                low = mid + 1
+            else:
+                high = mid - 1
+        pos = low
+
+        # Update parent pointer
+        if pos > 0:
+            parent_arr[i] = tail_indices[pos - 1]
+
+        # Update tails array
+        tail_indices[pos] = i
+
+        # Extend sequence if needed
+        if pos == length:
+            length += 1
+
+    # Reconstruct the result
+    result = np.empty(length, dtype=np.int64)
+    k = tail_indices[length - 1]
+    for i in range(length - 1, -1, -1):
+        result[i] = k
+        k = parent_arr[k]
+
+    return result
+
+
+# JIT-compiled version (same core function)
+_longest_increasing_subsequence_jit = njit(_lis_core)
+
+
+# Public interface with automatic fallback
+def longest_increasing_subsequence_i(seq: Union[np.ndarray, list]) -> np.ndarray:
+    """
+    Compute longest increasing subsequence with debug-aware JIT fallback:
+    - First attempts JIT-compiled version
+    - Falls back to non-JIT Python version if JIT fails
+    """
+    # Ensure input is numpy array of correct dtype
+    if not isinstance(seq, np.ndarray):
+        seq = np.array(seq, dtype=np.int64)
+    elif seq.dtype != np.int64:
+        seq = seq.astype(np.int64)
+
+    # First attempt: Try JIT-compiled version
+    try:
+        return _longest_increasing_subsequence_jit(seq)
+    except Exception as e:
+        l.exception("Fallback to non-JIT Python version")
+        # Fallback to Python implementation
+        return _lis_core(seq)
+
 
 
 def update_trend_between(t, t_trend, b_keep):
@@ -1089,7 +1211,7 @@ def find_sampling_frequency(tim: np.ndarray,
         # ignore all this:
         # - joined different data in backward order
         # - data with different frequencies
-        bad = b1spike_jit(tim)
+        bad = b1spike(tim)    # bad = b1spike_jit(tim) - AssertionError
         dt = np.ediff1d(tim[~bad].view(np.int64), to_end=1)
         bad = dt < 0
         bAnyDecreased = bad.any()

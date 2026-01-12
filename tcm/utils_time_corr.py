@@ -17,9 +17,9 @@ from .filters import (
 )
 from .utils2init import dir_create_if_need
 from .utils_time import lf, datetime_fun, check_time_diff
-#from to_pandas_hdf5.h5_dask_pandas import filter_global_minmax
+# from hdf5_pandas.h5_dask_pandas import filter_global_minmax
 
-
+fig_save_format_suffix: str = ".png"
 tim_min_save: pd.Timestamp     # can only decrease in time_corr(), set to pd.Timestamp('now', tz='UTC') before call
 tim_max_save: pd.Timestamp     # can only increase in time_corr(), set to pd.Timestamp(0, tz='UTC') before call
 def time_corr(
@@ -111,13 +111,12 @@ def time_corr(
     if cfg_min_date := cfg_in.get('min_date'):
         cfg_min_date = pd.Timestamp(cfg_min_date, tz=None if cfg_min_date.tzinfo else 'UTC')
 
-
         global tim_min_save, tim_max_save
         i_tim_min = tim.idxmin(skipna=True)
         tim_min = tim[i_tim_min]
         tim_max = tim.max(skipna=True)
 
-        # Auto shift time if it is less than minimum in many adjacent points
+        # Shift time if it is less than minimum in many adjacent points and cfg_in["date_to_from"]
         if tim_min < cfg_min_date:
 
             if (cfg_date_to_from := cfg_in.get('date_to_from')) and not cfg_date_to_from[0]:
@@ -305,11 +304,10 @@ def time_corr(
                         b_ok_in[~b_ok] = False
             else:  # Decreased time not in duplicates
                 i_dec = np.delete(i_different, np.searchsorted(i_different, i_inc))
-                assert np.alltrue(i_dec == i_different[~np.in1d(i_different, i_inc)])  # same results
-                # assert np.alltrue(i_dec == np.setdiff1d(i_different, i_inc[:-1]))  # same results
+                assert np.all(i_dec == i_different[~np.in1d(i_different, i_inc)])  # same results
+                # assert np.all(i_dec == np.setdiff1d(i_different, i_inc[:-1]))  # same results
                 if process == 'delete_inversions':
-                    b_ok_in[np.flatnonzero(b_ok_in)[i_dec] if cfg_in.get('b_keep_not_a_time') else i_dec] = \
-                        False
+                    b_ok_in[np.flatnonzero(b_ok_in)[i_dec] if cfg_in.get('b_keep_not_a_time') else i_dec] = False
 
             b_ok[b_ok] = np.ediff1d(t[b_ok], to_end=True) > 0  # adaption for next step
 
@@ -342,7 +340,7 @@ def time_corr(
                         cfg_in.get('fs_old_method'), freq)
                 freq = cfg_in.get('fs_old_method')
             else:  # constant freq = filtered mean
-                lf.info('Flatten time interval using median* freq = {:f}Hz determined', freq)
+                lf.info('Flatten time interval using median* freq = {:f}Hz', freq)
             b_show = n_decrease > 0
             if freq <= 1:
                 # Skip: typically data resolution is sufficient for this frequency
@@ -450,7 +448,7 @@ def time_corr(
         )
         if cfg_in.get('b_keep_not_a_time'):
             if n_same > 0:
-                lf.warning("Processing: {:s}")
+                lf.warning("Processing: {:s}", msg)
         else:
             # prepare to interp all non-increased (including NaNs)
             if n_bad_in:
@@ -523,10 +521,11 @@ def plot_bad_time_in_thread(cfg_in, t: np.ndarray, b_ok=None, idel=None,
     from bokeh.plotting import figure, output_file, show
     from bokeh.io import export_png, export_svgs
     from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
     from selenium.common.exceptions import (
         SessionNotCreatedException, WebDriverException, NoSuchDriverException
     )
-    save_format_suffix = '.png'
+    global fig_save_format_suffix
     # output figure name
     fig_name = '{:%y%m%d_%H%M}-{:%H%M}'.format(*(
         tim_range if (tim_range is not None and tim_range[0]) else
@@ -544,7 +543,7 @@ def plot_bad_time_in_thread(cfg_in, t: np.ndarray, b_ok=None, idel=None,
             while not p_use.is_dir():
                 p_use = p_use.parent
             path_save_image = dir_create_if_need(p_use / str(path_save_image))
-        fig_name = (path_save_image / fig_name).with_suffix(save_format_suffix)
+        fig_name = (path_save_image / fig_name).with_suffix(fig_save_format_suffix)
         if fig_name.is_file():
             # work have done before
             return
@@ -552,7 +551,7 @@ def plot_bad_time_in_thread(cfg_in, t: np.ndarray, b_ok=None, idel=None,
     # prepare saving/exporting method
     if isinstance(fig_name, Path):
         lf.info('saving figure to {!s}', fig_name)
-        if save_format_suffix != '.html':
+        if fig_save_format_suffix != '.html':
             try:
                 n_tries = range(3)
                 e = None
@@ -674,53 +673,60 @@ def plot_bad_time_in_thread(cfg_in, t: np.ndarray, b_ok=None, idel=None,
                         web_driver = None
                     except ImportError:
                         lf.exception('Skipping of figure creating because there is no needed package...')
-
                     except NoSuchDriverException:
                         pass
+                    except ValueError:
+                        lf.exception('Skipping of figure creating because of other error...')
             except (SessionNotCreatedException, Exception):  # or put exact type of ConnectionError if can
-                lf.exception("Can not save png so will save html instead")
-                save_format_suffix = ".html"
+                lf.exception("Can not save png so trying save html instead (big)")
+                fig_save_format_suffix = ".html"
                 # todo: parse message to get Current browser version (or better method):
                 # selenium.common.exceptions.SessionNotCreatedException: Message: session not created: This version of ChromeDriver only supports Chrome version 94
                 # Current browser version is 104.0.5112.39 with binary path ...
 
+    if fig_save_format_suffix != '.html': # conditioned skip to not save fig of > 100Mb size
+        # Create a new plot with a datetime axis type
+        p = figure(width=1400, height=700, y_axis_type="datetime")
+        # old: plot_width=1400, plot_height=700  # plt.figure('Decreasing time corr')
+        p.title.text = 'Decreasing time corr'
+        # add renderers
+        if idel is not None:
+            p.scatter(
+                idel,
+                pd.to_datetime(t[idel], utc=True),
+                legend_label="deleting",
+                size=4,
+                color="magenta",
+                alpha=0.8,
+            )
+        p.line(np.arange(t.size), tim, legend_label='all', color='red', alpha=0.2)  # long!
+        if b_ok is not None:
+            p.line(
+                np.flatnonzero(b_ok),
+                pd.to_datetime(t[b_ok], utc=True),
+                legend_label='good', color='green', alpha=0.8
+            )  # long!
+        # NEW: customize by setting attributes
+        p.legend.location = "top_left"
+        p.grid.grid_line_alpha = 0
+        p.xaxis.axis_label = 'Counts'
+        p.yaxis.axis_label = 'Date'
+        p.ygrid.band_fill_color = "olive"
+        p.ygrid.band_fill_alpha = 0.1
+        # show(p)  # shows and saves the html fig of > 100Mb size
 
-        if save_format_suffix == '.html':
-            # To static HTML file: big size but with interactive zoom, datashader?
-            output_file(fig_name.with_suffix(save_format_suffix), title=msg)
-            # web_driver.get("http://www.python.org")  # for testing
-
-
-    # Create a new plot with a datetime axis type
-    p = figure(width=1400, height=700, y_axis_type="datetime")   # old: plot_width=1400, plot_height=700  # plt.figure('Decreasing time corr')
-    p.title.text = 'Decreasing time corr'
-    # add renderers
-    if idel is not None:
-        p.circle(idel, pd.to_datetime(t[idel], utc=True), legend_label='deleting', size=4, color='magenta', alpha=0.8)
-    p.line(np.arange(t.size), tim, legend_label='all', color='red', alpha=0.2)  # long!
-    if b_ok is not None:
-        p.line(
-            np.flatnonzero(b_ok),
-            pd.to_datetime(t[b_ok], utc=True),
-            legend_label='good', color='green', alpha=0.8
-        )  # long!
-    # NEW: customize by setting attributes
-    p.legend.location = "top_left"
-    p.grid.grid_line_alpha = 0
-    p.xaxis.axis_label = 'Counts'
-    p.yaxis.axis_label = 'Date'
-    p.ygrid.band_fill_color = "olive"
-    p.ygrid.band_fill_alpha = 0.1
-
-    # show(p)  # show the results
-
-    # export figure
-    if isinstance(fig_name, Path) and save_format_suffix != '.html':
-        try:
-            (export_png if save_format_suffix == '.png' else export_svgs)(   # long!
-                p, filename=fig_name.with_suffix(save_format_suffix), webdriver=web_driver)
-            # export_svgs(p, filename=fig_name.with_suffix('.svg'), webdriver=web_driver)
-            # output_file(fig_name.with_suffix('.html'), title=msg)
-        except Exception as e:
-            lf.exception('Can not save figure of bad source time detected')
-        web_driver.quit()
+        # export figure
+        if isinstance(fig_name, Path):
+            if fig_save_format_suffix != '.html':
+                try:
+                    (export_png if fig_save_format_suffix == '.png' else export_svgs)(   # long!
+                        p, filename=fig_name.with_suffix(fig_save_format_suffix), webdriver=web_driver)
+                    # export_svgs(p, filename=fig_name.with_suffix('.svg'), webdriver=web_driver)
+                    # output_file(fig_name.with_suffix('.html'), title=msg)
+                except Exception as e:
+                    lf.exception('Can not save figure of bad source time detected')
+                web_driver.quit()
+            else:
+                # To static HTML file: big size but with interactive zoom, datashader?
+                output_file(fig_name.with_suffix(fig_save_format_suffix), title=msg)
+                # web_driver.get("http://www.python.org")  # for testing

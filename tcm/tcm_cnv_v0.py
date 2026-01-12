@@ -25,15 +25,15 @@ from pandas.tseries.frequencies import to_offset
 
 from yaml import safe_dump as yaml_safe_dump
 
-from to_vaex_hdf5 import cfg_dataclasses as cfg_d
+from hdf5_alt import cfg_dataclasses as cfg_d
 from inclinometer import incl_h5clc_hy
 
 # import my scripts
-# from to_pandas_hdf5.csv2h5 import main as csv2h5
-# from to_pandas_hdf5.csv_specific_proc import rep_in_file, correct_txt, loaded_tcm
+# from hdf5_pandas.csv2h5 import main as csv2h5
+# from hdf5_pandas.csv_specific_proc import rep_in_file, correct_txt, loaded_tcm
 
 lf = None
-# code from utils2init import open_csv_or_archive_of_them, ExitStatus ...
+# code from utils.init import open_csv_or_archive_of_them, ExitStatus ...
 def standard_error_info(e):
     msg_trace = '\n==> '.join((s for s in e.args if isinstance(s, str)))
     return f'{e.__class__}: {msg_trace}'
@@ -232,7 +232,7 @@ def init_logging(logger_name=__name__, log_file=None, level_file='INFO', level_c
 #######################################################################################################################
 lf = LoggingStyleAdapter(logging.getLogger(__name__))
 
-# code from to_pandas_hdf5.csv_specific_proc import mod_incl_name ...
+# code from hdf5_pandas.csv_specific_proc import mod_incl_name ...
 def mod_incl_name(file_in: Union[str, PurePath], add_prefix=None):
     """
     Change name of raw inclinometer/wavegauge data file to name of corrected (regular table format) csv file
@@ -1408,7 +1408,7 @@ def read_csv(paths: Sequence[Union[str, Path]],
     # meta_time_and_mask.b_ok = meta_time_and_mask.b_ok.astype(np.bool_)
 
 
-    utils_time_corr.tim_min_save = pd.Timestamp('now', tz='UTC')  # initialisation for time_corr_df()
+    utils_time_corr.tim_min_save = pd.Timestamp('now', tz='UTC')  # initialization for time_corr_df()
     utils_time_corr.tim_max_save = pd.Timestamp(0, tz='UTC')
 
     n_overlap = 2 * int(np.ceil(cfg_in['fs'])) if cfg_in.get('fs') else 50
@@ -1449,9 +1449,9 @@ def read_csv(paths: Sequence[Union[str, Path]],
 
             if cfg_in.get('csv_specific_param'):
                 # need run this:
-                # ddf = to_pandas_hdf5.csv_specific_proc.loaded_corr(
+                # ddf = hdf5_pandas.csv_specific_proc.loaded_corr(
                 #     ddf, cfg_in, cfg_in['csv_specific_param'])
-                ddf = ddf.map_partitions(to_pandas_hdf5.csv_specific_proc.loaded_corr,
+                ddf = ddf.map_partitions(hdf5_pandas.csv_specific_proc.loaded_corr,
                                          cfg_in, cfg_in['csv_specific_param']
                                          )
             # except (TypeError, Exception) as e:
@@ -1462,7 +1462,7 @@ def read_csv(paths: Sequence[Union[str, Path]],
             lf.info('processing csv data with time correction{:s}...', f' in {ddf.npartitions} blocks' if
                     ddf.npartitions > 1 else '')
 
-            # initialisation for utils_time_corr.time_corr():
+            # initialization for utils_time_corr.time_corr():
             def fun_loaded_and_time_corr_df(df_):
                 """fun_proc_loaded() then time_corr()
                 """

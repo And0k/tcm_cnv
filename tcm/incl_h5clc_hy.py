@@ -48,18 +48,19 @@ import pandas as pd
 from numba import njit, prange   # todo: no more jit, never
 from numpy.polynomial.polynomial import polyval2d
 from omegaconf import MISSING, OmegaConf, open_dict
+from ruamel.yaml import YAML
 
 # my:
 # # allows to run on both my Linux and Windows systems:
 # scripts_path = Path(f"{'D:' if sys.platform == 'win32' else '/mnt/D'}/Work/_Python3/And0K/h5toGrid/scripts")
 # sys.path.append(str(scripts_path.parent.resolve()))
 # sys.path.append( str(Path(__file__).parent.parent.resolve()) ) # os.getcwd()
-# from utils2init import ini2dict
+# from utils.init import ini2dict
 # from scripts.incl_calibr import calibrate, calibrate_plot, coef2str
 # from other_filters import despike, rep2mean
 from . import cfg_dataclasses as cfg_d
 from . import h5
-from .csv_load import search_correct_csv_files, load_from_csv_gen, pcid_from_parts, apply_time_ranges_mask
+from .csv_load import search_correct_csv_files, load_from_csv_gen, pcid_from_parts, mask_time_ranges
 from .csv_specific_proc import parse_name
 from .filters import b1spike, rep2mean
 from .h5_dask_pandas import (
@@ -101,8 +102,15 @@ class ConfigInCoefs_InclProc:
     Ch: Optional[Annotated[list[float], 3]] = field(default_factory=lambda: [10, 10, 10])
     Rz: Optional[List[List[float]]] = field(default_factory=lambda: [[1, 0, 0], [0, 1, 0], [0, 0, 1]])
     kVabs: Optional[List[float]] = field(default_factory=lambda: [10, -10, -10, -3, 3, 70])
-    # kP: Optional[List[float]] = field(default_factory=lambda: [0, 1])  # default polynom will not change input
+
     P_t: Optional[List[List[float]]] = None
+
+    # Old coefs for Pressure: direct, and separate dependences on temperature and voltage
+    # kP: Optional[List[float]] = field(default_factory=lambda: [0, 1])
+    P: Optional[List[float]] = field(default_factory=lambda: [0, 1])  # default polynom will not change input
+    PBattery: Optional[List[float]] = field(default_factory=lambda: [0, 1])
+    PTemp: Optional[List[float]] = field(default_factory=lambda: [0, 1])
+
     azimuth_shift_deg: Optional[float] = 180
     g0xyz: Optional[Annotated[list[float], 3]] = None  # field(default_factory=lambda: [0, 0, 1])  #
 
@@ -1195,7 +1203,7 @@ def calc_pressure_old(
     """
     replaces P column by Pressure applying polyval() and temperature and battery corrections if such coefs exists to P.
     :param a:
-    :param bad_p_at_bursts_starts_period:
+    :param bad_p_at_bursts_starts_period: str frequency i.e. '1h' if bursts is at hours starts
     :param P: conversion of raw Pressure to physical units polynom coefficents
     :param PTemp: polynom coefficients for temperature compensation that will be added to raw Pressure
     :param PBattery: raw P battery compensation coefficients
@@ -1214,7 +1222,7 @@ def calc_pressure_old(
             break
     else:
         return a
-
+    lf.debug("calculating pressure using separate polynoms (P, Temp, Battery)")
     meta = ('Pressure', 'f8')
     lengths = tuple(a.map_partitions(len, enforce_metadata=False).compute())
     len_data = sum(lengths)
@@ -1240,9 +1248,8 @@ def calc_pressure_old(
 
         st_en_use = bc.map_blocks(f_st_en, dtype=np.int64).compute()
         i_ok = np.append(
-            (np.append(0, np.cumsum(bc.chunks[0][:-1])).repeat(2) + st_en_use)[st_en_use >= 0],
-            len_data
-            )
+            (np.append(0, np.cumsum(bc.chunks[0][:-1])).repeat(2) + st_en_use)[st_en_use >= 0], len_data
+        )
         i_ok = i_ok[np.ediff1d(i_ok, to_begin=i_ok[0]) > 100]
         d_ok = np.ediff1d(i_ok, to_begin=i_ok[0])
         assert d_ok.sum() == len_data
@@ -1266,8 +1273,10 @@ def calc_pressure_old(
                 ).compute()
             # if have bad region => the number of source and target points is sufficient:
             if i_0 != i_1 and i_st_interp < len_data:
-                arr[i_st_interp:] = da.arange(len_data - i_st_interp) * \
-                             ((arr[i_1] - arr[i_0]) / (i_1 - i_0)) + arr[i_st_interp]
+                arr[i_st_interp:] = (
+                    da.arange(len_data - i_st_interp) * ((arr[i_1] - arr[i_0]) / (i_1 - i_0))
+                    + arr[i_st_interp]
+                )
 
         # Compensation on Battery after Battery < PBattery_min, before add constant polyval(PBattery, PBattery_min)
         if PBattery_min is not None:
@@ -1524,7 +1533,7 @@ def coef_prepare(
     data_date: datetime = None,
 ) -> Tuple[Dict[str, Any], np.ndarray, Dict[str, bool], str]:
     """
-    Add dates and absent fields to new coefficients from previous preserving reference and save to the database.
+    Add dates and absent fields to new coefficients from previous
 
     :param coefs: Dictionary of ndarrays, original loaded coefficients.
         Required fields:
@@ -1546,11 +1555,12 @@ def coef_prepare(
         - Message string describing the zeroing and rotation operations.
     """
 
+
     coefs_new = {
         "azimuth_shift_deg": get_coef_azimuth_shift(
                 azimuth_add, coordinates, coefs["azimuth_shift_deg"], data_date
             )
-    }
+    } if "azimuth_shift_deg" in coefs else {}
 
     # Get rotation coefficient Rz (if data time range for zeroing is specified)
     msg_zeroed = ""
@@ -1587,6 +1597,57 @@ def coef_prepare(
 
     # Return old coefficients updated with new
     return {**coefs, **coefs_new}, coef_zeroing_matrix, dates, msg_zeroed + msg_rotated
+
+
+def coef_prepare_to_save(df_raw, cfg_in, pcid, tbl_save_coef=None):
+    """
+    Prepare to save coefs to DB
+    # Postpone save coef by h5py to raw db as now it have been opened by pandas
+    save_coef_funcs += save_funcs
+    """
+
+    def factory_save_coef(**kwards):
+        """Save coefs function factory
+        :param kwards: tbl_raw, dict_matrices, dates
+        """
+        def h5copy_coef_to_db(db):
+            """
+            :param db: opened pandas HDF5 store or HDF5 file opened by h5py
+            """
+            # can't create dataset using h5py in the opened pandas store, so close and reopen
+            #
+            is_db_a_pandas_store = not isinstance(db, h5py.File)  # so it is isinstance(db, pd.HDFStore)
+            if is_db_a_pandas_store:  # is_db_a_pandas_store:
+                db.close()
+            table_written = h5copy_coef(None, db.filename if is_db_a_pandas_store else db, **kwards)
+            if is_db_a_pandas_store:
+                db.open()
+            return table_written
+
+        return h5copy_coef_to_db
+
+
+    coefs, coef_zeroing_matrix, dates, msg_coefs = call_with_valid_kwargs(
+        coef_prepare,
+        **cfg_in,
+        data=df_raw,
+        data_date=getattr(df_raw, 'divisions' if isinstance(df_raw, dd.DataFrame) else 'index')[0]
+    )
+
+    if tbl_save_coef:
+        # todo: if path_csv (is None? or) isinstance(path_csv, list) as returned by `load_from_csv_gen`
+        # if it founds and reuses existed db data (skips) we not need try rewrite coefs _if they exists_
+        lf.info(f"Coefficients will be saved {msg_coefs}to {tbl_save_coef}")
+        # Save coeff. funcs (one item)
+        save_funcs = [factory_save_coef(
+            dict_matrices=coefs_format_for_h5(coefs, pcid),
+            tbl=tbl_save_coef,
+            dates=dates,
+        )]
+    else:
+        save_funcs = []
+    return coefs, coef_zeroing_matrix, save_funcs
+
 
 
     # filter temperature
@@ -1962,11 +2023,12 @@ def get_coefs(
                 if OmegaConf.is_config(coefs_ovr):
                     coefs_ovr = OmegaConf.to_container(coefs_ovr)
 
-            # If ovr dates is not set, then set it to "date" or now
-            coefs_ovr_dates, _ = coefs_ovr.get("dates", coefs_ovr_dates), coefs_ovr.get("date", now)
-            coefs_ovr_dates = {
-                k: coefs_ovr_dates.get(k) or now for k in coefs_ovr if k in defaults and k not in not_ovr
-            }
+            # If ovr dates is not set, then set it to "date"
+            coefs_ovr_dates = coefs_ovr.get("dates", {})
+            if coefs_ovr_dates:
+                coefs_ovr_dates = {
+                    k: d for k, d in coefs_ovr_dates.items() if k in defaults and k not in not_ovr
+                }
     else:
         not_ovr = list(defaults)
         coefs_ovr = {}  # ensure Mapping
@@ -1994,7 +2056,10 @@ def get_coefs(
             for k, v in coefs_ovr.items():
                 if v is not None and k in defaults and k not in not_ovr:
                     coefs_load[k] = v
-                    coefs_load_dates[k] = coefs_ovr_dates[k]  # Overwrite loaded dates
+                    try:
+                        coefs_load_dates[k] = coefs_ovr_dates[k]  # Overwrite loaded dates
+                    except KeyError:  # time may not set
+                        continue
             coefs_load["dates"] = coefs_load_dates
     else:
         coefs_load = {**coefs_ovr, "dates": coefs_ovr_dates}
@@ -2015,6 +2080,7 @@ def get_coefs(
     if out_dates:
         coefs_load["date"] = max(out_dates)
     return coefs_load
+
 
 
 def coefs_format_for_h5(
@@ -2041,24 +2107,35 @@ def coefs_format_for_h5(
         # making default coef matrix
         coef = ConfigInCoefs_InclProc().__dict__
         del coef['g0xyz']
-        if not pcid.split("_")[-1].startswith('p'):  # device with pressure sensor
+        if not pcid.split("_")[-1].startswith('p'):  # device not with pressure sensor
             del coef['P_t']
-    elif 'Rz' not in coef:  # added for compability with old coefs (todo: better get by diagonalize G)
-        coef['Rz'] = np.eye(3)
+        if not pcid.startswith('w'):                 # device not just pressure sensor
+            del coef["P"]
+            del coef["PBattery"]
+            del coef["PTemp"]
+    elif 'Rz' not in coef and ("Ag" in coef or "Ah" in coef):
+        coef['Rz'] = np.eye(3)  # added for compability with old coefs (todo: better get by diagonalize G)
 
-    coef_no_rename = ['Rz']
-    if 'P_t' in coef:
-        coef_no_rename += ['P_t']
+    coef_renamed_or_skip = {"Ag", "Cg", "Ah", "Ch", "azimuth_shift_deg", "kVabs", "dates", "i"}
+    # not ["Rz", "P_t"]
     return {
         **{
-            f'//coef//{ch_u}//{m}': coef[f'{m}{ch}']
-            for ch, ch_u in (('h', 'H'), ('g', 'G')) for m in ('A', 'C')
+            f"//coef//{ch_u}//{m}": coef[f"{m}{ch}"]
+            for ch, ch_u in (("h", "H"), ("g", "G"))
+            for m in ("A", "C")
+            if f"{m}{ch}" in coef
         },
-        '//coef//H//azimuth_shift_deg': coef['azimuth_shift_deg'],
-        '//coef//Vabs0': coef['kVabs'],
-        **{f'//coef//{p}': coef[p] for p in coef_no_rename},
-        '//coef//pid': pcid,
-        '//coef//date': date or datetime.now().replace(microsecond=0).isoformat()
+        **(
+            {"//coef//H//azimuth_shift_deg": coef["azimuth_shift_deg"]} if "azimuth_shift_deg" in coef else {}
+        ),
+        **({"//coef//Vabs0": coef["kVabs"]} if "kVabs" in coef else {}),
+        **{
+            f"//coef//{k}": p
+            for k, p in coef.items()
+            if k not in coef_renamed_or_skip and isinstance(p, np.ndarray)
+        },
+        "//coef//pid": pcid,
+        "//coef//date": date or datetime.now().replace(microsecond=0).isoformat(),
     }
 
 def separate_cfg_in_for_probes(cfg_in, in_many={}, probes=None
@@ -2174,9 +2251,10 @@ def pcid_to_raw_name(pcid: str):
     return f"incl{pcid[1:]}" if pcid[0] == "i" else pcid
 
 
-def to_pcid_from_name(probe_name: str|int, probe_type: str = "i"):
+def to_pcid_from_name(probe_name: str|int, probe_type: Optional[str] = None):
     """
-    Get Probe output Column ID (pcid)
+    Get Probe output Column ID (pcid). This normalized ID has type (optional if "i") and model parts joined
+    with "_"
     :param probe_name: any of
     - output column name
     - raw table name
@@ -2188,15 +2266,17 @@ def to_pcid_from_name(probe_name: str|int, probe_type: str = "i"):
     - column suffix in combined table
     - name in specific for this probe hydra conig `ConfigInMany_InclProc`
     """
-    if (isinstance(probe_name, str) and probe_name[0].isdigit()) or isinstance(probe_name, int):
-        return f"{probe_type}{probe_name:0>2}"
-
-    # pid to pcid
-    if isinstance(probe_name, str) and len(probe_name) == 3 and probe_name[1:].isdigit():
-        if probe_name[0] == probe_type == "i":
-            return probe_name
-        elif probe_name[0].isalpha():
-            return f"{probe_type}_{probe_name}"
+    if isinstance(probe_name, str):
+        probe_name0 = probe_name[0]
+        if probe_name0.isdigit():
+            return f"{probe_type or 'i'}{probe_name:0>2}"
+        if len(probe_name) == 3 and probe_name[1:].isdigit():  # pid to pcid
+            if probe_name0 == probe_type or not probe_type and probe_name0 in ["i", "w"]:
+                return probe_name
+            if probe_name0.isalpha():
+                return f"{probe_type or 'i'}_{probe_name}"
+    else:  # isinstance(probe_name, int):
+        return f"{probe_type or 'i'}{probe_name:0>2}"
 
     pattern_name_parts = parse_name(probe_name.replace('.', ''))
     if pattern_name_parts:
@@ -2228,7 +2308,7 @@ def cur_cfg(
     }
     # + Load coefs from DB
     cfg1["in"]["coefs"] = get_coefs(
-        ([cfg["in"]["path"]] if ".raw" in cfg["in"]["path"].suffixes[-2:-1] else [])
+        ([cfg["in"]["path"]] if cfg["in"]["path"] and ".raw" in cfg["in"]["path"].suffixes[-2:-1] else [])
         + (
             [cfg["in"]["coefs_path"]]
             if cfg["in"]["coefs_path"]
@@ -2330,10 +2410,11 @@ def to_physical(
     # todo: message of filtered especially if all was filt out
 
     # Apply loaded or calculated rotation to Ag & Ah coefficients (with copying to new coef object to not cumulate)
-    if coef_zeroing_matrix is None:
-        lf.info("No rotation (Rz) in loaded coefficient. Suppose rotations already applied")
-    else:
-        coefs = {**coefs, **{c: coef_zeroing_matrix @ coefs[c] for c in ["Ag", "Ah"]}}
+    if "Gx" in df_raw.columns or "Mx" in df_raw.columns:
+        if coef_zeroing_matrix is None:
+            lf.info("No rotation (Rz) in loaded coefficient. Suppose rotations already applied")
+        else:
+            coefs = {**coefs, **{c: coef_zeroing_matrix @ coefs[c] for c in ["Ag", "Ah"]}}
 
     if isinstance(df_raw, pd.DataFrame):
         d_raw = dd.from_pandas(df_raw, npartitions=1)
@@ -2371,6 +2452,8 @@ def to_physical(
             # Pressure
             d_avg = calc_pressure(d_avg, **coefs)
             # **{(pb := 'bad_p_at_bursts_starts_period'): cfg['filter'][pb]},
+            if 'Pressure' not in d_avg.columns:  # this column `calc_pressure` adds
+                d_avg = calc_pressure_old(d_avg, **coefs)
 
             if need_d:
                 d = d_avg
@@ -2401,7 +2484,7 @@ def track_probe_closure(b_input_is_h5, b_from_processed_db=False):
     b_input_is_h5: bool, show in message that raw data is from db
     """
     pcid_prev = None
-    pcid_part = 0
+    pcid_part = 1
 
     def track_probe(pcid):
         nonlocal pcid_part, pcid_prev
@@ -2410,7 +2493,7 @@ def track_probe_closure(b_input_is_h5, b_from_processed_db=False):
             pcid_part += 1  # next part of same csv
         else:
             pcid_prev = pcid
-            pcid_part = 0
+            pcid_part = 1
 
         tbl_raw = pcid_to_raw_name(pcid)
         lf.warning(
@@ -2490,7 +2573,7 @@ def h5_gen_by_time_ranges(
             yield d, msg
     else:
         # Process full range data
-        d = h5_load_range_by_coord(**cfg_in, db_path=db, range_coordinates=None)
+        d = h5_load_range_by_coord(db_path=db, table=table, **cfg_in, range_coordinates=None)
         msg = ""
 
         yield d, msg
@@ -2500,7 +2583,8 @@ def gen_raw_from_h5(
     cfg_in_for_probes: Dict[str, Dict[str, Any]],
     cfg_in_common: Dict[str, Any],
     cfg_out: Dict[str, Any],
-    b_raw: bool = True
+    b_raw: bool = True,
+    b_only_meta: bool = False,  # todo
 ) -> Generator[Tuple[pd.DataFrame, Tuple[Any, pd.DataFrame, str]], None, None]:
     """
     Generates raw data from raw (todo: / from noAvg) DB HDF5 file based on the provided configuration.
@@ -2623,7 +2707,7 @@ def gen_raw_from_h5(
                 update_cfg_time_ranges(cfg_in_cur, cfg_in_cur["min_date"], cfg_in_cur["max_date"])
 
                 for d, msg in h5_gen_by_time_ranges(
-                    path_in,
+                    db,
                     tbl_in,
                     time_ranges=cfg_in_cur["time_ranges"]
                     if (".raw" in path_in.suffixes[-2:-1] or cfg_out.get("b_split_by_time_ranges"))
@@ -2648,19 +2732,19 @@ def gen_physical(
     **in_many
 ) -> Iterator[Tuple[dd.DataFrame, Dict[str, np.array], str, int]]:
     """
-    Yields parameters to process many paths, tables, dates_min and dates_max. For hdf5 data uses
-    `h5.dispenser_and_names_gen(fun_gen)`, for text input - `load_csv.load_from_csv_gen()`
+    Yields parameters to process many paths, tables, dates_min and dates_max. If configured input is:
+    - hdf5, then uses gen_raw_from_h5 <- h5_gen_by_time_ranges <- h5_dask_pandas.h5_load_range_by_coord;
+    - text, then uses `load_csv.load_from_csv_gen()`.
 
-    :param cfg: dict with fields
+    :param cfg: configuration dict with fields:
     - in:
         - table: pattern to search input tables (any input to `to_pcid_from_name`)
-        letter type prefix (incl) for data in counts else one letter (i). After is porobe identificator separated with "_" if not start with "i" else just 2 digits    - out: dict with fields
+        letter type prefix (incl) for data in counts else one letter (i). After is porobe identificator
+        separated with "_" if not start with "i" else just 2 digits    - out: dict with fields
     - out:
         - table: pattern to construct output table based on input tables found using `in.table` search pattern
         - dt_bins: list of bins to average
     - ...
-    - program: if this dict has field 'return_' equal to '<cfg_input_files>' then returned `d` will have only
-    edge rows
     :param: in_many: fields originated from ConfigInMany_InclProc: these fields will be replaced by single valued fields like in ConfigIn_InclProc:
     - path: Union[str, Path], str/path of real path or multiple paths joined by '|' to be split in list cfg['paths'],
 
@@ -2683,37 +2767,15 @@ def gen_physical(
     # Separate config for each probe from cfg['in_many'] fields
     cfg_in_common, cfg_in_for_probes = separate_cfg_in_for_probes(cfg["in"], in_many)
 
-    # Prepare to save coefs to DB
-
-    def factory_save_coef(**kwards):
-        """Save coefs function factory
-        :param kwards: tbl_raw, dict_matrices, dates
-        """
-        def h5copy_coef_to_db(db):
-            """
-            :param db: opened pandas HDF5 store or HDF5 file opened by h5py
-            """
-            # can't create dataset using h5py in the opened pandas store, so close and reopen
-            #
-            is_db_a_pandas_store = not isinstance(db, h5py.File)  # so it is isinstance(db, pd.HDFStore)
-            if is_db_a_pandas_store:  # is_db_a_pandas_store:
-                db.close()
-            table_written = h5copy_coef(None, db.filename if is_db_a_pandas_store else db, **kwards)
-            if is_db_a_pandas_store:
-                db.open()
-            return table_written
-
-        return h5copy_coef_to_db
-
-
     save_coef_funcs = []  # container for functions that saves coefs
+    raw_updated_pcids = set()  # Track pcids with updated raw data
 
     def calc(
         df_raw,
         cfg_in,
         cfg_filter,
         pcid,
-        tbl_save_coef,
+        coefs, coef_zeroing_matrix,
         df_physical=None,
         dt_bins=cfg["out"]["dt_bins"],
         dt_dask_partition=cfg["out"]["split_period"],
@@ -2722,32 +2784,8 @@ def gen_physical(
         Prepare coef, calculate and average physical parameters data (calls `coef_prepare`, `to_physical`)
         :param tbl_save_coef: if not set then do not save coefs to DB
         """
-        nonlocal save_coef_funcs
-        coefs, coef_zeroing_matrix, dates, msg_coefs = call_with_valid_kwargs(
-            coef_prepare,
-            **cfg_in,
-            data=df_raw,
-            data_date=getattr(df_raw, 'divisions' if isinstance(df_raw, dd.DataFrame) else 'index')[0]
-        )
-
-        # Postpone save coef by h5py to raw db as now it can be opened by pandas
-        if tbl_save_coef:
-            # todo: if path_csv (is None? or) isinstance(path_csv, list) as returned by `load_from_csv_gen`
-            # if it founds and reuses existed db data (skips) we not need try rewrite coefs _if they exists_
-
-            lf.info(f"Coefficients will be saved {msg_coefs}to {tbl_save_coef}")
-            # Save coeff. funcs (one item)
-            save_funcs = [factory_save_coef(
-                dict_matrices=coefs_format_for_h5(coefs, pcid),
-                tbl=tbl_save_coef,
-                dates=dates,
-            )]
-        else:
-            save_funcs = []
-        save_coef_funcs += save_funcs
-
         if False:  # todo: check when we can do time range (global) filtering if loading from db
-            b_ok = apply_time_ranges_mask(df_raw.index, time_ranges=cfg_in.get("time_ranges"))
+            b_ok = mask_time_ranges(df_raw.index, time_ranges=cfg_in.get("time_ranges"))
             if b_ok is not None:  # Removing rows with bad time
                 df_raw = df_raw.loc[b_ok, :]
 
@@ -2780,7 +2818,7 @@ def gen_physical(
         cfg["in"]["path"] = get_input_db(
             cfg["in"]["path"], dt_min_binning_proc=cfg["in"]["dt_min_binning_proc"], **cfg["out"]
         )
-        gen_raw = partial(
+        gen_from_raw = partial(
             gen_raw_from_h5,
             cfg_in_for_probes,
             cfg_in_common,
@@ -2790,77 +2828,40 @@ def gen_physical(
     else:
         # Load CSV (meta)data
         #####################
-        if cfg["in"]["path"]:
-            cfg["in"]["paths"] = []  # ignore
-        if cfg["out"]["dt_bins"]:
-            ...
 
-        # Load only metadata: probes list, optionally with 1st and last data row for each probe
+        # Load metadata of probes to files correspondance
         if cfg_in_common["tables"] and (
                 len(cfg_in_common["tables"]) > 1 or "*" not in cfg_in_common["tables"][0]
             ):
             cfg_in_common["probes"] = [to_pcid_from_name(t) for t in cfg_in_common["tables"]]
-        raw_corrected = search_correct_csv_files(cfg_in_common, cfg["program"])
 
-        gen_csv = partial(
-            load_from_csv_gen,
-            raw_corrected=raw_corrected,
-            cfg_in=cfg_in_common,
-            cfg_in_probe=cfg_in_for_probes,
-        )
+        def fun_gen_from_csv(path):
+            cfg_in = {**cfg_in_common, "path": path}
+            raw_corrected=search_correct_csv_files(cfg_in, cfg["program"])
+            if not raw_corrected:
+                lf.warning(f"Why no files found for {cfg_in['tables']} probes in {path}? Debug running again")
+                raw_corrected=search_correct_csv_files(cfg_in, cfg["program"])
+            return partial(load_from_csv_gen, raw_corrected=raw_corrected, cfg_in=cfg_in)
 
-        if cfg["program"]["return_"] and cfg["program"]["return_"].startswith("<cfg_input_files"):
-            # Yield metadata:
-            # cfg1: calc. parameters (including dataframes with edge rows if cfg["program"]["return_"] set so)
-            # pcid: output col name suffix
-            # tbl_raw: same as pcid with i replaced to "incl"
+        if cfg["in"]["paths"]:
+            cfg["in"]["path"] = None
+            # stream results from each path
+            def gen_from_csv(*args, **kwargs):
+                for path in cfg["in"]["paths"]:
+                    yield from fun_gen_from_csv(path)(*args, **kwargs)
 
-            for df_raw_edges, (ipid, pcid, path_csv) in gen_csv(
-                return_=cfg["program"]["return_"],
-            ):
-                # Configuration with coef. for current input pcid
-                cfg1 = cur_cfg(pcid, cfg_in_for_probes, cfg_in_common, cfg)
-                cfg1["in"]["path"] = path_csv  # corrected raw txt
-                if df_raw_edges:
-                    cfg1["time_ranges"] = [dt.isoformat() for dt in df_raw_edges.index]
-                if len(cfg1["in"]["tables"]) > 0 and cfg1["in"]["tables"][0] == "incl*":  # > 1
-                    cfg1["in"]["tables"] = [pcid_to_raw_name(pcid)]
+        elif cfg["in"]["path"]:
+            cfg["in"]["paths"] = []  # ignore
+            gen_from_csv = fun_gen_from_csv(cfg["in"]["path"])
 
-                # output pcid
-                if cfg["out"]["table"]:
-                    pcid = to_pcid_from_name(cfg["out"]["table"])
-
-
-                # rename incompatible to OmegaConf "in" name, remove paths as we save for each file
-                cfg1 = {"input": {**cfg1.pop("in"), "paths": None}, **cfg1}
-                cfg1["out"]["dt_bins"] = cfg["out"]["dt_bins"]
-
-                # Delete fields that added here and are not in structured config
-                # (does they will be removed anyway by `cfg_d.to_omegaconf_merge_compatible()`?)
-                for del_field in [
-                    "tables", "nfiles", "b_del_temp_db", "temp_db_path", "b_incremental_update"
-                    ]:
-                    del cfg1["out"][del_field]
-                del cfg1["input"]["dt_min_binning_proc"]
-                # not supported config may have been added by h5.out_init() if input from hdf5 file:
-                try:
-                    del cfg1["input"]["b_insert_separator"]
-                    # del cfg1["input"]["pid"]  # todo: from where?
-                except KeyError:
-                    pass
-
-                del cfg1["input"]["cfgFile"]
-
-                yield cfg1, (False, pcid, None)
-            return
-
-
+        if cfg["out"]["dt_bins"]:
+            ...
 
         # CSV to raw DB (`*.raw.h5`)
 
         def to_record_raw(meta):
             """
-            :param meta: tuple (ipid, pcid, csv) - `gen_csv()` metadata output
+            :param meta: tuple (ipid, pcid, csv) - `gen_from_csv()` metadata output
             """
             return h5.file_name_and_time_to_record(
                 meta[-1], *(cfg["out"].get("logfield_fileName_len") or (),)
@@ -2876,28 +2877,46 @@ def gen_physical(
             - metacsv_rec_tblraw: tuple where `metacsv` is (ipid, pcid, csv) yelded by `load_from_csv_gen()`
             Call in calc phys. cycle inside `h5.append_through_temp_db_gen` that can reuse data from noAvg DB
             """
+            nonlocal raw_updated_pcids  # collect probes we skip processing after writing to raw DB
+
+            b_raw_updated = False
+            def keep_recorded_file_(cur: Mapping[str, Any], existing: pd.DataFrame):
+                """
+                Skip loading raw from csv if data already in raw DB. In only such a case also mark
+                `b_raw_updated = False` (so, otherwise, we may stop to allow user inspect new raw db data first)
+                """
+                nonlocal b_raw_updated
+                b_raw_updated = not h5.keep_recorded_file(
+                    cur, existing, keep_newer_records=False, time_range=cfg["in"]["time_ranges"]
+                )
+                b_skip = (not b_raw_updated) if cfg["out"]["b_incremental_update"] else False
+                return b_skip
+
             for df_raw, metacsv_rec_tblraw in h5.append_through_temp_db_gen(
-                gen_csv,
+                gen_from_csv,
                 db_path=cfg["out"]["raw_db_path"],
                 # temp_db_path=cfg["out"]["temp_db_path"],  # need?
                 table_from_meta=(lambda meta_csv: pcid_to_raw_name(meta_csv[1])),
-                skip_fun=(
-                    partial(h5.keep_recorded_file, keep_newer_records=False)
-                    if cfg["out"]["b_incremental_update"]
-                    else (lambda cur, existing: False)
-                ),
+                skip_fun=keep_recorded_file_,
                 record_from_meta=to_record_raw,
             ):
+                if b_raw_updated:  # collect updated probes
+                    pcid = metacsv_rec_tblraw[0][1]
+                    raw_updated_pcids.add(pcid)
+
                 yield df_raw, metacsv_rec_tblraw
 
             # Write coefs to raw db (without temporary db)
             if save_coef_funcs:
                 tables_written = []
-                with h5py.File(cfg["out"]["raw_db_path"], "a") as h5dest:
-                    for fun_save_coef in save_coef_funcs:
-                        tables_written += fun_save_coef(h5dest)
+                try:
+                    with h5py.File(cfg["out"]["raw_db_path"], "a") as h5dest:
+                        for fun_save_coef in save_coef_funcs:
+                            tables_written += fun_save_coef(h5dest)
+                except OSError as e:
+                    print(f"Error: {e}:", end="")
                 print(f"coefs written to raw db: {tables_written}")
-
+            return
 
     # Raw to noAvg DB (`*.proc_noAvg.h5`)
     cfg1 = None  # configuration for current probe in cycle with copy of cfg fields that can be changed
@@ -2909,11 +2928,6 @@ def gen_physical(
         :param meta: tuple (i1pid_pid_csv, csv_record, tbl_raw)
         By the way we get `cfg1` and `pcid`
         """
-        nonlocal cfg1
-
-        # Get coefficients time for metadata record and, by the way, vars needed later
-        # pcid = to_pcid_from_name(tbl_raw)
-        cfg1 = cur_cfg(pcid, cfg_in_for_probes, cfg_in_common, cfg)
 
         # Set metadata record with fileChangeTime = max time of sources that can affect result
         record_file, record_max = (
@@ -2937,32 +2951,49 @@ def gen_physical(
         :param skip_for_meta: function defined inside caller `h5.append_through_temp_db_gen`' `data_gen`
         arg to eval its `table_from_meta` and `record_from_meta` args from meta arg we put here.
         This allows caller get saved data from noAvg DB instead of process what we yield here.
-
+        :param gen_raw:
 
         yields (d_avg, meta_avg_db_bin):
         - d_avg: processed data bin averaged with `dt_bin` (which can be 0 if need proc. not avg more)
         - d_bins_and_cont_pcid_tbl_rec: metadata (probe_continues, pcid, tbl_raw, dt_bin, tbl, rec)
 
         """
-
+        nonlocal save_coef_funcs
+        nonlocal cfg1  # get it by the way for coefficients time for metadata record by to_record_proc_db)
         b_binning = any(dt_bin > timedelta(0) for dt_bin in cfg["out"]["dt_bins"])
         for df_raw, metacsv_rec_tblraw in gen_raw():
             (i1pcid, pcid, path_csv), rec_raw, tbl_raw = metacsv_rec_tblraw
-            probe_continues = track_probe(pcid)  # or use i1pcid?
+            probe_continues = track_probe(pcid)
+            if not (probe_continues):
+                cfg1 = cur_cfg(pcid, cfg_in_for_probes, cfg_in_common, cfg)
+                coefs, coef_zeroing_matrix, save_funcs = coef_prepare_to_save(
+                    df_raw, cfg1["in"], pcid, tbl_save_coef= None if b_input_is_h5 else tbl_raw
+                )
+                # Postpone save coef by h5py to raw db as now it have been opened by pandas
+                save_coef_funcs += save_funcs
 
-            # b_skip_dt0 = skip_for_meta(metacsv_rec_tblraw)
-            # yield (None if b_skip_dt0 else df_raw), metacsv_rec_tblraw
+            b_skip = skip_for_meta([pcid, rec_raw])
 
-            # Allow caller get its destination table and current record, also allowing to reuse saved noAvg
-            # data if they match: we yield data=None to indicate it should reuse.
-            # We not skip if we need binning as `skip_for_meta` checks only not avg. data existence
-            b_skip = skip_for_meta([pcid, rec_raw]) and not b_binning
+            if cfg["program"].get("return_after_saving_to_raw_db", True):
 
-            # if need binning before physical parameters calculation then df_raw will be needed, without
+                # we have updated / created raw data table
+                b_skip = pcid in raw_updated_pcids
+                if b_skip:
+                    lf.warning("Skipping averaging because of return_after_saving_to_raw_db setting (default True)")
+                    yield [], ([], [rec_raw, probe_continues, pcid])  # todo: remove proc/avg data if exist
+                    continue                                          # for now leave it as is
+            else:
+                # We not skip if we need binning as `skip_for_meta` checks only not avg data existence
+                b_skip = b_skip and not b_binning
+
+            # If need binning before physical parameters calculation then df_raw will be needed, without
             # we can skip and avg later if no any(dt_bin <= dt_min_binning_proc for dt_bin in dt_bins)
             # but won't
 
-            # Calc noAvg + Avg at once (we put Avg in meta to reuse later)
+            # Calc noAvg + Avg at once
+
+            # Allow caller get its destination table and current record, also allowing to reuse saved noAvg
+            # data if they match: we yield data d=None to indicate it should reuse.
             d, *d_avg = (
                 [None]
                 if b_skip
@@ -2971,11 +3002,12 @@ def gen_physical(
                     cfg1["in"],
                     cfg1["filter"],
                     pcid,
-                    tbl_save_coef= None if probe_continues or b_input_is_h5 else tbl_raw,
+                    coefs, coef_zeroing_matrix
                     # dt_bins=[timedelta(0)]
                 )
             )
-            yield d, (d_avg, [rec_raw, probe_continues, pcid])
+            yield d, (d_avg, [rec_raw, probe_continues, pcid])  # we put Avg in meta to reuse later
+        return
 
     def gen_avg_save_notavg(skip_for_meta: Callable[[Any], Any]):
         """
@@ -2989,17 +3021,27 @@ def gen_physical(
         dt_avg_bins = dt_bins[(dt_bins[0] == timedelta(0)):] if dt_bins else []
         # Updating noAvg DB
         for d, ((d_avgs, (rec, cont, pcid)), rec_noavg, tbl_noavg) in h5.append_through_temp_db_gen(
-            partial(gen_processed, gen_raw=gen_raw if b_input_is_h5 else gen_save_raw),
+            partial(gen_processed, gen_raw=gen_from_raw if b_input_is_h5 else gen_save_raw),
             db_path=cfg["out"]["not_joined_db_path"],
             table_from_meta=lambda pcid_rec: pcid_rec[0],  # `meta` is a skip_for_meta arg in `gen_save_raw`
             record_from_meta=lambda pcid_rec: to_record_proc_db(*pcid_rec),
             ):
+
+            # # Skip averaging conditionally
+            # if cfg["program"].get("skip_avg_after_raw", True) and pcid in raw_updated_pcids:
+            #     continue
+            dt_bin = timedelta(0)
+            if dt_bins and dt_bins[0] == dt_bin:
+                # b_skip = skip_for_meta([rec_noavg, pcid, dt_bin])
+                yield [d], (cont, pcid, dt_bin)  # wrap to list to not save (only DataFrames are saved)
+
             # Gen processed data separatly for each averaging bin
             for d_avg, dt_bin in zip(d_avgs, dt_avg_bins):
                 # Allow caller get its destination table and current record, so anable to reuse saved Avg
                 # data if they match: we yield data=None to indicate it should be reused.
                 b_skip = skip_for_meta([rec_noavg, pcid, dt_bin])
                 yield (None if b_skip else d_avg), (cont, pcid, dt_bin)
+        return
 
 
     def table_from_meta(rec_tbl_bin):
@@ -3009,8 +3051,8 @@ def gen_physical(
         _, tbl, dt_avg_bin = rec_tbl_bin
         return "{tbl}bin{bin}s".format(tbl=tbl, bin=int(dt_avg_bin.total_seconds()))
 
+    # Executing -----------------------------------------------------------------------------------
 
-    # Read csv if csv input else DB and yield processed Avg data (to write to output csv)
     if cfg["out"]["db_path"]:
         # Writing to raw DB, noAvg DB and Avg DB (through temporary DBs) is configured
         for d_avg, (cont_pcid_bin, rec_avg, tbl_avg) in h5.append_through_temp_db_gen(
@@ -3020,17 +3062,20 @@ def gen_physical(
             table_from_meta=table_from_meta,
             record_from_meta=(lambda rec_tbl_bin: rec_tbl_bin[0]),
         ):
-            yield d_avg, cont_pcid_bin
+            yield (
+                d_avg if isinstance(d_avg, (pd.DataFrame, dd.DataFrame)) else d_avg[0],  # unwrap
+                cont_pcid_bin,
+            )
 
     else:
         # Not writing to DB (and not reading DB data except config coefs)
-        for df_raw, (i1pcid, pcid, path_csv) in gen_csv():
+        for df_raw, (i1pcid, pcid, path_csv) in gen_from_csv():
             # Configuration for pcid: `cfg1` with copy of cfg fields that can be changed in cycle
             cfg1 = cur_cfg(pcid, cfg_in_for_probes, cfg_in_common, cfg)  # get coefs
-            probe_continues = track_probe(pcid)  # or use i1pcid?
-            d_avgs = calc(
-                df_raw, cfg1["in"], cfg1["filter"], pcid  #, tbl_save_coef=False
-            )
+            probe_continues = track_probe(pcid)
+            if not probe_continues:
+                coefs, coef_zeroing_matrix, _save_funcs = coef_prepare_to_save(df_raw, cfg1["in"], pcid)
+            d_avgs = calc(df_raw, cfg1["in"], cfg1["filter"], pcid, coefs, coef_zeroing_matrix)
             if cfg["out"]["table"]:
                 pcid = to_pcid_from_name(cfg["out"]["table"])
             dt_bins = cfg["out"]["dt_bins"]
@@ -3040,7 +3085,662 @@ def gen_physical(
                     continue
 
                 yield d_avgs, [probe_continues, pcid, dt_bin]
+    return
 
+# # Разбиваем gen_physical на специализированные генераторы
+
+# def pipeline_with_db(cfg, ctx: ProcessingContext, **kwargs):
+#     """Пайплайн с записью в базы данных"""
+
+
+#     def gen_raw_stage(cfg, ctx: ProcessingContext, **kwargs):
+#         """Генератор для стадии сырых данных"""
+#         ctx.current_stage = 'raw'
+
+#         # Separate config for each probe from cfg['in_many'] fields
+#         cfg_in_common, cfg_in_for_probes = separate_cfg_in_for_probes(cfg["in"], in_many)
+
+#         # Prepare to save coefs to DB
+
+#         def factory_save_coef(**kwards):
+#             """Save coefs function factory
+#             :param kwards: tbl_raw, dict_matrices, dates
+#             """
+#             def h5copy_coef_to_db(db):
+#                 """
+#                 :param db: opened pandas HDF5 store or HDF5 file opened by h5py
+#                 """
+#                 # can't create dataset using h5py in the opened pandas store, so close and reopen
+#                 #
+#                 is_db_a_pandas_store = not isinstance(db, h5py.File)  # so it is isinstance(db, pd.HDFStore)
+#                 if is_db_a_pandas_store:  # is_db_a_pandas_store:
+#                     db.close()
+#                 table_written = h5copy_coef(None, db.filename if is_db_a_pandas_store else db, **kwards)
+#                 if is_db_a_pandas_store:
+#                     db.open()
+#                 return table_written
+
+#             return h5copy_coef_to_db
+
+#         raw_updated_pcids = set()  # Track pcids with updated raw data
+
+#         b_input_is_h5 = cfg["in"]["paths"][0].suffix in hdf5_suffixes
+#         track_probe = track_probe_closure(b_input_is_h5, b_from_processed_db=False)
+
+
+#         if ctx.cfg["in"]["paths"][0].suffix in hdf5_suffixes:
+#             # Load HDF5
+#             for data, meta in gen_h5_raw(ctx, **kwargs):
+#                 yield data, meta
+#         else:
+#             # Load CSV
+
+#             if cfg["in"]["path"]:
+#                 cfg["in"]["paths"] = []  # ignore
+#             if cfg["out"]["dt_bins"]:
+#                 ...
+
+#             # Load metadata of probes to files correspondance
+#             if cfg_in_common["tables"] and (
+#                     len(cfg_in_common["tables"]) > 1 or "*" not in cfg_in_common["tables"][0]
+#                 ):
+#                 cfg_in_common["probes"] = [to_pcid_from_name(t) for t in cfg_in_common["tables"]]
+#             raw_corrected = search_correct_csv_files(cfg_in_common, cfg["program"])
+
+#             gen_from_csv = partial(
+#                 load_from_csv_gen,
+#                 raw_corrected=raw_corrected,
+#                 cfg_in=cfg_in_common,
+#                 cfg_in_probe=cfg_in_for_probes,
+#             )
+
+#             # CSV to raw DB (`*.raw.h5`)
+
+#             def to_record_raw(meta):
+#                 """
+#                 :param meta: tuple (ipid, pcid, csv) - `gen_from_csv()` metadata output
+#                 """
+#                 return h5.file_name_and_time_to_record(
+#                     meta[-1], *(cfg["out"].get("logfield_fileName_len") or (),)
+#                 )
+
+#             def gen_save_raw():
+#                 """
+#                 Generate raw data and update raw DB (`*.raw.h5`) through temporary (`*.raw_not_sorted.h5`),
+#                 skipping to save the existed up to date text data in raw DB (in that case load it).
+#                 :yields df_raw_or_None, (df_raw, metacsv_rec_tblraw) where:
+#                 - df_raw_or_None raw data or None if this data is not needed,
+#                 - df_raw: raw data,
+#                 - metacsv_rec_tblraw: tuple where `metacsv` is (ipid, pcid, csv) yelded by `load_from_csv_gen()`
+#                 Call in calc phys. cycle inside `h5.append_through_temp_db_gen` that can reuse data from noAvg DB
+#                 """
+#                 nonlocal raw_updated_pcids
+#                 for df_raw, metacsv_rec_tblraw in h5.append_through_temp_db_gen(
+#                     gen_from_csv,
+#                     db_path=cfg["out"]["raw_db_path"],
+#                     # temp_db_path=cfg["out"]["temp_db_path"],  # need?
+#                     table_from_meta=(lambda meta_csv: pcid_to_raw_name(meta_csv[1])),
+#                     skip_fun=(
+#                         partial(
+#                             h5.keep_recorded_file, keep_newer_records=False, time_range=cfg["in"]["time_ranges"]
+#                         )
+#                         if cfg["out"]["b_incremental_update"]
+#                         else (lambda cur, existing: False)
+#                     ),
+#                     record_from_meta=to_record_raw,
+#                 ):
+#                     pcid = metacsv_rec_tblraw[0][1]
+#                     raw_updated_pcids.add(pcid)  # Mark pcid as updated
+#                     yield df_raw, metacsv_rec_tblraw
+
+#                 # Write coefs to raw db (without temporary db)
+#                 if save_coef_funcs:
+#                     tables_written = []
+#                     with h5py.File(cfg["out"]["raw_db_path"], "a") as h5dest:
+#                         for fun_save_coef in save_coef_funcs:
+#                             tables_written += fun_save_coef(h5dest)
+#                     print(f"coefs written to raw db: {tables_written}")
+
+
+
+
+#             for data, meta in gen_csv_raw(ctx, **kwargs):
+#                 pcid = meta[1]  # Извлекаем PCID из метаданных
+#                 ctx.mark_raw_updated(pcid)
+#                 yield data, meta
+
+#     def gen_noavg_stage(gen_raw, ctx: ProcessingContext):
+#         """Генератор для стадии без усреднения"""
+#         ctx.current_stage = 'noavg'
+
+#         # Prepare to save coefs to DB
+
+#         def factory_save_coef(**kwards):
+#             """Save coefs function factory
+#             :param kwards: tbl_raw, dict_matrices, dates
+#             """
+#             def h5copy_coef_to_db(db):
+#                 """
+#                 :param db: opened pandas HDF5 store or HDF5 file opened by h5py
+#                 """
+#                 # can't create dataset using h5py in the opened pandas store, so close and reopen
+#                 #
+#                 is_db_a_pandas_store = not isinstance(db, h5py.File)  # so it is isinstance(db, pd.HDFStore)
+#                 if is_db_a_pandas_store:  # is_db_a_pandas_store:
+#                     db.close()
+#                 table_written = h5copy_coef(None, db.filename if is_db_a_pandas_store else db, **kwards)
+#                 if is_db_a_pandas_store:
+#                     db.open()
+#                 return table_written
+
+#             return h5copy_coef_to_db
+
+
+#         save_coef_funcs = []  # container for functions that saves coefs
+
+#         def calc(
+#             df_raw,
+#             cfg_in,
+#             cfg_filter,
+#             pcid,
+#             tbl_save_coef,
+#             df_physical=None,
+#             dt_bins=cfg["out"]["dt_bins"],
+#             dt_dask_partition=cfg["out"]["split_period"],
+#         ) -> List[dd.DataFrame]:
+#             """
+#             Prepare coef, calculate and average physical parameters data (calls `coef_prepare`, `to_physical`)
+#             :param tbl_save_coef: if not set then do not save coefs to DB
+#             """
+#             nonlocal save_coef_funcs
+#             coefs, coef_zeroing_matrix, dates, msg_coefs = call_with_valid_kwargs(
+#                 coef_prepare,
+#                 **cfg_in,
+#                 data=df_raw,
+#                 data_date=getattr(df_raw, 'divisions' if isinstance(df_raw, dd.DataFrame) else 'index')[0]
+#             )
+
+#             # Postpone save coef by h5py to raw db as now it have been opened by pandas
+#             if tbl_save_coef:
+#                 # todo: if path_csv (is None? or) isinstance(path_csv, list) as returned by `load_from_csv_gen`
+#                 # if it founds and reuses existed db data (skips) we not need try rewrite coefs _if they exists_
+
+#                 lf.info(f"Coefficients will be saved {msg_coefs}to {tbl_save_coef}")
+#                 # Save coeff. funcs (one item)
+#                 save_funcs = [factory_save_coef(
+#                     dict_matrices=coefs_format_for_h5(coefs, pcid),
+#                     tbl=tbl_save_coef,
+#                     dates=dates,
+#                 )]
+#             else:
+#                 save_funcs = []
+#             save_coef_funcs += save_funcs
+
+#             if False:  # todo: check when we can do time range (global) filtering if loading from db
+#                 b_ok = mask_time_ranges(df_raw.index, time_ranges=cfg_in.get("time_ranges"))
+#                 if b_ok is not None:  # Removing rows with bad time
+#                     df_raw = df_raw.loc[b_ok, :]
+
+#             d_avgs = to_physical(
+#                 df_raw,
+#                 {
+#                     **coefs,
+#                     **incl_calc_kwargs,
+#                     "max_incl_of_fit_deg": cfg_in["max_incl_of_fit_deg"],
+#                     "calc_version": cfg_in["calc_version"],
+#                 },
+#                 coef_zeroing_matrix,
+#                 cfg_filter=cfg_filter,
+#                 dt_bins=dt_bins,
+#                 dt_min_binning_proc=cfg_in["dt_min_binning_proc"],
+#                 pcid=pcid,
+#                 dt_dask_partition=dt_dask_partition,
+#                 df_physical=df_physical,
+#             )
+#             return d_avgs
+
+
+#         # Raw to noAvg DB (`*.proc_noAvg.h5`)
+#         cfg1 = None  # configuration for current probe in cycle with copy of cfg fields that can be changed
+#         # pcid = None  # name of probe in `cfg_many` config (Probe output Column ID in output composed table)
+
+#         def to_record_proc_db(pcid, csv_record):
+#             """
+#             Extract noAvg DB log record, and init `cfg1` with coefficients as their date used here
+#             :param meta: tuple (i1pid_pid_csv, csv_record, tbl_raw)
+#             By the way we get `cfg1` and `pcid`
+#             """
+#             nonlocal cfg1
+
+#             # Get coefficients time for metadata record and, by the way, vars needed later
+#             # pcid = to_pcid_from_name(tbl_raw)
+#             cfg1 = cur_cfg(pcid, cfg_in_for_probes, cfg_in_common, cfg)
+
+#             # Set metadata record with fileChangeTime = max time of sources that can affect result
+#             record_file, record_max = (
+#                 [csv_record[k] for k in ["fileName", "fileChangeTime"]]
+#                 if isinstance(csv_record, Mapping)  # when not from raw db
+#                 else csv_record.loc[:, ["fileName", "fileChangeTime"]].values[0]
+#             )
+#             # to_record_raw(i1pid_pid_csv)["fileName"] if i1pid_pid_csv
+#             return {
+#                 "fileName": record_file,
+#                 "fileChangeTime": max(
+#                     (d for d in [cfg1["in"]["coefs"].get("date"), record_max] if d is not None)
+#                 )
+#             }
+
+#         def gen_processed(skip_for_meta: Callable[[Any], Any], gen_raw: Callable[[Any], Any]):
+#             """
+#             Gen processed data (with updating noAvg DB). For use in `h5.append_through_temp_db_gen` writing to
+#             noAvg DB. Avg data we put in metadata for later use. When calc adds coefs, but not calcs if noAvg
+#             already exists - todo: set adding coefs when adding raw data.
+#             :param skip_for_meta: function defined inside caller `h5.append_through_temp_db_gen`' `data_gen`
+#             arg to eval its `table_from_meta` and `record_from_meta` args from meta arg we put here.
+#             This allows caller get saved data from noAvg DB instead of process what we yield here.
+#             :param gen_raw:
+
+#             yields (d_avg, meta_avg_db_bin):
+#             - d_avg: processed data bin averaged with `dt_bin` (which can be 0 if need proc. not avg more)
+#             - d_bins_and_cont_pcid_tbl_rec: metadata (probe_continues, pcid, tbl_raw, dt_bin, tbl, rec)
+
+#             """
+
+#             b_binning = any(dt_bin > timedelta(0) for dt_bin in cfg["out"]["dt_bins"])
+#             for df_raw, metacsv_rec_tblraw in gen_raw():
+#                 (i1pcid, pcid, path_csv), rec_raw, tbl_raw = metacsv_rec_tblraw
+#                 probe_continues = track_probe(pcid)  # or use i1pcid?
+
+#                 # b_skip_dt0 = skip_for_meta(metacsv_rec_tblraw)
+#                 # yield (None if b_skip_dt0 else df_raw), metacsv_rec_tblraw
+
+#                 b_skip = skip_for_meta([pcid, rec_raw])
+
+
+#                 if True:  # todo: cfg["program"]["return_after_saving_to_raw_db"]:
+
+#                     # todo: better method to determine that we have updated / created raw data table now than this
+#                     # b_skip = pd.Timestamp.now() - rec_raw["DateProc"].iloc[-1] < pd.Timedelta(hours=2)
+#                     lf.warning("Skipping averaging because of return_after_saving_to_raw_db (always True) setting")
+
+#                     b_skip = pcid in raw_updated_pcids
+#                     if b_skip:
+#                         yield None, ([], [rec_raw, probe_continues, pcid])  # todo: remove proc/avg data if exist
+#                         continue                                            # for now leave it as is
+#                 else:
+#                     # We not skip if we need binning as `skip_for_meta` checks only not avg data existence
+#                     b_skip = b_skip and not b_binning
+
+#                 # If need binning before physical parameters calculation then df_raw will be needed, without
+#                 # we can skip and avg later if no any(dt_bin <= dt_min_binning_proc for dt_bin in dt_bins)
+#                 # but won't
+
+#                 # Calc noAvg + Avg at once
+
+#                 # Allow caller get its destination table and current record, also allowing to reuse saved noAvg
+#                 # data if they match: we yield data d=None to indicate it should reuse.
+#                 d, *d_avg = (
+#                     [None]
+#                     if b_skip
+#                     else calc(
+#                         df_raw,
+#                         cfg1["in"],
+#                         cfg1["filter"],
+#                         pcid,
+#                         tbl_save_coef= None if probe_continues or b_input_is_h5 else tbl_raw,
+#                         # dt_bins=[timedelta(0)]
+#                     )
+#                 )
+#                 yield d, (d_avg, [rec_raw, probe_continues, pcid])  # we put Avg in meta to reuse later
+
+
+
+#         def wrapped_gen(skip_for_meta):
+#             for data, (pcid, rec_raw) in raw_gen():
+#                 ctx.current_pcid = pcid
+#                 # ... существующая логика обработки ...
+#                 yield processed_data, (d_avgs, [rec_raw, cont, pcid])
+
+#         yield from append_through_temp_db_gen(
+#             wrapped_gen,
+#             db_path=ctx.cfg["out"]["not_joined_db_path"],
+#             # ... другие параметры ...
+#         )
+
+
+
+
+#     def gen_avg_stage(noavg_gen, cfg, ctx: ProcessingContext):
+
+#         """Генератор для стадии усреднения с условным пропуском"""
+#         ctx.current_stage = 'avg'
+
+
+#         def gen_avg_save_notavg(skip_for_meta: Callable[[Any], Any]):
+#             """
+#             Gen processed data (with updating noAvg DB).
+#             :param skip_for_meta: function defined inside caller `h5.append_through_temp_db_gen`' `data_gen` arg
+#             to eval `table_from_meta` and `record_from_meta` args (allows it load saved data from Avg DB
+#             yields (d_avg, cont, pcid, dt_bin):
+#             - d_avg: processed data bin averaged with `dt_bin` (which > 0 as not avg is not need proc. more)
+#             """
+#             dt_bins = cfg["out"]["dt_bins"]
+#             dt_avg_bins = dt_bins[(dt_bins[0] == timedelta(0)):] if dt_bins else []
+#             # Updating noAvg DB
+#             for d, ((d_avgs, (rec, cont, pcid)), rec_noavg, tbl_noavg) in h5.append_through_temp_db_gen(
+#                 partial(gen_processed, gen_raw=gen_from_raw if b_input_is_h5 else gen_save_raw),
+#                 db_path=cfg["out"]["not_joined_db_path"],
+#                 table_from_meta=lambda pcid_rec: pcid_rec[0],  # `meta` is a skip_for_meta arg in `gen_save_raw`
+#                 record_from_meta=lambda pcid_rec: to_record_proc_db(*pcid_rec),
+#                 ):
+
+#                 # # Skip averaging conditionally
+#                 # if cfg["program"].get("skip_avg_after_raw", True) and pcid in raw_updated_pcids:
+#                 #     continue
+
+#                 # Gen processed data separatly for each averaging bin
+#                 for d_avg, dt_bin in zip(d_avgs, dt_avg_bins):
+#                     # Allow caller get its destination table and current record, so anable to reuse saved Avg
+#                     # data if they match: we yield data=None to indicate it should be reused.
+#                     b_skip = skip_for_meta([rec_noavg, pcid, dt_bin])
+#                     yield (None if b_skip else d_avg), (cont, pcid, dt_bin)
+
+
+#         def table_from_meta(rec_tbl_bin):
+#             """
+#             :param rec_tbl_bin: `meta` arg of skip_for_meta in `gen_avg_save_notavg`
+#             """
+#             _, tbl, dt_avg_bin = rec_tbl_bin
+#             return "{tbl}bin{bin}s".format(tbl=tbl, bin=int(dt_avg_bin.total_seconds()))
+
+#         # --------------------------------------------------------------------------------------------
+
+#         if cfg["out"]["db_path"]:
+#             # Writing to raw DB, noAvg DB and Avg DB (through temporary DBs) is configured
+#             for d_avg, (cont_pcid_bin, rec_avg, tbl_avg) in h5.append_through_temp_db_gen(
+#                 gen_avg_save_notavg,
+#                 db_path=cfg["out"]["not_joined_db_path"].parent
+#                 / cfg["out"]["not_joined_db_path"].name.replace("_noAvg", "_Avg", 1),
+#                 table_from_meta=table_from_meta,
+#                 record_from_meta=(lambda rec_tbl_bin: rec_tbl_bin[0]),
+#             ):
+#                 yield d_avg, cont_pcid_bin
+
+
+
+#         def wrapped_gen(skip_for_meta):
+#             for d, ((d_avgs, (rec, cont, pcid)), rec_noavg, tbl_noavg in noavg_gen():
+#                 ctx.current_pcid = pcid
+#                 dt_bins = [b for b in cfg["out"]["dt_bins"] if b > timedelta(0)]
+
+#                 for d_avg, dt_bin in zip(d_avgs, dt_bins):
+#                     if ctx.should_skip_avg(pcid, dt_bin):
+#                         continue  # Пропускаем усреднение!
+
+#                     yield d_avg, (cont, pcid, dt_bin)
+
+#         yield from append_through_temp_db_gen(
+#             wrapped_gen,
+#             db_path=cfg["out"]["db_path"],
+#             # ... другие параметры ...
+#         )
+
+#     def avg_stage(noavg_stage, cfg):
+#         """Conditional averaging with raw-update check"""
+#         def avg_gen(skip_for_meta):
+#             for noavg_data, meta in noavg_stage():
+#                 pcid = meta[0]
+#                 for dt_bin in cfg["out"]["dt_bins"]:
+#                     if should_skip_avg(pcid, dt_bin):
+#                         continue
+#                     # Perform averaging
+#                     avg_data = average(noavg_data, dt_bin)
+#                     yield avg_data, (pcid, dt_bin)
+
+#         yield from append_through_temp_db_gen(
+#             avg_gen,
+#             db_path=cfg["out"]["db_path"],
+#             ...
+#         )
+
+
+
+#     # Стадия 1: Обработка сырых данных
+#     raw_gen = gen_raw_stage(cfg, ctx, **kwargs)
+
+#     # Стадия 2: Обработка без усреднения
+#     noavg_gen = gen_noavg_stage(raw_gen, cfg, ctx)
+
+#     # Стадия 3: Усреднение (с условным пропуском)
+#     avg_gen = gen_avg_stage(noavg_gen, cfg, ctx)
+
+#     yield from avg_gen
+
+
+
+# def gen_physical_todo(cfg: MutableMapping[str, Any], **kwargs):
+
+#     # контекст обработки для состояния
+#     class ProcessingContext:
+#         def __init__(self, cfg):
+#             self.cfg = cfg
+#             self.raw_updated_pcids = set()  # Трекер PCID с обновленными сырыми данными
+#             self.current_pcid = None
+#             self.current_stage = None  # 'raw', 'noavg', 'avg'
+
+#         def mark_raw_updated(self, pcid):
+#             """Пометить PCID как имеющий обновленные сырые данные"""
+#             self.raw_updated_pcids.add(pcid)
+
+#         def should_skip_avg(self, pcid, dt_bin):
+#             """Определить нужно ли пропускать усреднение"""
+#             return (
+#                 dt_bin > timedelta(0) and
+#                 pcid in self.raw_updated_pcids and
+#                 self.cfg.get("skip_avg_after_raw", True)
+#             )
+
+#     ctx = ProcessingContext(cfg)
+
+#     # Основной пайплайн обработки
+#     if cfg["out"]["db_path"]:
+#         yield from pipeline_with_db(ctx, **kwargs)
+#     else:
+#         yield from pipeline_in_memory(ctx, **kwargs)
+
+
+
+
+# # Разбиваем gen_physical на специализированные генераторы
+# def gen_physical(cfg: MutableMapping[str, Any], **kwargs):
+#     ctx = ProcessingContext(cfg)
+
+#     # Основной пайплайн обработки
+#     if cfg["out"]["db_path"]:
+#         yield from pipeline_with_db(ctx, **kwargs)
+#     else:
+#         yield from pipeline_in_memory(ctx, **kwargs)
+
+# ## Read raw input (csv / DB) and yield processed Avg data
+# def gen_raw_stage(ctx: ProcessingContext, **kwargs):
+#     """Генератор для стадии сырых данных"""
+#     ctx.current_stage = 'raw'
+
+#     if ctx.cfg["in"]["paths"][0].suffix in hdf5_suffixes:
+#         # Обработка HDF5
+#         for data, meta in gen_h5_raw(ctx, **kwargs):
+#             yield data, meta
+#     else:
+#         # Обработка CSV
+#         for data, meta in gen_csv_raw(ctx, **kwargs):
+#             pcid = meta[1]  # Извлекаем PCID из метаданных
+#             ctx.mark_raw_updated(pcid)
+#             yield data, meta
+
+
+# def pipeline_with_db(ctx: ProcessingContext, **kwargs):
+#     """Пайплайн с записью в базы данных"""
+#     # Стадия 1: Обработка сырых данных
+#     raw_gen = gen_raw_stage(ctx, **kwargs)
+
+#     # Стадия 2: Обработка без усреднения
+#     noavg_gen = gen_noavg_stage(ctx, raw_gen)
+
+#     # Стадия 3: Усреднение (с условным пропуском)
+#     avg_gen = gen_avg_stage(ctx, noavg_gen)
+
+#     yield from avg_gen
+
+
+
+
+
+def gen_metadata(
+    cfg: MutableMapping[str, Any],
+    incl_calc_kwargs={},
+    **in_many
+) -> Iterator[Tuple[dd.DataFrame, Dict[str, np.array], str, int]]:
+    """
+    Yields metadata by reading configured paths, tables, dates_min and dates_max.
+    Loads data from CSV.
+    if cfg["program"]["return_"] and cfg["program"]["return_"].startswith("<cfg_input_files"):
+    - text, then uses `load_csv.load_from_csv_gen()`.
+
+    :param cfg: configuration dict with fields:
+    - in: ... same as for `gen_physical()`
+    """
+
+    # Separate config for each probe from cfg['in_many'] fields
+    cfg_in_common, cfg_in_for_probes = separate_cfg_in_for_probes(cfg["in"], in_many)
+
+    b_input_is_h5 = cfg["in"]["paths"][0].suffix in hdf5_suffixes
+    # track_probe = track_probe_closure(b_input_is_h5, b_from_processed_db=False)
+    if b_input_is_h5:
+        print("Metadata from hdf5 may be not implemented")
+        # Loading from HDF5
+        # Determine whether we need input raw data or averaged data
+        cfg["in"]["path"] = get_input_db(
+            cfg["in"]["path"], dt_min_binning_proc=cfg["in"]["dt_min_binning_proc"], **cfg["out"]
+        )
+        gen_from_raw = partial(  # yields (d, meta_raw_db)
+            gen_raw_from_h5,
+            cfg_in_for_probes,
+            cfg_in_common,
+            cfg_out=cfg["out"],
+            b_raw=".raw" in cfg["in"]["path"].suffixes[-2:-1],
+            b_only_meta=True  # todo: implement
+        )
+    else:
+        # Loading from CSV
+        if cfg["in"]["path"]:
+            cfg["in"]["paths"] = []  # ignore
+        if cfg["out"]["dt_bins"]:
+            ...
+
+        # Load only metadata: probes list, optionally with 1st and last data row for each probe
+        if cfg_in_common["tables"] and (
+                len(cfg_in_common["tables"]) > 1 or "*" not in cfg_in_common["tables"][0]
+            ):
+            cfg_in_common["probes"] = [to_pcid_from_name(t) for t in cfg_in_common["tables"]]
+        raw_corrected = search_correct_csv_files(cfg_in_common, cfg["program"])
+
+        gen_from_raw = partial(  # gen_from_csv
+            load_from_csv_gen,
+            raw_corrected=raw_corrected,
+            cfg_in=cfg_in_common,
+            cfg_in_probe=cfg_in_for_probes,
+            return_=cfg["program"]["return_"],
+        )
+
+    # Yield metadata:
+    # cfg1: calc. parameters (including dataframes with edge rows if cfg["program"]["return_"] set so)
+    # pcid: output col name suffix
+    # tbl_raw: same as pcid with i replaced to "incl"
+
+    for df_raw_edges, (ipid, pcid, path_csv) in gen_from_raw():
+        # Configuration with coef. for current input pcid
+        cfg1 = cur_cfg(pcid, cfg_in_for_probes, cfg_in_common, cfg)
+        cfg1["in"]["path"] = path_csv  # corrected raw txt
+        if df_raw_edges:
+            cfg1["time_ranges"] = [dt.isoformat() for dt in df_raw_edges.index]
+        if len(cfg1["in"]["tables"]) > 0 and cfg1["in"]["tables"][0] == "incl*":  # > 1
+            cfg1["in"]["tables"] = [pcid_to_raw_name(pcid)]
+
+        # output pcid
+        if cfg["out"]["table"]:
+            pcid = to_pcid_from_name(cfg["out"]["table"])
+
+        # rename incompatible to OmegaConf "in" name, remove paths as we save for each file
+        cfg1 = {"input": {**cfg1.pop("in"), "paths": None}, **cfg1}
+        cfg1["out"]["dt_bins"] = cfg["out"]["dt_bins"]
+
+        # Delete fields that added here and are not in structured config
+        # (does they will be removed anyway by `cfg_d.to_omegaconf_merge_compatible()`?)
+        for del_field in [
+            "tables", "nfiles", "b_del_temp_db", "temp_db_path", "b_incremental_update"
+            ]:
+            del cfg1["out"][del_field]
+        del cfg1["input"]["dt_min_binning_proc"]
+        # not supported config may have been added by h5.out_init() if input from hdf5 file:
+        try:
+            del cfg1["input"]["b_insert_separator"]
+            # del cfg1["input"]["pid"]  # todo: from where?
+        except KeyError:
+            pass
+
+        del cfg1["input"]["cfgFile"]
+
+        yield cfg1, (False, pcid, None)
+
+
+def save_config_to_yaml(cfg):
+    """
+    Collects and saves configs from gen_metadata() which emulates the runs of gen_physical() on edge rows
+    :return out_dicts:
+    """
+    out_dicts = {}
+    try:
+        dir_cfg_proc = cfg["out"]["raw_db_path"].parent
+    except AttributeError:
+        dir_cfg_proc = cfg["out"]["db_path"].parent
+        if dir_cfg_proc.name != "_raw":
+            dir_cfg_proc =  dir_cfg_proc / "_raw"
+    dir_cfg_proc = dir_cfg_proc / "cfg_proc" / "defaults"
+    dir_cfg_proc.mkdir(parents=True, exist_ok=True)
+
+    file_name_ptn = "{pcid}_{time_now:%Y%m%d_%H%M%S}.yaml"
+    time_now = datetime.now()
+    lf.info(
+        "Saving configuration parameters mode: to {} for each probe ID",
+        file_name_ptn.format(pcid="{}", time_now = time_now)
+    )
+    ry = YAML(typ="safe", pure=True)  # sorts by default
+    ry.default_flow_style = False
+    ry.allow_unicode = True
+    # ry.indent(mapping=2, sequence=4, offset=2)
+
+    file_stems = set()  # to mantain uneque file names
+    for cfg1, (probe_continues, pcid, _) in gen_metadata(cfg, **cfg["in_many"]):
+        if dir_cfg_proc:
+            # Save calculating parameters
+            conf_ = cfg_d.to_omegaconf_merge_compatible(cfg1, ConfigType)
+            # conf = OmegaConf.create(conf_)
+
+            # Save to `defaults` dir so we can use them as configs with new defaults to run later
+            while True:  # Make unique file name (can gen_metadata/gen_physical yield same pcid?)
+                file_stem = file_name_ptn.format(pcid=pcid, time_now=time_now)
+                if file_stem in file_stems:  # change next time-based files names
+                    time_now = datetime.now()
+                    continue
+                file_stems.add(file_stem)
+                break
+            print(f"{pcid}: {file_stem}", end=", ")
+            with (dir_cfg_proc / file_stem).with_suffix(".yaml").open(encoding="utf8", mode="w") as fp:
+                ry.dump(conf_, stream=fp)
+        # OmegaConf.save(conf, fp)  # or pickle.dump(conf, fp)
+        # fp.flush()
+        out_dicts[str(cfg1['input']['path'])] = cfg1  # [tbl]? cfg_?
+    return out_dicts
 
 # -----------------------------------------------------------------------------------------------------------
 
@@ -3063,7 +3763,13 @@ def main(config: ConfigType) -> Union[None, Mapping[str, Any], pd.DataFrame]:
     cfg['input']['paths'] = (
         [Path(config.input['path'])] if config.input['paths'] is None
         else [Path(p) for p in config.input['paths']])
-    cfg = cfg_d.main_init_input_file(cfg, cs_store_name, msg_action='Loading data from', in_file_field='path')
+
+    cfg = cfg_d.main_init_input_file(
+        cfg,
+        cs_store_name,
+        msg_action="Configuration for" if cfg["program"]["return_"] else "Loading data from",
+        in_file_field="path",
+    )
     lf.info(
         "Begin {:s} {:s}",
         this_prog_basename(__file__),
@@ -3071,65 +3777,24 @@ def main(config: ConfigType) -> Union[None, Mapping[str, Any], pd.DataFrame]:
         if cfg["out"]["dt_bins"] == [timedelta(0)]
         else "(bins: {})".format(', '.join(format_timedelta(dt) for dt in cfg["out"]["dt_bins"]))
     )
+    if not cfg["in"]["path"]:
+        cfg["in"]["path"] = cfg["in"]["paths"][0]  # used to get full path if needed in following func. only
     cfg["in"]["path"] = set_full_paths_and_h5_out_fields(cfg["out"], **cfg["in"])
+
     cfg['in'].setdefault('dt_min_binning_proc', pd.Timedelta('2s'))
 
     if cfg['program']['return_']:
-
-        # Return / save configuration
+        # Return after saving configuration if configured
 
         if cfg['program']['return_'] == '<cfg_before_cycle>':
             return cfg  # common config to help testing
         if cfg['program']['return_'].startswith('<cfg_input_files'):
-            # Return configuration for each input file and optionally save them
-            out_dicts = {}
+            # Return configuration for each input file and optionally save them with meta from edge rows
             if cfg['program']['return_'].endswith('to_yaml>'):
-                try:
-                    dir_cfg_proc = cfg["out"]["raw_db_path"].parent
-                except AttributeError:
-                    dir_cfg_proc = cfg["out"]["db_path"].parent
-                    if dir_cfg_proc.name != "_raw":
-                        dir_cfg_proc =  dir_cfg_proc / "_raw"
-                dir_cfg_proc = dir_cfg_proc / "cfg_proc" / "defaults"
-                dir_cfg_proc.mkdir(parents=True, exist_ok=True)
-
-                file_name_ptn = "{pcid}_{time_now:%Y%m%d_%H%M%S}.yaml"
-                time_now = datetime.now()
-                lf.info(
-                    "Saving configuration parameters mode: to {} for each probe ID",
-                    file_name_ptn.format(pcid="{}", time_now = time_now)
-                )
-
-                from ruamel.yaml import YAML
-                ry = YAML(typ="safe", pure=True)  # sorts by default
-                ry.default_flow_style = False
-                ry.allow_unicode = True
-                # ry.indent(mapping=2, sequence=4, offset=2)
-
-                file_stems = set()
-                for cfg1, (probe_continues, pcid, _) in gen_physical(cfg, **cfg['in_many']):
-                    if dir_cfg_proc:
-                        # Save calculating parameters
-                        conf_ = cfg_d.to_omegaconf_merge_compatible(cfg1, ConfigType)
-                        # conf = OmegaConf.create(conf_)
-
-                        # Save to `defaults` dir so we can use them as configs with new defaults to run later
-                        while True:  # Make unique file name (can gen_physical yield same pcid?)
-                            file_stem = file_name_ptn.format(pcid=pcid, time_now=time_now)
-                            if file_stem in file_stems:  # change next time-based files names
-                                time_now = datetime.now()
-                                continue
-                            file_stems.add(file_stem)
-                            break
-                        print(f"{pcid}: {file_stem}", end=", ")
-                        with (dir_cfg_proc / file_stem).with_suffix('.yaml').open(encoding="utf8", mode="w") as fp:
-                            ry.dump(conf_, stream=fp)
-                            # OmegaConf.save(conf, fp)  # or pickle.dump(conf, fp)
-                            # fp.flush()
-                    out_dicts[str(cfg1['input']['path'])] = cfg1  # [tbl]? cfg_?
-
+                out_dicts = save_config_to_yaml(cfg)
             else:
-                dir_cfg_proc = None
+                out_dicts = {}
+                # dir_cfg_proc = None
                 lf.info('Not saving yaml configs')
 
             print("\nOk.", end=" ")
@@ -3139,11 +3804,11 @@ def main(config: ConfigType) -> Union[None, Mapping[str, Any], pd.DataFrame]:
         lf.error("Neither output hdf5 store nor text output was requested. The end")
         return
 
-    # Set columns from incl_calc_velocity() we need to calculate: all calculated cols will be prepend if
+    # Set columns from incl_calc_velocity() we need to calculate: all calculated cols will be prepended if
     # save txt and without Vabs/dir columns if not txt needed
     cols_out_h5 = ['v', 'u', 'Pressure', 'Temp', 'inclination']  # absent here cols will be ignored
 
-    # Filtering config [min/max][M] could be specified with just key M to set same value for keys Mx My Mz
+    # Filtering config [min/max] "M"-shortcat value copy to "Mx", "My", "Mz" fields for wich it was not set
     for lim in ["min", "max"]:
         if "M" in cfg["filter"][lim]:
             for ch in ("x", "y", "z"):
@@ -3171,7 +3836,7 @@ def main(config: ConfigType) -> Union[None, Mapping[str, Any], pd.DataFrame]:
 
     # Data processing cycle
     dfs_all_bins: Mapping[str, List[pd.DataFrame]] = {
-        dt: [] for dt in cfg["out"]["dt_bins"] if dt > timedelta(0)}
+        dt: [] for dt in cfg["out"]["dt_bins"]}  # if dt > timedelta(0)
     tbls = {k: [] for k in dfs_all_bins.keys()}  # tables to add to log table & to joined suffix of comb. csv
     cfg["out"]['tables_written'] = set()
     probe_continue_file_names = {k: {} for k in dfs_all_bins.keys()}
@@ -3182,7 +3847,7 @@ def main(config: ConfigType) -> Union[None, Mapping[str, Any], pd.DataFrame]:
         if cfg["out"]["text_path"]
         else {},  # keep min cols if not need to save txt: v, u, inclination
     ):
-        if d is None:
+        if d is None or not len(d):
             continue
         bin = int(dt_bin.total_seconds())
 

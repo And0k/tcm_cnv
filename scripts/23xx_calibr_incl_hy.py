@@ -150,7 +150,7 @@ if st(20, 'Coefficients to convert inclination to |V| and zero calibration (not 
     """
     from h5from_veusz_coef import main as h5from_veusz_coef
 
-    # from veuszPropagate import __file__ as file_veuszPropagate
+    # from utils.veuszPropagate import __file__ as file_veuszPropagate
 
     # [36,37,38,3,4]  # range(26, 31)  # range(1, 31) [23,30,32] 17,18 [3,12,15,19,1,13,14,16] [1,4,5,7,11,12]  # [4,5,11,12]   #[29, 30, 33]  # [3, 14, 15, 16, 19]
     #channels_list = ['M', 'A']  # []

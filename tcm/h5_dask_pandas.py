@@ -492,7 +492,7 @@ def filt_blocks_array(x, i_starts, func=None):
 
     """
     if func is None:
-        from filters_scipy import despike
+        from utils.filters_scipy import despike
 
         func = lambda x: despike(x, offsets=(20, 5), blocks=len(x), ax=None, label=None)[0]
 

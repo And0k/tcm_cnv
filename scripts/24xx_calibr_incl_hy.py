@@ -2,38 +2,40 @@
 # coding:utf-8
 """
 Author:  Andrey Korzh <ao.korzh@gmail.com>
-Purpose: Calibrate AB SIO RAS inclinometers: step1. magnetometer and accelerometer, step2. velocity(incl.gle)
+Purpose: Calibrate AB SIO RAS inclinometers.
+The following steps and corresponding `st.start` and `st.end` values to control execution implemented:
+- 10: magnetometer and accelerometer in lab;
+- 15: copy lab coef to tank;
+- 20: velocity in tank;
+- 35: copy tank coef where need.
+Note: if st.end >= st.start then one step will be processed.
+
 Created: 20.08.2020
-Modified: 20.01.2024
-Note: requires source raw data loaded to HDF5 table
+Modified: 20.01.2025
+Requirement: source raw data loaded to HDF5 table
 """
+from datetime import datetime
 import sys
 from pathlib import Path
 from yaml import safe_dump as yaml_safe_dump
-
 # import my scripts
 drive_d = Path('D:/' if sys.platform == 'win32' else '/mnt/D')  # allows to run on both my Linux and Windows systems:
 scripts_path = drive_d.joinpath('Work/_Python3/And0K/tcm/scripts')
-sys.path.append(str(Path(scripts_path).parent.resolve()))  # os.getcwd()
-
+sys.path.append(str(Path(scripts_path).parent.resolve()))
 from tcm import cfg_dataclasses as cfg_d
 from tcm.h5inclinometer_coef import h5copy_coef
 from tcm.utils2init import st, path_on_drive_d, init_logging
-# Add under {path_db_raw}\cfg_proc dir
-# - time_ranges for probes to \input\input_mod.yaml. Probe names should be in form {i for inclinometers}{model}{number}
-# - input tables names to cfg_proc\my_incl_calibr.yaml
-# Possible values:
-# 10: lab,
-# 15: copy lab coef to tank,
-# 20: tank,
-# 35: copy tank coef where need
-st.start = 35  # 10 (use with end after 15) # 20
-st.end = 35  # if = st.start then process one step.
 
 
+st.start = 35  # 10 15 20 35
+st.end = 35
+
+## Source calibration lab/tank data path
+# (in lab + in tank if you not redefine it under step 15)
 
 path_db_raw = path_on_drive_d(
-    r"D:\WorkData\_experiment\inclinometer\250505_tube\_raw\250505.raw.h5"
+    r"D:\WorkData\_experiment\inclinometer\250610tank@i63,64,67,68,78,86,87\_raw\250610tank.raw.h5"
+    # r"D:\WorkData\_experiment\inclinometer\250505_tube\_raw\250505.raw.h5"
     # r"F:\_\copy\AB_SIO_RAS\240527_stand,tank,tube@i61-90\_raw\240604tube.raw.h5"
     # r"d:\WorkData\_experiment\inclinometer\240527_stand,tank,tube@i61-90\_raw\240527.raw.h5"
     # r"d:\WorkData\_experiment\inclinometer\_type_b\231009_tank@iB18,25-30\_raw\231009.raw.h5"
@@ -53,21 +55,6 @@ if st(10, "Magnetometer and accelerometer calibration of devices listed in cfg_p
     from tcm import incl_calibr_hy
 
     db_in = str(path_db_raw).replace('\\', '/')
-
-    if False:  # load devices listed in cfg_proc/my_incl_calibr - not need now (?)
-        # Setting of hydra.searchpath to cruise specific config dir: "{path_db_raw.parent}/cfg_proc"
-        # probes config directory within inclinometer/cfg/incl_h5clc_hy.yaml
-        # Else it will be not used and hydra will only warn
-        path_cfg_default = (lambda p: p.parent / 'cfg' / p.name)(Path(incl_calibr_hy.__file__)).with_suffix('.yaml')
-        with path_cfg_default.open('w') as f:
-            yaml_safe_dump({
-                'defaults': ['my_incl_calibr', '_self_'],  # 'base_incl_calibr_hy', {'override input': 'input_mod'}
-                # 'hydra': {'searchpath': [path_db_raw.with_name("cfg_proc").as_uri().replace('///', '//')]}  # .as_posix()
-                # file://d:/WorkData/_experiment/inclinometer/_type_b/230117_stand%40ib26%2C28-30/_raw/cfg_proc
-                # file://d:/WorkData/_experiment/inclinometer/_type_b/230117_stand_ib26_28_30/_raw/cfg_proc
-                'hydra': {'searchpath': [f'file://{path_db_raw.with_name("cfg_proc").as_posix()}']}  #.as_uri().replace('///', '//')
-                }, f)  # not .as_uri() which adds "file://" as it also replaces "," and "@" but this is not that hydra need
-            f.flush()
     search_path = path_db_raw.with_name("cfg_proc")
     config_files = [f.stem for f in (search_path / "defaults").glob("*.yaml")]
     cfg_d.main_call(
@@ -112,9 +99,9 @@ if st(10, "Magnetometer and accelerometer calibration of devices listed in cfg_p
 
 
 if st.end >= 15:
-    # 1. tank data
-    db_path_tank = path_db_raw
+    ## Tank calibration settings
 
+    db_path_tank = path_db_raw  # modify this line if need separate tank data
     # path_on_drive_d(  # or other path to load calibration data (add newer on top of first and comment old item)
     # r'd:\WorkData\_experiment\inclinometer\231010_stand,tank@i52-56\_raw\231011tank.raw.h5'
     # r'd:\WorkData\_experiment\inclinometer\230614_tank@i3,4,15,19,28,33,37,38;В27-30\230614tank.raw.h5'
@@ -127,7 +114,8 @@ if st.end >= 15:
     # r'd:\WorkData\_experiment\inclinometer\210331_tank[4,5,9,10,11,19,28,33,36,37,38]\210331incl.h5'
     # r'd:\WorkData\_experiment\inclinometer\_Schukas\200807_tank[b01-b30]\200807_calibr-tank-b.h5'
     # )
-    probes = range(63, 69) # range(68, 69)
+    probes = [63, 64, 67, 68, 78, 86, 87]
+    # range(63, 69) # range(68, 69)
     # [75, 76, 77, 79, 80, 81, 82, 83, 84, 85, 89, 90]  # 72,
     # [61, 68, 70, 71] # range(60, 91)
     # [18, 25, 26, 27, 28, 29, 30]  # [58, 59, 60]    # 53, 55, 56 3,4 [27,28,29,30] [3,4,15,19,37,38]
@@ -135,10 +123,24 @@ if st.end >= 15:
 
     tbl_prefix = 'incl'  # 'incl' # 'incl_p' 'incl_b' 'i_d'
 
+    vsz_param = {
+        "dir": db_path_tank.parent / "vsz(250610_1340,range=1h)_tank",  # / "vsz(range=5min)"}
+        "stem_ptn": "@i{p_type}{p_num:0>2}",  # use p_type & p_num variables
+        "substr_not_in_tbl": r"^[^@]+",  # 'tank@'
+    }
+    # db_path_tank.parent / "vsz(240604_1300,range=1h,db_stem=240604tube)" / f"tube@i{p_type}{p_num:0>2}"
+    # db_path_tank.parent / "240920_tube@72,75-77,79-85,89,90" / f"[0-9]*@i{p_type}{p_num:0>2}"
+    # db_path_tank.parent / f"*@i{p_type}{p_num:0>2}"  # fr'*@iB{p_num:0>2}'  @i_p
+    # db_path_tank.parent / 'vsz(range=1h)' / fr'*@ib{p_num:0>2}g'  # 230109_1404_13min@ib29g.vsz
+    # f'{vsz_substr_not_in_tbl}i{p_num:0>2}'
+    # tbl
+    # f'i_{vsz_substr_not_in_tbl}d{p_num:0>2}'
+    # {db_path_tank.stem}
+
     if path_db_raw != db_path_tank and st(15, 'Copy laboratory calibration coefficients to other experiments databases'):
-        for i, pnum in enumerate(probes):
-            # incl_calibr not supports multiple time_ranges so calculate one by one pnum
-            tbl = f'{tbl_prefix}{pnum:0>2}'
+        for i, p_num in enumerate(probes):
+            # incl_calibr not supports multiple time_ranges so calculate one by one p_num
+            tbl = f'{tbl_prefix}{p_num:0>2}'
             print(f'Copying {tbl} coefficients from {path_db_raw}')
             h5copy_coef(path_db_raw, h5file_dest=db_path_tank, tbl=tbl, ok_to_replace_group=True)
 
@@ -150,8 +152,8 @@ if st.end >= 15:
     db_paths_copy = [
         path_on_drive_d(p)
         for p in [
+            r'C:\Work\Python\AB_SIO_RAS\tcm\tcm\cfg\coef\190710incl.h5',  # default: all coefficients here
             # r"d:\WorkData\~configuration~\inclinometer\incl#b.h5",
-            r'C:\Work\Python\AB_SIO_RAS\tcm\tcm\cfg\coef\190710incl.h5',
             # r'd:\WorkData\BalticSea\230507_ABP53\inclinometer@i3,4,15,19,37,38;ib27-30,ip6\_raw\230507.raw.h5'
             # r'd:\WorkData\BalticSea\_Pregolya,Lagoon\221103@ib26,28-30\_raw\221103.raw.h5'
             # r'e:\WorkData\BalticSea\181005_ABP44\inclinometer\_raw\181017.raw.h5',
@@ -175,46 +177,38 @@ if st(20, 'Coefficients to convert inclination to |V| and zero calibration (not 
     because of zero calibration is in vsz too).
     """
     from h5from_veusz_coef import main as h5from_veusz_coef
-    # from veuszPropagate import __file__ as file_veuszPropagate
-
-    vsz_substr_not_in_tbl = r'^[^@]+'  # 'tank@'
+    # from utils.veuszPropagate import __file__ as file_veuszPropagate
     vsz_data = {'veusze': None}
-    for i, pnum in enumerate(probes):
-        # incl_calibr not supports multiple time_ranges so calculate one by one pnum
-        tbl = f'{tbl_prefix}{pnum:0>2}'  # note: regex result from veusz name by re_tbl_from_vsz_name below must be same
-        # f'incl_b{pnum:0>2}'
+    for i, p_num in enumerate(probes):
+        # incl_calibr not supports multiple time_ranges so calculate one by one p_num
+        tbl = f'{tbl_prefix}{p_num:0>2}'  # note: regex result from veusz name by re_tbl_from_vsz_name below must be same
+        # f'incl_b{p_num:0>2}'
         p_type= '' if tbl_prefix[-1]=='l' else tbl_prefix[-1]
-        vsz_path = (
-            db_path_tank.parent / "vsz(range=5min)" / f"@i{p_type}{pnum:0>2}"
-            # db_path_tank.parent / "vsz(240604_1300,range=1h,db_stem=240604tube)" / f"tube@i{p_type}{pnum:0>2}"
-            # db_path_tank.parent / "240920_tube@72,75-77,79-85,89,90" / f"[0-9]*@i{p_type}{pnum:0>2}"
-            # db_path_tank.parent / f"*@i{p_type}{pnum:0>2}"  # fr'*@iB{pnum:0>2}'  @i_p
-            # db_path_tank.parent / 'vsz(range=1h)' / fr'*@ib{pnum:0>2}g'  # 230109_1404_13min@ib29g.vsz
-            # f'{vsz_substr_not_in_tbl}i{pnum:0>2}'
-            # tbl
-            # f'i_{vsz_substr_not_in_tbl}d{pnum:0>2}'
-            # {db_path_tank.stem}
-        ).with_suffix(".vsz")
-        vsz_data = h5from_veusz_coef([
-            # str(Path(file_veuszPropagate).with_name('veuszPropagate.ini')),
-            '--data_yield_prefix', 'Inclination',
-            '--path', str(vsz_path),
-            '--pattern_path', str(vsz_path),
-            '--widget', '/fitV(incl)/grid1/graph/fit_t/values',
-            # '/fitV(force)/grid1/graph/fit1/values',
-            '--data_for_coef', 'max_incl_of_fit_t',
-            '--out.path', str(db_path_tank),
-            #'--re_match_tbl_from_vsz_name', f'[^_@\d]+_?\d+',
-            '--re_sub_tbl_from_vsz_name', '^.*',  # r'\D+',
-            '--to_sub_tbl_from_vsz_name', tbl,  # tbl_prefix
-            '--channels_list', '',  # 'M,A',
-            '--b_update_existed', 'True',  # to not skip.
-            '--export_pages_int_list', '4,6',  #4 0 = all
-            '--b_interact', 'False',
-            '--b_execute_vsz', 'True',  # not works without
-            '--return', '<embedded_object>',  # reuse to not bloat memory
+        vsz_path = (vsz_param["dir"] / vsz_param["stem_ptn"].format(p_type=p_type, p_num=p_num)).with_suffix(
+            ".vsz"
+        )
+        vsz_data = h5from_veusz_coef(
+            [
+                # str(Path(file_veuszPropagate).with_name('veuszPropagate.ini')),
+                '--data_yield_prefix', 'Inclination',
+                '--path', str(vsz_path),
+                '--pattern_path', str(vsz_path),
+                '--widget', '/fitV(incl)/grid1/graph/fit_t/values',
+                # '/fitV(force)/grid1/graph/fit1/values',
+                '--data_for_coef', 'max_incl_of_fit_t',
+                '--out.path', str(db_path_tank),
+                #'--re_match_tbl_from_vsz_name', f'[^_@\d]+_?\d+',
+                '--re_sub_tbl_from_vsz_name', '^.*',  # r'\D+',
+                '--to_sub_tbl_from_vsz_name', tbl,  # tbl_prefix
+                '--channels_list', '',  # 'M,A',
+                '--b_update_existed', 'True',  # to not skip.
+                '--export_pages_int_list', '4,6',  #4 0 = all
+                '--b_interact', 'False',
+                '--b_execute_vsz', 'True',  # not works without
+                '--return', '<embedded_object>',  # reuse to not bloat memory
             ],
-            veusze=vsz_data['veusze'])
+            veusze=vsz_data['veusze']
+        )
 
         def any_inside(v):
             if isinstance(v, list):
@@ -247,16 +241,16 @@ if path_db_raw != db_path_tank:
     db_paths_copy.append(path_db_raw)  # db_paths_copy = [path_db_raw]
 db_paths_copy.append(
     # r'C:\Work\Python\AB_SIO_RAS\h5toGrid\inclinometer\tests\data\inclinometer\incl#b.h5'
-    r"B:\WorkData\BalticSea\240625_ABP56-incl,t-chain\inclinometer\_raw\240616.raw.h5"
+    r"D:\Cruises\BalticSea\240616_ABP56@i,t-chain\inclinometer\_raw\240625.raw.h5"
 )
 
 if db_paths_copy and st(35, f"Copy calibration coefficients from {db_path_tank} to {db_paths_copy}"):
     init_logging(logger=__name__)
     for db in db_paths_copy:
         print('to', db)
-        for i, pnum in enumerate(probes):
-            # incl_calibr not supports multiple time_ranges so calculate one by one pnum
-            tbl = f'{tbl_prefix}{pnum:0>2}'
+        for i, p_num in enumerate(probes):
+            # incl_calibr not supports multiple time_ranges so calculate one by one p_num
+            tbl = f'{tbl_prefix}{p_num:0>2}'
             try:
                 print(f'Copying {tbl}', end="... ")
                 h5copy_coef(db_path_tank, h5file_dest=db, tbl=tbl, ok_to_replace_group=True)
@@ -267,4 +261,22 @@ if db_paths_copy and st(35, f"Copy calibration coefficients from {db_path_tank} 
 
 #%%
 
-print('Ok')
+print(f"{datetime.now():%Y-%m-%d %H:%M:%S} Ok>")
+
+
+
+# removed old code
+if False:  # load devices listed in cfg_proc/my_incl_calibr - not need now (?)
+    # Setting of hydra.searchpath to cruise specific config dir: "{path_db_raw.parent}/cfg_proc"
+    # probes config directory within inclinometer/cfg/incl_h5clc_hy.yaml
+    # Else it will be not used and hydra will only warn
+    path_cfg_default = (lambda p: p.parent / 'cfg' / p.name)(Path(incl_calibr_hy.__file__)).with_suffix('.yaml')
+    with path_cfg_default.open('w') as f:
+        yaml_safe_dump({
+            'defaults': ['my_incl_calibr', '_self_'],  # 'base_incl_calibr_hy', {'override input': 'input_mod'}
+            # 'hydra': {'searchpath': [path_db_raw.with_name("cfg_proc").as_uri().replace('///', '//')]}  # .as_posix()
+            # file://d:/WorkData/_experiment/inclinometer/_type_b/230117_stand%40ib26%2C28-30/_raw/cfg_proc
+            # file://d:/WorkData/_experiment/inclinometer/_type_b/230117_stand_ib26_28_30/_raw/cfg_proc
+            'hydra': {'searchpath': [f'file://{path_db_raw.with_name("cfg_proc").as_posix()}']}  #.as_uri().replace('///', '//')
+            }, f)  # not .as_uri() which adds "file://" as it also replaces "," and "@" but this is not that hydra need
+        f.flush()

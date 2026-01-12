@@ -35,7 +35,7 @@ from .utils2init import (
     my_logging,
 )
 from functools import partial, wraps
-
+from operator import sub
 from .utils_time import matlab2datetime64ns, date_from_filename
 from .utils_time_corr import plot_bad_time_in_thread
 
@@ -1004,13 +1004,13 @@ def loaded_tcm(
         pass
 
     try:
-        lf.info("Time {:%y-%m-%d %H:%M} – {:%d %H:%M} converted", *tim_index[[0, -1]].to_pydatetime())
+        lf.info("Time {:%y-%m-%d %H:%M} – {:%m-%d %H:%M} converted", *tim_index[[0, -1]].to_pydatetime())
     except KeyError:
         lf.warning("Time of block size {} converted", tim_index.size)
 
     try:
         key = "invert_magnetometer"
-        if csv_specific_param[key]:
+        if csv_specific_param[key] and "Mx" in a.columns:
             magnetometer_channels = ["Mx", "My", "Mz"]
             # Log csv_specific_param operation with message to indicate how meny redundant calls of this have been made.
             # (possible side effect of this is canceled by copy() below, except a long calculation time)
@@ -1019,9 +1019,8 @@ def loaded_tcm(
                 {
                     "key": key,
                     "add_same_counter": 1,
-                    "id": id(
-                        a.loc[:, magnetometer_channels[0]].values
-                    ),  # Is id() always detects same input data?
+                    "id": id(a.loc[:, magnetometer_channels[0]].values),
+                    # Is id() always detects same input data?
                 },
             )
             a.loc[:, magnetometer_channels] = -a.loc[:, magnetometer_channels].values  # Is "*= -1" better?
@@ -1200,40 +1199,58 @@ def rep_in_file(
 def parse_name(name: str):
     """
     Extract logical parts of inclinometer / wave gauge name/glob from source raw csv file name
-
-    :param name: name/glob of source raw csv file
+    :param name: name/glob of source raw csv file. Note: all chars before 1st `i`/`w`/`*`/`[` are ignored.
+    Chars `*` and `[`, if exits, will be returned in type assuming it is a glob.
     :return: dict with fields:
     - type:
     - model: abbreviation of one letter among (i, b, d, p, w) or '' if not recognized
-    - number:
+    - number: keeping prefixing zeros/asterixes
     - chars1 and chars2: before and after ``number``
     """
     name = name.lower()
+
+    # 1. try match regular file stem
     m = re.match(  # (?P<chars0>\*?) search
-        r"@?(?P<type>[iw])(?P<chars1>nkl_|nkl|ncl_|ncl|\*_|_\*?|\*|)"
-        r"(?P<model>[bdp]|\[[0bdp]{1,4}]|)(?P<number>\*?\d{1,4})(?P<chars2>\D*)",
+        r"[^iw]*(?P<type>[iw])(?P<chars1>((?:nkl|ncl|))_?)"
+        r"(?P<model>[bdp]|[0bdp]{1,4}]|)(?P<chars2>_?)(?P<number>\d{1,4})(?P<chars3>\D*)",
         name,
     )
-
     if m:
         m = m.groupdict()
-    else:  # unusual i / w
-        m = re.match(r"@?(?P<type>voln_v)(?P<chars1>\D*)(?P<number>\d\d)(?P<chars2>\D*)", name)
-        if m:
-            m = m.groupdict()
-            m["type"] = "w"
-            m["model"] = ""
-    return m
+        m["chars0"] = ""
+        return m
+
+    # 2. try match glob of file stems
+    m = re.match(  # (?P<chars0>\*?) search
+        r"[^iw\*\[]*(?P<chars0>\*?\[?)(?P<type>[iw])(?P<chars1>((?:nkl|ncl|))_?\[?)"
+        r"(?P<model>[bdpw]{0,4})(?P<chars2>\]?\*?)(?P<number>\d{0,4})(?P<chars3>\D*)",
+        name,
+    )
+    if m:
+        return m.groupdict()
+
+    # 3. unusual i / w
+    m = re.match(r"@?(?P<type>voln_v)(?P<chars2>\D*)(?P<number>\d\d)(?P<chars3>\D*)", name)
+    if m:
+        m = m.groupdict()
+        m["chars0"] = m["chars1"] = ""
+        m["type"] = "w"
+        m["model"] = ""
+        return m
+
+    return None
 
 
-def mod_name(file_in: Union[str, PurePath], add_prefix=None, parse=True) -> Tuple[str, Path]:
+def mod_name(file_in: Union[str, PurePath], add_prefix="", parse=True) -> Tuple[str, Path]:
     """
-    Extract 1. `model` of inclinometer / wave gauge and construct (as we use inclinometer with pressure sensor
+    1. Normalize name: convert Translit to English and make file name lower case
+    2. Extract:
+    - 1. `model` of inclinometer / wave gauge and construct (as we use inclinometer with pressure sensor
     now, and it includes wave gauge functionality, type is not needed as now it always "inclinometer")
-    2. Path/name or glob pattern (keeps asterixes if in prefixes) of corrected raw data file (of inclinometer
-    / wave gauge) from name/glob of source raw csv file
+    - 2. Path/name or glob pattern (keeps asterixes and [] in around type/model) of corrected raw data file
+    (of inclinometer / wave gauge) from name/glob of source raw csv file
 
-    :param parse: if False then just return `model` = None and `file_in` prefixed with one `add_prefix`
+    :param parse: if False then just return (`None`, `{add_prefix}{normalized name}`)
     :param file_in: full path name/glob of source raw csv file
     :param add_prefix:
     :return:
@@ -1241,38 +1258,40 @@ def mod_name(file_in: Union[str, PurePath], add_prefix=None, parse=True) -> Tupl
         - modified file name (of corrected not here raw inclinometer / wave gauge data).
     """
     file_in = PurePath(file_in)
-    name = file_in.stem
+    name = file_in.stem.lower().replace("inkl", "incl")
     if parse:
-        m = parse_name(name.lower().replace("inkl", "incl"))  # convert Translit to English)
+        b_pattern = ("*" in name or "?" in name)
+        m = parse_name(name)  #
         # Return "i" for inclinometer if model is not specified else matched regex model; "w" for wave gauge
         if m:
             model = m["model"]
             if not model:
                 model = m["type"]
-            name = "{type}{chars1}{model}{number}{chars2}".format_map(m)
-            if not ("*" in name or "?" in name) and not m["number"]:  # give up determine pattern correctness
+
+            # if pattern is not used, then do not insert special chars in output. Last chars keep as user id
+            if b_pattern:
+                name = "{chars0}{type}{chars1}{model}{chars2}{number}{chars3}".format_map(m)
+            else:
+                name = "{type}_{model}{number}{chars3}".format_map(m)  # incl -> i
+            if not b_pattern and not m["number"]:  # give up determine pattern correctness
                 print(f"Bad probe name {file_in}: probe number not detected")
         else:
             model = None
-            if not ("*" in name or "?" in name):  # give up to determine pattern correctness
+            if not b_pattern:  # give up to determine pattern correctness
                 print(f"Not known probe name: {file_in}")
 
         # Paste `add_prefix` before extension, keeping asterixes if exist
         if add_prefix:
 
-            def rep(matchobj):
-                """if add_prefix (excluding @) in ``name`` replace it else append"""
+            def prefix_target(matchobj):
+                """return matching substring prefixed by `add_prefix` """
                 substr = matchobj.group(0)
-                # if (add_str1 := add_prefix.replace('@', '')) in substr:
-                #     return substr.replace(add_str1, add_prefix)
-                # else:
                 return f"{add_prefix}{substr}"
-                # '{0}{2}.{1}'.format(*name.rsplit('.', 1), add_prefix) f'{substr}{add_prefix}'
 
-            name = re.sub(r"^\*?([^*.]*)", rep, name)
+            name = re.sub(r"^\*?([^*.]*)", prefix_target, name)
     else:
         model = None
-        name = f"@{name.lstrip(add_prefix)}"
+        name = f"{add_prefix}{name.lstrip(add_prefix)}"
 
     file_out = file_in.with_name(name).with_suffix(file_in.suffix)
     return model, file_out

@@ -83,7 +83,7 @@ class ConfigInCsv:
 
     :param csv_specific_param_dict: not default parameters for function in csv_specific_proc.py used to load data
     """
-    path: Any = 'to_vaex_hdf5'
+    path: Any = 'hdf5_alt'
     b_search_in_subdirs: bool = False
     exclude_dirs_endswith: Tuple[str] = ('toDel', '-', 'bad', 'test', 'TEST')
     exclude_files_endswith: Tuple[str] = ('coef.txt', '-.txt', 'test.txt')
@@ -486,14 +486,14 @@ def to_omegaconf_merge_compatible(unstructured: Dict[str, Any], schema) -> Dict[
                 if converted_value != schema_fields[key][1]:
                     converted[key] = converted_value
         else:
-            lf.warning('Field "{}" is not in config: removed', key)
+            lf.warning('Field "{}" is not in {}: removed', key, schema.__name__)
     return converted
 
 
 def hydra_cfg_store(
         cs_store_name: str,
         cs_store_group_options: Mapping[str, Sequence[Any]],
-        module=sys.modules[__name__]  # to_vaex_hdf5.cfg_dataclasses
+        module=sys.modules[__name__]  # hdf5_alt.cfg_dataclasses
         ) -> Tuple[ConfigStore, object]:
     """
     Registering Structured config with defaults specified by dataclasses in ConfigStore

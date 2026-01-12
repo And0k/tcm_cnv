@@ -1,8 +1,8 @@
 [project]
 authors = [ {name = "Andrey Korzh", email = "ao.korzh@gmail.com"} ]
-description = "console program to convert raw data files meaured by AB SIO RAS tilt current meters to csv o hdf5 data files with physical units optionally with filtering/averaging"
+description = "Console program to convert raw data files meaured by AB SIO RAS tilt current meters (TCM) to csv and hdf5 data files with physical units optionally with filtering/averaging"
 license = "MIT"
-name = "absioras-tsm"
+name = "absioras-tcm"
 version = "0.1.0"
 readme = "README.md"
 
@@ -12,6 +12,16 @@ dependencies=[
 
 [project.optional-dependencies]
 test = [ "pytest", "pytest-arraydiff"]
+
+[build-system]
+build-backend = "hatchling.build"
+requires = ["hatchling"]
+
+[tasks]
+start = "python tcm/incl_h5clc_hy.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["./tcm"]
 
 [tool.pixi.dependencies]
 antlr = "*"
@@ -81,11 +91,13 @@ urllib3 = "*"
 xarray = "*"
 webdriver-manager = "*"
 pixi-kernel = "*"
+pytest = "*"
+pytest-cov = "*"
 
 [tool.pixi.pypi-dependencies]
-absioras-tsm = { path = ".", editable = true }
+absioras-tcm = { path = ".", editable = true }
 
-[tool.pixi.project]
+[tool.pixi.workspace]
 channels = ["conda-forge", "main"]
 platforms = ["win-64"]
 
@@ -95,12 +107,3 @@ test = { features = ["test"], solve-group = "default" }
 [tool.ruff]
 line-length = 110
 
-[tasks]
-start = "python tsm/incl_h5clc_hy.py"
-
-[build-system]
-build-backend = "hatchling.build"
-requires = ["hatchling"]
-
-[tool.hatch.build.targets.wheel]
-packages = ["./tcm"]
