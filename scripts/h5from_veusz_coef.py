@@ -24,7 +24,7 @@ except ModuleNotFoundError:
     from typing import Sequence
 
     def is_sequence(x):
-        return isinstance(x, Sequence)
+        return isinstance(x, Sequence) or isinstance(x, np.ndarray)
 
 # my
 from tcm import veuszPropagate
@@ -321,6 +321,14 @@ def main(new_arg=None, veusze=None):
     if b_have_fits:
         print(txt_results)
         for n in names_get:
+            is_1d = [d.ndim < 2 for d in vsz_data[n]]
+            if not any(is_1d):
+                if not all(is_1d):
+                    # raise NotImplementedError("Saving 2D data to csv")
+                    print("skipping saving 2D data to csv")
+                continue
+            if not all(is_1d):
+                raise NotImplementedError("Saving 1D and 2D data in same csv")
             pd.DataFrame.from_dict(
                 dict(zip(list(txt_results['fit1result'].keys()), vsz_data[n]))
                 ).to_csv(
